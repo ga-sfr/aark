@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "caseId": "old-drive-001",
+  "source": "/dev/disk/by-id/REPLACE_WITH_STABLE_SOURCE_PARTITION_ID",
+  "destination": "/mnt/separate-recovery-disk/old-drive-001",
+  "requireReadOnlySource": true,
+  "execute": false,
+  "sectorOffset": 0,
+  "image": {
+    "enabled": true,
+    "path": "/mnt/separate-recovery-disk/old-drive-001/evidence/source.img",
+    "mapfile": "/mnt/separate-recovery-disk/old-drive-001/evidence/source.map"
+  },
+  "stages": {
+    "deletedMetadata": true,
+    "ntfsUndelete": true,
+    "unallocatedStream": true,
+    "signatureCarving": true,
+    "volumeShadows": false,
+    "residualMemory": false,
+    "deletedRegistryCells": false
+  }
+}

@@ -1,0 +1,4 @@
+dist/test/
+dist/**/*.map
+optional/**/__pycache__/
+optional/**/*.py[cod]

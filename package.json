@@ -1,0 +1,62 @@
+{
+  "name": "agetnic-tools",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read-only disk recovery orchestration and offline sensitive-material mining for authorized forensic recovery.",
+  "type": "module",
+  "bin": {
+    "agetnic": "dist/cli.js",
+    "agetnic-tools": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "optional",
+    "docs",
+    "examples",
+    "README.md",
+    "SECURITY.md",
+    "THIRD_PARTY.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node -e \"require('node:fs').chmodSync('dist/cli.js',0o755)\"",
+    "build:test": "npm run clean && tsc -p tsconfig.json && node -e \"require('node:fs').chmodSync('dist/cli.js',0o755)\"",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build:test && node --test dist/test/*.test.js",
+    "check:python": "python3 -c \"import ast,pathlib; ast.parse(pathlib.Path('optional/impacket/dpapi_bridge.py').read_text(encoding='utf-8'))\"",
+    "audit:repo": "node scripts/audit-repository.mjs",
+    "audit:dependencies": "npm audit --audit-level=moderate",
+    "check": "npm run typecheck && npm test && npm run check:python && npm run audit:repo && npm run audit:dependencies",
+    "prepack": "npm run clean && npm run build",
+    "start": "node dist/cli.js"
+  },
+  "keywords": [
+    "data-recovery",
+    "digital-forensics",
+    "deleted-files",
+    "private-keys",
+    "wallet-recovery",
+    "dpapi",
+    "ubuntu"
+  ],
+  "author": "ga-nyc",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ga-nyc/agetnic-tools.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ga-nyc/agetnic-tools/issues"
+  },
+  "homepage": "https://github.com/ga-nyc/agetnic-tools#readme",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "@scure/bip39": "^2.2.0",
+    "commander": "^15.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "typescript": "^7.0.2"
+  }
+}

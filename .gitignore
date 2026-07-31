@@ -40,6 +40,62 @@ build/Release
 # Dependency directories
 node_modules/
 jspm_packages/
+__pycache__/
+*.py[cod]
+
+# Local forensic cases and sensitive output
+.agetnic-*.lock
+cases/
+recovery-output/
+sensitive-mining/
+artifacts/
+inventory-sensitive.json
+case-sensitive.json
+final-report-sensitive.md
+final-report-redacted.md
+manifest-redacted.json
+plan-redacted.json
+*-sensitive.json
+*-sensitive.log
+*-final-report-sensitive.md
+*-final-report-redacted.md
+*-manifest-redacted.json
+*-plan-redacted.json
+*.img
+*.dd
+*.raw
+*.E01
+*.map
+*.dmp
+*.mem
+*.hiber
+*.pagefile
+*.swapfile
+*.vhd
+*.vhdx
+*.qcow2
+*.sqlite-wal
+*.sqlite-shm
+wallet.dat
+*.wallet
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.kdbx
+*.psafe3
+*.gpg
+*.asc
+*.bin
+*.der
+*.ppk
+*.sqlite
+*.db
+Login Data
+Local State
+key4.db
+logins.json
 
 # Snowpack dependency directory (https://snowpack.dev/)
 web_modules/
@@ -69,6 +125,12 @@ web_modules/
 .env
 .env.*
 !.env.example
+.npmrc
+.pypirc
+.netrc
+.aws/
+.ssh/
+kubeconfig
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache
