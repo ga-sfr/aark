@@ -47,6 +47,7 @@ export interface RecoveryStep {
   sourceMutationExpected: false;
   destinationWritesExpected: boolean;
   optional: boolean;
+  partialSuccessExitCodes?: number[];
   notes: string[];
 }
 

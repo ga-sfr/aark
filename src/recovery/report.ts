@@ -98,7 +98,7 @@ export function renderRecoverySensitiveReport(
   lines.push(
     "## What this report establishes",
     "",
-    "The paths above identify where each recovery engine wrote its results. Only stages marked completed should be treated as successfully run. Deleted-metadata and filesystem-unallocated provenance are retained separately from carved, shadow-copy, residual-memory, and allocated-reference material. A successful stage does not guarantee that every deleted byte was recoverable, and a carved file does not by itself prove an original pathname.",
+    "The paths above identify where each recovery engine wrote its results. Stages marked completed produced their planned outputs; completed-with-warnings means the engine retained new output but reported a configured partial-result exit, so inspect its sensitive logs. Deleted-metadata and filesystem-unallocated provenance are retained separately from carved, shadow-copy, residual-memory, and allocated-reference material. A successful stage does not guarantee that every deleted byte was recoverable, and a carved file does not by itself prove an original pathname.",
     "",
     "Run the mining layer against the relevant restored-data subfolders, using separate scans when their provenance labels differ. The mining layer writes its own final reports with credential categories, possible access, and exact local finding locations.",
     "",

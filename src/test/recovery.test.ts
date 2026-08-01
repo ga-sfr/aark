@@ -6,7 +6,7 @@ import path from "node:path";
 import { loadRecoveryConfig } from "../recovery/config.js";
 import { buildRecoveryPlan } from "../recovery/plan.js";
 import { renderRecoveryRedactedReport, renderRecoverySensitiveReport } from "../recovery/report.js";
-import { redactedPlan, runRecoveryPlan } from "../recovery/runner.js";
+import { recoveryStepStatus, redactedPlan, runRecoveryPlan } from "../recovery/runner.js";
 import type { SourceSafety } from "../recovery/source-safety.js";
 import type { RecoveryConfig } from "../recovery/types.js";
 
@@ -50,6 +50,33 @@ test("recovery plan selects deleted/unallocated modes and redacts local paths", 
   assert.equal(rendered.includes(config().caseId), false);
   assert.ok(rendered.includes("<SOURCE>"));
   assert.ok(rendered.includes("<CASE_ROOT>"));
+});
+
+test("recovery plan uses supported ddrescue and ntfsundelete options", () => {
+  const input = config();
+  input.image.enabled = true;
+  input.stages.ntfsUndelete = true;
+  const plan = buildRecoveryPlan(input);
+
+  const retry = plan.steps.find((step) => step.id === "image-retry-pass");
+  assert.ok(retry);
+  assert.ok(retry.args.includes("--idirect"));
+  assert.equal(retry.args.includes("--direct"), false);
+
+  const ntfsScan = plan.steps.find((step) => step.id === "ntfs-undelete-scan");
+  assert.ok(ntfsScan);
+  assert.ok(ntfsScan.args.includes("--parent"));
+  assert.ok(ntfsScan.args.includes("--verbose"));
+
+  const ntfsRecover = plan.steps.find((step) => step.id === "ntfs-undelete-recover");
+  assert.ok(ntfsRecover);
+  assert.ok(ntfsRecover.args.includes("--match"));
+  assert.equal(ntfsRecover.args.includes("--percentage"), false);
+  assert.deepEqual(ntfsRecover.partialSuccessExitCodes, [1]);
+  assert.equal(recoveryStepStatus(ntfsRecover, 0, false), "completed");
+  assert.equal(recoveryStepStatus(ntfsRecover, 1, true), "completed-with-warnings");
+  assert.equal(recoveryStepStatus(ntfsRecover, 1, false), "failed");
+  assert.equal(recoveryStepStatus(ntfsScan, 1, true), "failed");
 });
 
 test("redacted plans also hide mounted source-volume paths", () => {

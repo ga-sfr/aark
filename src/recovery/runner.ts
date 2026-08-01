@@ -35,6 +35,7 @@ function redactedStep(step: RecoveryStep, plan: RecoveryPlan): Record<string, Js
     sourceMutationExpected: false,
     destinationWritesExpected: step.destinationWritesExpected,
     optional: step.optional,
+    partialSuccessExitCodes: step.partialSuccessExitCodes ?? [],
     notes: step.notes,
   };
 }
@@ -115,6 +116,70 @@ function destinationPaths(step: RecoveryStep, root: string): string[] {
 
 function expectedOutputKind(step: RecoveryStep, output: string): "file" | "directory" {
   return (step.stdoutFile !== undefined && output === path.resolve(step.stdoutFile)) || step.id.startsWith("image-") ? "file" : "directory";
+}
+
+type RecoveryOutputSnapshot =
+  | { kind: "missing" }
+  | { kind: "file"; device: number; inode: number; size: number; modifiedMs: number }
+  | { kind: "directory"; entries: Set<string> }
+  | { kind: "other" };
+
+async function recoveryOutputSnapshot(output: string): Promise<RecoveryOutputSnapshot> {
+  try {
+    const metadata = await lstat(output);
+    if (metadata.isFile()) {
+      return { kind: "file", device: metadata.dev, inode: metadata.ino, size: metadata.size, modifiedMs: metadata.mtimeMs };
+    }
+    if (metadata.isDirectory()) return { kind: "directory", entries: new Set(await readdir(output)) };
+    return { kind: "other" };
+  } catch (error) {
+    const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+    if (code === "ENOENT") return { kind: "missing" };
+    throw error;
+  }
+}
+
+async function snapshotRecoveryOutputs(step: RecoveryStep): Promise<Map<string, RecoveryOutputSnapshot>> {
+  const snapshots = new Map<string, RecoveryOutputSnapshot>();
+  for (const output of new Set(step.outputs.map((value) => path.resolve(value)))) {
+    snapshots.set(output, await recoveryOutputSnapshot(output));
+  }
+  return snapshots;
+}
+
+async function stepProducedNewOutput(step: RecoveryStep, before: Map<string, RecoveryOutputSnapshot>): Promise<boolean> {
+  for (const output of new Set(step.outputs.map((value) => path.resolve(value)))) {
+    const prior = before.get(output) ?? { kind: "missing" };
+    const current = await recoveryOutputSnapshot(output);
+    if (current.kind === "file") {
+      if (
+        prior.kind !== "file"
+        || prior.device !== current.device
+        || prior.inode !== current.inode
+        || prior.size !== current.size
+        || prior.modifiedMs !== current.modifiedMs
+      ) return true;
+    }
+    if (current.kind === "directory") {
+      const priorEntries = prior.kind === "directory" ? prior.entries : new Set<string>();
+      for (const entry of current.entries) {
+        if (priorEntries.has(entry)) continue;
+        const metadata = await lstat(path.join(output, entry));
+        if (!metadata.isSymbolicLink() && metadata.isFile()) return true;
+      }
+    }
+  }
+  return false;
+}
+
+export function recoveryStepStatus(
+  step: RecoveryStep,
+  exitCode: number,
+  producedNewOutput: boolean,
+): "completed" | "completed-with-warnings" | "failed" {
+  if (exitCode === 0) return "completed";
+  if (producedNewOutput && step.partialSuccessExitCodes?.includes(exitCode) === true) return "completed-with-warnings";
+  return "failed";
 }
 
 async function assertStepOutputsSafe(
@@ -453,6 +518,9 @@ export async function runRecoveryPlan(
           if (!recoveryStep.optional) throw new Error(`required executable is missing: ${recoveryStep.executable}`);
           continue;
         }
+        const outputSnapshot = recoveryStep.partialSuccessExitCodes === undefined
+          ? undefined
+          : await snapshotRecoveryOutputs(recoveryStep);
         const commandStdout = recoveryStep.stdoutFile ?? stdoutLog;
         if (commandStdout === undefined) throw new Error("recovery step has no safe stdout destination");
         await assertNoSymlinkComponents(plan.destination, stderrLog);
@@ -505,8 +573,11 @@ export async function runRecoveryPlan(
             && await validateMountedReadOnlyInput(mountedReadOnlyRoot, mountedExecutionInput) !== mountedExecutionInput
           ) throw new Error("mounted recovery input changed during a recovery stage");
         }
-        if (completed.exitCode === 0) await assertStepOutputsSafe(recoveryStep, safety, analysisSafety, true);
-        const stepStatus = completed.exitCode === 0 ? "completed" : "failed";
+        const producedNewOutput = completed.exitCode !== 0 && outputSnapshot !== undefined
+          ? await stepProducedNewOutput(recoveryStep, outputSnapshot)
+          : false;
+        const stepStatus = recoveryStepStatus(recoveryStep, completed.exitCode, producedNewOutput);
+        if (stepStatus !== "failed") await assertStepOutputsSafe(recoveryStep, safety, analysisSafety, true);
         sensitiveRun.results.push({
           id: recoveryStep.id,
           status: stepStatus,
@@ -529,7 +600,7 @@ export async function runRecoveryPlan(
         });
         sensitiveRun.currentStep = null;
         await persistState();
-        if (completed.exitCode !== 0 && !recoveryStep.optional) throw new Error(`recovery step failed: ${recoveryStep.id}`);
+        if (stepStatus === "failed" && !recoveryStep.optional) throw new Error(`recovery step failed: ${recoveryStep.id}`);
       } catch (error) {
         if (!sensitiveRun.results.some((result) => result.id === recoveryStep.id)) {
           sensitiveRun.results.push({
