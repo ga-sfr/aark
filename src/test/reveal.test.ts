@@ -18,7 +18,7 @@ test("reveal validation accepts only artifacts referenced by a finalized adjacen
   await writeFile(unlisted, "not listed");
   const inventory: SensitiveScanInventory = {
     version: 1,
-    tool: "agetnic-tools",
+    tool: "aark",
     layer: "mining",
     status: "complete",
     complete: true,
@@ -47,6 +47,13 @@ test("reveal validation accepts only artifacts referenced by a finalized adjacen
   };
   await writeFile(path.join(output, "inventory-sensitive.json"), JSON.stringify(inventory));
   assert.deepEqual(await readValidatedRevealArtifact(artifact), exact);
+
+  inventory.tool = "agetnic-tools";
+  await writeFile(path.join(output, "inventory-sensitive.json"), JSON.stringify(inventory));
+  assert.deepEqual(await readValidatedRevealArtifact(artifact), exact);
+  inventory.tool = "aark";
+  await writeFile(path.join(output, "inventory-sensitive.json"), JSON.stringify(inventory));
+
   await assert.rejects(readValidatedRevealArtifact(unlisted), /not referenced/);
 
   const alias = path.join(findingDirectory, "alias.txt");

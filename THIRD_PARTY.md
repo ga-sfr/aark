@@ -1,6 +1,6 @@
 # Third-party software
 
-Agetnic Tools has no project license and grants no rights to its own source code. Its npm dependencies and optional external tools remain governed by their respective upstream licenses; this repository does not relicense them.
+AARK has no project license and grants no rights to its own source code. Its npm dependencies and optional external tools remain governed by their respective upstream licenses; this repository does not relicense them.
 
 Direct npm dependencies:
 

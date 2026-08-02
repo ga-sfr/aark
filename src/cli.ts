@@ -33,7 +33,7 @@ function mib(value: string): number {
 
 function redactedError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  if (process.env.AGETNIC_SENSITIVE_DEBUG === "1") return message;
+  if (process.env.AARK_SENSITIVE_DEBUG === "1" || process.env.AGETNIC_SENSITIVE_DEBUG === "1") return message;
   return message
     .replace(/(["'])(?:\/|[A-Za-z]:\\)[^"'\r\n]*\1/g, "$1<PATH>$1")
     .replace(/(^|[\s"'`(=:,])\/(?!\/)(?:[^/\s"'`()=:,]+\/)*[^/\s"'`()=:,]+/gm, "$1<PATH>")
@@ -46,8 +46,8 @@ function supportedNodeVersion(version: string): boolean {
 }
 
 const program = new Command()
-  .name("agetnic")
-  .description("Read-only recovery orchestration and offline sensitive-material mining")
+  .name("aark")
+  .description("Agentic Artifact Recovery Kit: read-only recovery and offline sensitive-material analysis")
   .version(VERSION)
   .configureOutput({ outputError: (message, write) => write(redactedError(message)) })
   .showHelpAfterError();

@@ -7,6 +7,7 @@ import type { SensitiveScanInventory } from "./types.js";
 
 const MAX_REVEAL_BYTES = 256 * 1024 * 1024;
 const TERMINAL_STATUSES = new Set(["complete", "complete-with-errors", "failed", "interrupted"]);
+const SUPPORTED_INVENTORY_TOOLS = new Set(["aark", "agetnic-tools"]);
 
 async function readStableRegularFile(filename: string, maximumBytes: number, expected?: { dev: number; ino: number }): Promise<Buffer> {
   const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -71,7 +72,7 @@ export async function readValidatedRevealArtifact(input: string): Promise<Buffer
   const completeStatus = inventory.status === "complete" || inventory.status === "complete-with-errors";
   if (
     inventory.version !== 1
-    || inventory.tool !== "agetnic-tools"
+    || !SUPPORTED_INVENTORY_TOOLS.has(inventory.tool)
     || inventory.layer !== "mining"
     || !TERMINAL_STATUSES.has(inventory.status)
     || inventory.complete !== completeStatus

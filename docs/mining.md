@@ -14,7 +14,7 @@ A scan writes three kinds of local output:
 | `inventory-sensitive.json` | Source paths, byte offsets, SHA-256 fingerprints, provenance, sensitive metadata, artifact mappings, and integrity hashes for every exact/derived artifact | Secret; mode `0600` |
 | `manifest-redacted.json` | Aggregate counts, categories, validation methods, generic artifact IDs, and error counts | Values, paths, offsets, and fingerprints omitted |
 
-“Redacted by default” applies to routine output and the shareable manifest, not the recovered artifacts. Exact bytes remain available to the owner for manual verification. `agetnic mine reveal <artifact>` is the only command that deliberately copies an artifact to stdout; it accepts only a file referenced by the finalized adjacent mining inventory and verifies its recorded size and SHA-256 hash before printing any bytes.
+“Redacted by default” applies to routine output and the shareable manifest, not the recovered artifacts. Exact bytes remain available to the owner for manual verification. `aark mine reveal <artifact>` is the only command that deliberately copies an artifact to stdout; it accepts only a file referenced by the finalized adjacent mining inventory and verifies its recorded size and SHA-256 hash before printing any bytes.
 
 On completion, failure, or interruption after output initialization, the sensitive final report states the exact run status, whether cryptocurrency-related material was detected so far, separates direct keys/seeds from wallet or keystore containers, categorizes every credential type by possible access, and points to every exact artifact and source occurrence. It also lists local scan errors. The report does not duplicate secret values that already exist in the artifact files. Report generation is entirely local and deterministic. If the output itself becomes unsafe, substituted, or unwritable, report publication may be refused because writing there is no longer trustworthy.
 
@@ -25,7 +25,7 @@ The category counts in the redacted manifest can still reveal that a type of cre
 Every file is scanned through 32 MiB chunks with a 17 MiB overlap by default. Files up to 64 MiB also receive a separate, bounded whole-file pass so complete containers and JSON formats can be validated. Seventeen MiB is the enforced minimum overlap because it covers the largest bounded streaming candidate (a DPAPI blob of up to 16 MiB) and therefore lets every built-in streaming format cross a chunk boundary without being lost. Adjust these values when necessary:
 
 ```bash
-agetnic mine scan /case/recovery/unallocated/free-space.raw \
+aark mine scan /case/recovery/unallocated/free-space.raw \
   --output /case/mining-unallocated \
   --provenance unallocated-stream \
   --chunk-mib 32 \
@@ -44,7 +44,7 @@ Input-root identity and mount backing are revalidated while walking. The output 
 For raw memory, hibernation, swap, or unallocated streams, `--deep-key-schedules` tests every byte position for a complete AES-128/192/256 encryption-key expansion recurrence and checks initialized ChaCha states. An AES match recovers the original key and preserves the full schedule as a derived artifact; a ChaCha match preserves the 64-byte state alongside its exact key bytes. This mode is CPU-intensive, so it is explicit rather than the unnoticed default. Its exhaustive pass is internally divided into overlapping 1 MiB slices with event-loop yields so cancellation and checkpoints are not blocked for an entire streaming window:
 
 ```bash
-agetnic mine scan /case/recovery/residual-memory \
+aark mine scan /case/recovery/residual-memory \
   --output /case/mining-aes \
   --provenance residual-memory \
   --deep-key-schedules

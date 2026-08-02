@@ -45,7 +45,7 @@ export interface SensitiveFinding {
 
 export interface SensitiveScanInventory {
   version: 1;
-  tool: "agetnic-tools";
+  tool: "aark" | "agetnic-tools";
   layer: "mining";
   status: MiningRunStatus;
   complete: boolean;

@@ -2,7 +2,7 @@
 
 ## Authorized use only
 
-Agetnic Tools is intended for recovery from media and accounts you own or are explicitly authorized to examine. It is not an endpoint collection agent and does not include remote acquisition, persistence, credential testing, or exfiltration features.
+AARK is intended for recovery from media and accounts you own or are explicitly authorized to examine. It is not an endpoint collection agent and does not include remote acquisition, persistence, credential testing, or exfiltration features.
 
 ## Non-negotiable defaults
 
@@ -25,9 +25,9 @@ Agetnic Tools is intended for recovery from media and accounts you own or are ex
 
 The redacted manifest and `final-report-redacted.md` omit source paths, byte offsets, hashes, token values, key identities, certificate subjects, mnemonic text, and local artifact paths. Category counts can still be sensitive. Both final reports are rendered by local deterministic code; no LLM or remote service receives report or evidence content.
 
-`agetnic mine reveal` is the only built-in command that intentionally writes an artifact value to stdout. It requires an explicit artifact path under `artifacts/finding-NNNNNN/`, rejects hard-linked files, verifies that a finalized adjacent inventory references the file, checks its recorded size and SHA-256 hash before emitting bytes, and is never called by scanning or reporting code.
+`aark mine reveal` is the only built-in command that intentionally writes an artifact value to stdout. It requires an explicit artifact path under `artifacts/finding-NNNNNN/`, rejects hard-linked files, verifies that a finalized adjacent inventory references the file, checks its recorded size and SHA-256 hash before emitting bytes, and is never called by scanning or reporting code.
 
-Normal CLI errors redact local paths. `AGETNIC_SENSITIVE_DEBUG=1` is an explicit local troubleshooting override and must never be enabled in shared logs, CI, or support transcripts.
+Normal CLI errors redact local paths. `AARK_SENSITIVE_DEBUG=1` is an explicit local troubleshooting override and must never be enabled in shared logs, CI, or support transcripts. `AGETNIC_SENSITIVE_DEBUG=1` remains accepted as a deprecated compatibility alias.
 
 ## Wallet recovery
 

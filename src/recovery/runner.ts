@@ -270,7 +270,7 @@ async function validateCaseDestination(destination: string, plan: RecoveryPlan, 
   const caseEntries = entries.filter((entry) => entry !== ".agetnic-recovery.lock");
   if (caseEntries.length > 0) {
     if (!entries.includes("case-sensitive.json") || !entries.includes("plan-redacted.json")) {
-      throw new Error("existing non-empty destination is not a fully initialized Agetnic recovery case");
+      throw new Error("existing non-empty destination is not a fully initialized AARK recovery case");
     }
     for (const filename of ["case-sensitive.json", "plan-redacted.json"]) {
       const marker = await lstat(safeJoin(destination, filename));
@@ -457,7 +457,7 @@ export async function runRecoveryPlan(
     await writeCaseFile(safeJoin(plan.destination, "final-report-redacted.md"), redactedReport, 0o644);
     const complete = status === "complete" || status === "complete-with-warnings";
     const manifest: Record<string, JsonValue> = {
-      tool: "agetnic-tools",
+      tool: "aark",
       layer: "recovery",
       runId,
       status,

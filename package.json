@@ -1,10 +1,11 @@
 {
-  "name": "agetnic-tools",
+  "name": "aark",
   "version": "0.1.0",
   "private": true,
-  "description": "Read-only disk recovery orchestration and offline sensitive-material mining for authorized forensic recovery.",
+  "description": "Agent-oriented, read-only disk recovery orchestration and offline sensitive-artifact analysis for authorized forensic recovery.",
   "type": "module",
   "bin": {
+    "aark": "dist/cli.js",
     "agetnic": "dist/cli.js",
     "agetnic-tools": "dist/cli.js"
   },
@@ -32,6 +33,8 @@
   },
   "keywords": [
     "data-recovery",
+    "agentic",
+    "artifact-recovery",
     "digital-forensics",
     "deleted-files",
     "private-keys",
@@ -42,12 +45,12 @@
   "author": "ga-nyc",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ga-nyc/agetnic-tools.git"
+    "url": "git+https://github.com/ga-nyc/aark.git"
   },
   "bugs": {
-    "url": "https://github.com/ga-nyc/agetnic-tools/issues"
+    "url": "https://github.com/ga-nyc/aark/issues"
   },
-  "homepage": "https://github.com/ga-nyc/agetnic-tools#readme",
+  "homepage": "https://github.com/ga-nyc/aark#readme",
   "engines": {
     "node": ">=22.12.0"
   },

@@ -379,7 +379,8 @@ def main() -> int:
         arguments = parser().parse_args()
         result = arguments.handler(arguments)
     except Exception as error:
-        detail = str(error) if os.environ.get("AGETNIC_SENSITIVE_DEBUG") == "1" else "operation failed; verify local inputs and enable AGETNIC_SENSITIVE_DEBUG=1 for details"
+        sensitive_debug = os.environ.get("AARK_SENSITIVE_DEBUG") == "1" or os.environ.get("AGETNIC_SENSITIVE_DEBUG") == "1"
+        detail = str(error) if sensitive_debug else "operation failed; verify local inputs and enable AARK_SENSITIVE_DEBUG=1 for details"
         print(json.dumps({"ok": False, "error": detail}), file=sys.stderr)
         return 1
     print(json.dumps(result, sort_keys=True))

@@ -6,20 +6,20 @@ After every completed, failed, or interrupted plan whose destination remains tru
 
 ## Recommended sequence
 
-1. Identify the exact source and destination devices with `agetnic recover inventory`.
+1. Identify the exact source and destination devices with `aark recover inventory`.
 2. Hardware-write-block the source where possible; otherwise use `blockdev --setro` before the case and verify `RO=1` with `lsblk`.
 3. Image unhealthy media with GNU ddrescue. Work from the image after that point.
 4. Recover deleted metadata with The Sleuth Kit and, for a directly addressable NTFS volume, `ntfsundelete`.
 5. Extract filesystem-unallocated blocks with `blkls`.
 6. Run PhotoRec against the `blkls` unallocated stream for formats whose metadata is gone.
 7. Examine Volume Shadow Copies and residual-memory files as distinct historical sources.
-8. Run `agetnic mine scan` over each recovery output with the correct provenance label.
+8. Run `aark mine scan` over each recovery output with the correct provenance label.
 
 The example configuration assumes `source` is a directly addressable filesystem partition. For a whole-disk image, use `mmls` or equivalent read-only inventory to identify the filesystem’s sector offset, set `sectorOffset` for The Sleuth Kit stages, and provide a partition/decrypted view as `analysisSource` for tools such as `ntfsundelete` that do not accept an image offset. `residualMemory` and `deletedRegistryCells` additionally require `mountedReadOnlyRoot`.
 
 Regular source and analysis images must be stable for the duration of a run. The runner records their canonical identity, size, modification time, and change time and verifies those values around every relevant recovery stage. Read-only mounted roots are also rechecked around stages; every fixed residual/registry input path is independently required to stay on a local read-only mount and may not traverse symbolic links. Do not point a recovery run at an image that another acquisition process is still extending.
 
-The destination must be a dedicated case subdirectory on the separate recovery filesystem, for example `/mnt/recovery-disk/case-001`; the filesystem mount root itself is rejected. Reusing a fully initialized Agetnic case is supported for resumable imaging and additional runs only when its bounded, stable control files contain a recognized terminal status and the recorded source, destination, case ID, sensitive plan, and redacted plan all match exactly. An exclusive case lock prevents concurrent runs, and the destination is checked again while the lock is held. If a process is killed without cleanup, inspect the sensitive state and running processes before treating the remaining lock as stale; unrelated or partially initialized non-empty directories are rejected.
+The destination must be a dedicated case subdirectory on the separate recovery filesystem, for example `/mnt/recovery-disk/case-001`; the filesystem mount root itself is rejected. Reusing a fully initialized AARK case is supported for resumable imaging and additional runs only when its bounded, stable control files contain a recognized terminal status and the recorded source, destination, case ID, sensitive plan, and redacted plan all match exactly. An exclusive case lock prevents concurrent runs, and the destination is checked again while the lock is held. If a process is killed without cleanup, inspect the sensitive state and running processes before treating the remaining lock as stale; unrelated or partially initialized non-empty directories are rejected.
 
 Recovery engines run with the case's private log directory as their current directory and receive a separate private case-local temporary directory, so incidental engine files cannot land in the operator's working directory or on a mounted source. Cancellation targets the engine's isolated process group and escalates to `SIGKILL`, preventing a helper process from continuing to write after the parent exits. The same process-tree termination is triggered when periodic checks detect that the destination directory, backing mount, a nested mount inside the case, or the exact case-lock inode changed during a long stage. Before execution, planned files and directories are checked for the required type; file outputs may not be hard links to the source, analysis image, or another output, and a successful engine must leave every declared output present.
 
@@ -44,7 +44,7 @@ The orchestrator deliberately does not ask PhotoRec to distinguish allocated fro
 
 ## BitLocker
 
-Keep the encrypted physical source read-only. Use dislocker or another audited implementation to expose a decrypted view, then mount the resulting filesystem read-only. Passwords and recovery keys should be read from a protected file or interactive input and must not be placed in process arguments, logs, JSON configuration, or shell history. Because dislocker’s credential modes vary, Agetnic Tools inventories its availability but does not automate a password-bearing command line.
+Keep the encrypted physical source read-only. Use dislocker or another audited implementation to expose a decrypted view, then mount the resulting filesystem read-only. Passwords and recovery keys should be read from a protected file or interactive input and must not be placed in process arguments, logs, JSON configuration, or shell history. Because dislocker’s credential modes vary, AARK inventories its availability but does not automate a password-bearing command line.
 
 ## Volume Shadow Copies
 

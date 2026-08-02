@@ -1,6 +1,8 @@
-# Agetnic Tools
+# AARK
 
-Reusable, offline-first tools for recovering deleted data from disks and then mining the recovered material for private keys, cryptographic material, password-manager databases, wallet artifacts, and credentials.
+AARK (Agentic Artifact Recovery Kit) is an offline-first toolkit for recovering deleted data from disks and then mining the recovered material for private keys, cryptographic material, password-manager databases, wallet artifacts, and credentials.
+
+Its reviewed plans, bounded commands, structured manifests, and deterministic reports are designed for both direct human operation and agentic workflows. The current implementation remains fully local and does not bundle an autonomous agent.
 
 The project is deliberately split into two layers:
 
@@ -12,7 +14,7 @@ The project is deliberately split into two layers:
 
 ## Why this shape?
 
-Node.js is a good fit for orchestration, streaming scans, manifests, validation, and a cross-tool CLI. It is not a good replacement for years of filesystem and forensic work in GNU ddrescue, The Sleuth Kit, TestDisk/PhotoRec, libvshadow, dislocker, bulk_extractor, or Impacket. Agetnic Tools calls those projects with argument arrays instead of shell strings and keeps their output behind a consistent, auditable case layout.
+Node.js is a good fit for orchestration, streaming scans, manifests, validation, and a cross-tool CLI. It is not a good replacement for years of filesystem and forensic work in GNU ddrescue, The Sleuth Kit, TestDisk/PhotoRec, libvshadow, dislocker, bulk_extractor, or Impacket. AARK calls those projects with argument arrays instead of shell strings and keeps their output behind a consistent, auditable case layout.
 
 No telemetry, LLM/API integration, cloud validation, or network lookup is performed by the CLI. Recovered secret values never leave the machine.
 
@@ -36,39 +38,41 @@ sudo apt install gddrescue testdisk sleuthkit ntfs-3g \
 ## Install from source
 
 ```bash
-git clone https://github.com/ga-nyc/agetnic-tools.git
-cd agetnic-tools
+git clone https://github.com/ga-nyc/aark.git
+cd aark
 npm ci
 npm run build
 npm link
-agetnic doctor
+aark doctor
 ```
+
+The legacy `agetnic` and `agetnic-tools` executable names remain available as compatibility aliases. New scripts should use `aark`.
 
 ## Quick start
 
 First inventory the machine without changing anything:
 
 ```bash
-agetnic recover inventory --json
+aark recover inventory --json
 ```
 
 Create a case configuration and review its execution plan:
 
 ```bash
 cp examples/recovery-case.example.json recovery-case.json
-agetnic recover plan --config recovery-case.json
+aark recover plan --config recovery-case.json
 ```
 
 The generated plan defaults to dry-run behavior. Execution requires both a configuration that says `execute: true` and an explicit CLI confirmation flag:
 
 ```bash
-sudo agetnic recover run --config recovery-case.json --execute
+sudo aark recover run --config recovery-case.json --execute
 ```
 
 Mine one or more recovered directories:
 
 ```bash
-agetnic mine scan /mnt/recovery/case-001/recovered \
+aark mine scan /mnt/recovery/case-001/recovered \
   --output /mnt/recovery/case-001/sensitive-mining \
   --provenance unallocated-carve
 ```
@@ -83,7 +87,7 @@ The output contains:
 
 The recovery layer writes the same pair of final-report filenames at the case root. Its sensitive report records the restored-data folder, source and destination devices, stage status, provenance, and per-stage output locations. Reports are produced by deterministic local code; their content is not sent to an LLM or remote service.
 
-Use `agetnic mine reveal <artifact>` when you intentionally want a validated artifact printed locally. It first checks that the file is referenced by a finalized adjacent inventory and still matches its recorded size and SHA-256 hash. The explicit reveal command is never invoked by a scan and its output is never copied into a log.
+Use `aark mine reveal <artifact>` when you intentionally want a validated artifact printed locally. It first checks that the file is referenced by a finalized adjacent inventory and still matches its recorded size and SHA-256 hash. The explicit reveal command is never invoked by a scan and its output is never copied into a log. Inventories created under the former `agetnic-tools` name remain supported.
 
 ## Recovery stages
 
@@ -135,6 +139,8 @@ See [Security model](SECURITY.md), [data flow and failure behavior](docs/data-fl
 ## Project status
 
 This is an early forensic toolkit. Review every plan before execution and retain original images and tool logs. Contributions that add deterministic validators, new read-only adapters, or synthetic tests are welcome.
+
+The planned next layer is optional, offline OCR over recovered screenshots to locate candidate secrets, keys, and cryptocurrency material. It is not implemented yet; when added, it will preserve AARK's local-only processing, provenance, validation, and redaction boundaries.
 
 ## Usage rights
 

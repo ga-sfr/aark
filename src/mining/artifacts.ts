@@ -141,7 +141,7 @@ export class ArtifactStore {
     const finished = status !== "in-progress";
     return {
       version: 1,
-      tool: "agetnic-tools",
+      tool: "aark",
       layer: "mining",
       status,
       complete: status === "complete" || status === "complete-with-errors",
@@ -166,7 +166,7 @@ export class ArtifactStore {
     }
     return {
       version: 1,
-      tool: "agetnic-tools",
+      tool: "aark",
       layer: "mining",
       status,
       complete: status === "complete" || status === "complete-with-errors",
