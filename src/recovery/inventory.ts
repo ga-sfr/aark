@@ -11,6 +11,7 @@ export async function machineInventory(): Promise<unknown> {
     captureCommand("findmnt", ["--json", "--bytes", "--output", "SOURCE,TARGET,FSTYPE,OPTIONS,SIZE,AVAIL"], { timeoutMs: 30_000 }),
   ]);
   if (block.exitCode !== 0 || mounts.exitCode !== 0) throw new Error("failed to inventory block devices or mounts");
+  if (block.stdoutTruncated || mounts.stdoutTruncated) throw new Error("device inventory exceeded the bounded command-output capture");
   let blockDevices: unknown;
   let mountedFilesystems: unknown;
   try {

@@ -35,6 +35,8 @@ function config(): RecoveryConfig {
 
 test("recovery plan selects deleted/unallocated modes and redacts local paths", () => {
   const plan = buildRecoveryPlan(config());
+  assert.equal(plan.requireReadOnlySource, true);
+  assert.deepEqual(plan.storage, { minFreeGiB: 5, minFreePercent: 5 });
   const tsk = plan.steps.find((step) => step.executable === "tsk_recover");
   assert.ok(tsk);
   assert.equal(tsk.args.includes("-e"), false);
@@ -50,6 +52,11 @@ test("recovery plan selects deleted/unallocated modes and redacts local paths", 
   assert.equal(rendered.includes(config().caseId), false);
   assert.ok(rendered.includes("<SOURCE>"));
   assert.ok(rendered.includes("<CASE_ROOT>"));
+  assert.match(rendered, /"requireReadOnlySource":true/);
+
+  const weakened = config();
+  weakened.requireReadOnlySource = false;
+  assert.notDeepEqual(buildRecoveryPlan(weakened), plan);
 });
 
 test("recovery plan uses supported ddrescue and ntfsundelete options", () => {
@@ -111,12 +118,14 @@ test("recovery final reports locate restored outputs while the shareable version
     kind: "block-device",
     bytes: 1024,
     regularFileIdentity: null,
+    blockDeviceIdentity: { device: 1, inode: 2, rawDevice: 3 },
     kernelReadOnly: true,
     writableMounts: [],
     sourceTopDevices: ["/dev/source-physical-test"],
     sourceTopDevice: "/dev/source-physical-test",
     destinationDevices: ["/dev/destination-physical-test"],
     destinationDevice: "/dev/destination-physical-test",
+    destinationFilesystemDevice: 200,
     destinationMountSource: "/dev/destination-partition-test",
     destinationBackingKind: "block-device",
     deviceComparisonCertain: true,
@@ -149,6 +158,9 @@ test("recovery config rejects typos, coercion, and allocated-space carving", asy
     stages: { signatureCarving: true },
   };
 
+  await writeFile(filename, JSON.stringify({ ...valid, storage: { minFreeGiB: 1.001, minFreePercent: 1.15, maxOutputGiB: 100.003 } }));
+  assert.deepEqual((await loadRecoveryConfig(filename)).storage, { minFreeGiB: 1.001, minFreePercent: 1.15, maxOutputGiB: 100.003 });
+
   await writeFile(filename, JSON.stringify({ ...valid, stages: { signatureCarvin: false } }));
   await assert.rejects(loadRecoveryConfig(filename), /unknown field/);
 
@@ -158,6 +170,15 @@ test("recovery config rejects typos, coercion, and allocated-space carving", asy
   await writeFile(filename, JSON.stringify({ ...valid, sectorOffset: "2048" }));
   await assert.rejects(loadRecoveryConfig(filename), /sectorOffset must be an integer/);
 
+  await writeFile(filename, JSON.stringify({ ...valid, storage: { minFreePercent: 101 } }));
+  await assert.rejects(loadRecoveryConfig(filename), /storage.minFreePercent/);
+
+  await writeFile(filename, JSON.stringify({ ...valid, storage: { minFreePercent: 5.001 } }));
+  await assert.rejects(loadRecoveryConfig(filename), /two decimal places/);
+
+  await writeFile(filename, JSON.stringify({ ...valid, storage: { maxOutputGiB: 0 } }));
+  await assert.rejects(loadRecoveryConfig(filename), /storage.maxOutputGiB/);
+
   await writeFile(filename, JSON.stringify({ ...valid, destination: "/" }));
   await assert.rejects(loadRecoveryConfig(filename), /dedicated case directory/);
 
@@ -165,6 +186,9 @@ test("recovery config rejects typos, coercion, and allocated-space carving", asy
   await assert.rejects(loadRecoveryConfig(filename), /control characters/);
 
   await writeFile(filename, JSON.stringify({ ...valid, source: "/mnt/destination-test/strict-case/evidence/source.img" }));
+  await assert.rejects(loadRecoveryConfig(filename), /source must not be stored inside/);
+
+  await writeFile(filename, JSON.stringify({ ...valid, source: "/mnt/destination-test/strict-case/..source.img" }));
   await assert.rejects(loadRecoveryConfig(filename), /source must not be stored inside/);
 
   await writeFile(filename, JSON.stringify({ ...valid, analysisSource: "/mnt/destination-test/strict-case/recovery/unallocated/free-space.raw" }));
@@ -226,7 +250,7 @@ test("recovery completion and interruption both produce sensitive and redacted f
   assert.match(completeRedacted, /Status: complete/);
   assert.equal(completeRedacted.includes(completeConfig.caseId), false);
   assert.ok((await readdir(path.join(completeDestination, "runs"))).some((filename) => filename.endsWith("-final-report-sensitive.md")));
-  await assert.rejects(access(path.join(completeDestination, ".agetnic-recovery.lock")));
+  await assert.rejects(access(path.join(completeDestination, ".aark-recovery.lock")));
 
   const redactedPlanPath = path.join(completeDestination, "plan-redacted.json");
   const storedRedactedPlan = await readFile(redactedPlanPath);
@@ -239,10 +263,18 @@ test("recovery completion and interruption both produce sensitive and redacted f
     runRecoveryPlan(mismatchedConfig, buildRecoveryPlan(mismatchedConfig), true),
     /belongs to a different/,
   );
-  const lockPath = path.join(completeDestination, ".agetnic-recovery.lock");
+  await assert.rejects(
+    runRecoveryPlan(completeConfig, buildRecoveryPlan(completeConfig), true),
+    /only be reused for its explicitly resumable ddrescue quota pause/,
+  );
+  const lockPath = path.join(completeDestination, ".aark-recovery.lock");
   await writeFile(lockPath, "synthetic stale lock");
   await assert.rejects(runRecoveryPlan(completeConfig, buildRecoveryPlan(completeConfig), true), /exclusive lock/);
   await unlink(lockPath);
+  const legacyLockPath = path.join(completeDestination, ".agetnic-recovery.lock");
+  await writeFile(legacyLockPath, "synthetic stale legacy lock");
+  await assert.rejects(runRecoveryPlan(completeConfig, buildRecoveryPlan(completeConfig), true), /exclusive lock/);
+  await unlink(legacyLockPath);
 
   const interruptedDestination = path.join(root, "interrupted-case");
   const interruptedConfig = makeConfig(interruptedDestination);
@@ -251,5 +283,6 @@ test("recovery completion and interruption both produce sensitive and redacted f
   await assert.rejects(runRecoveryPlan(interruptedConfig, buildRecoveryPlan(interruptedConfig), true, controller.signal), /interrupted/);
   assert.match(await readFile(path.join(interruptedDestination, "final-report-sensitive.md"), "utf8"), /Status: interrupted/);
   assert.match(await readFile(path.join(interruptedDestination, "final-report-redacted.md"), "utf8"), /Status: interrupted/);
+  await assert.rejects(access(path.join(interruptedDestination, ".aark-recovery.lock")));
   await assert.rejects(access(path.join(interruptedDestination, ".agetnic-recovery.lock")));
 });

@@ -44,6 +44,28 @@ function integer(value: unknown, fallback: number, label: string, minimum: numbe
   return value as number;
 }
 
+function hasFixedPrecision(value: number, scale: number): boolean {
+  const rounded = Math.round(value * scale);
+  const tolerance = Number.EPSILON * Math.max(1, Math.abs(value)) * 8;
+  return Number.isSafeInteger(rounded) && Math.abs(value - rounded / scale) <= tolerance;
+}
+
+function decimal(value: unknown, fallback: number, label: string, minimum: number, maximum: number): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < minimum || value > maximum || !hasFixedPrecision(value, 1000)) {
+    throw new Error(`${label} must be a number from ${minimum} through ${maximum} with at most three decimal places`);
+  }
+  return value;
+}
+
+function percentage(value: unknown, fallback: number, label: string): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 100 || !hasFixedPrecision(value, 100)) {
+    throw new Error(`${label} must be a number from 0 through 100 with at most two decimal places`);
+  }
+  return value;
+}
+
 function absolute(value: unknown, label: string): string {
   const result = text(value, label);
   if (!path.isAbsolute(result)) throw new Error(`${label} must be an absolute path`);
@@ -52,20 +74,22 @@ function absolute(value: unknown, label: string): string {
 
 function within(root: string, candidate: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 export async function loadRecoveryConfig(filename: string): Promise<RecoveryConfig> {
   const document = record(await readJson<unknown>(filename), "configuration");
   knownKeys(document, [
     "version", "caseId", "source", "analysisSource", "mountedReadOnlyRoot", "destination",
-    "requireReadOnlySource", "execute", "sectorOffset", "photoRecCommand", "image", "stages",
+    "requireReadOnlySource", "execute", "sectorOffset", "photoRecCommand", "image", "stages", "storage",
   ], "configuration");
   if (document.version !== 1) throw new Error("configuration version must be 1");
   const stagesInput = document.stages === undefined ? {} : record(document.stages, "stages");
   const imageInput = document.image === undefined ? {} : record(document.image, "image");
+  const storageInput = document.storage === undefined ? {} : record(document.storage, "storage");
   knownKeys(stagesInput, Object.keys(DEFAULT_STAGES), "stages");
   knownKeys(imageInput, ["enabled", "path", "mapfile", "retryPasses"], "image");
+  knownKeys(storageInput, ["minFreeGiB", "minFreePercent", "maxOutputGiB"], "storage");
   const imageEnabled = boolean(imageInput.enabled, false, "image.enabled");
   const source = absolute(document.source, "source");
   const destination = absolute(document.destination, "destination");
@@ -150,6 +174,13 @@ export async function loadRecoveryConfig(filename: string): Promise<RecoveryConf
     execute: boolean(document.execute, false, "execute"),
     sectorOffset,
     photoRecCommand,
+    storage: {
+      minFreeGiB: decimal(storageInput.minFreeGiB, 5, "storage.minFreeGiB", 0, 1_000_000),
+      minFreePercent: percentage(storageInput.minFreePercent, 5, "storage.minFreePercent"),
+      ...(storageInput.maxOutputGiB === undefined ? {} : {
+        maxOutputGiB: decimal(storageInput.maxOutputGiB, 0, "storage.maxOutputGiB", 0.001, 1_000_000),
+      }),
+    },
     image: {
       enabled: imageEnabled,
       path: imagePath,

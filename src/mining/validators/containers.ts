@@ -61,7 +61,7 @@ function completeDer(value: Buffer): boolean {
   return header + payload === value.length;
 }
 
-export function validateJks(data: Buffer): ContainerValidation | null {
+export function validateJks(data: Buffer, takeValidation: () => boolean = () => true): ContainerValidation | null {
   try {
     const reader = new Reader(data);
     if (reader.u32be() !== 0xfeedfeed) return null;
@@ -72,6 +72,7 @@ export function validateJks(data: Buffer): ContainerValidation | null {
     let trustedCertificateEntries = 0;
     let certificates = 0;
     for (let index = 0; index < entries; index += 1) {
+      if (!takeValidation()) throw new Error("JKS validation limit reached");
       const tag = reader.u32be();
       reader.modifiedUtf();
       const timestamp = reader.u64be();
@@ -83,6 +84,8 @@ export function validateJks(data: Buffer): ContainerValidation | null {
         const chain = reader.u32be();
         if (chain > 10_000) throw new Error("invalid certificate chain count");
         for (let item = 0; item < chain; item += 1) {
+          if (certificates >= 100_000) throw new Error("JKS certificate count exceeds its validation limit");
+          if (!takeValidation()) throw new Error("JKS validation limit reached");
           if (version === 2) reader.modifiedUtf();
           const certificate = reader.read(reader.u32be());
           new X509Certificate(certificate);
@@ -407,12 +410,13 @@ function openPgpPacket(data: Buffer, offset: number): { tag: number; bodyStart: 
   return { tag, bodyStart: cursor, end: cursor + length };
 }
 
-export function validateOpenPgpSecretKeyring(data: Buffer): ContainerValidation | null {
+export function validateOpenPgpSecretKeyring(data: Buffer, takeValidation: () => boolean = () => true): ContainerValidation | null {
   if (data.length < 16) return null;
   let cursor = 0;
   let packets = 0;
   let secretPackets = 0;
   while (cursor < data.length && packets < 100_000) {
+    if (!takeValidation()) return null;
     const packet = openPgpPacket(data, cursor);
     if (packet === null || packet.end <= cursor) return null;
     if (packet.tag === 5 || packet.tag === 7) {
@@ -435,6 +439,7 @@ export function validateOpenPgpSecretKeyring(data: Buffer): ContainerValidation 
 
 export function validateGnuPgPrivateSExpression(data: Buffer): ContainerValidation | null {
   if (data.length < 64 || data.length > 64 * 1024 * 1024 || data.includes(0)) return null;
+  if (!data.includes(Buffer.from("(private-key", "ascii")) && !data.includes(Buffer.from("(protected-private-key", "ascii"))) return null;
   const text = data.toString("utf8");
   if (!/\((?:protected-)?private-key\s+\(/.test(text)) return null;
   let depth = 0;
@@ -468,13 +473,22 @@ export function validateGnuPgPrivateSExpression(data: Buffer): ContainerValidati
   };
 }
 
-export function validateStructuredContainer(data: Buffer): ContainerValidation | null {
-  return validateJks(data)
-    ?? validatePasswordSafeV3(data)
+export function validateStructuredContainer(data: Buffer, takeValidation: () => boolean = () => true): ContainerValidation | null {
+  let exhausted = false;
+  const boundedValidation = (): boolean => {
+    const available = takeValidation();
+    if (!available) exhausted = true;
+    return available;
+  };
+  const jks = validateJks(data, boundedValidation);
+  if (jks !== null || exhausted) return jks;
+  const fixed = validatePasswordSafeV3(data)
     ?? validateKdbx(data)
     ?? validateBitcoinCoreBerkeleyWallet(data)
     ?? validateSensitiveSqlite(data)
-    ?? validatePkcs12(data)
-    ?? validateOpenPgpSecretKeyring(data)
-    ?? validateGnuPgPrivateSExpression(data);
+    ?? validatePkcs12(data);
+  if (fixed !== null) return fixed;
+  const openPgp = validateOpenPgpSecretKeyring(data, boundedValidation);
+  if (openPgp !== null || exhausted) return openPgp;
+  return validateGnuPgPrivateSExpression(data);
 }

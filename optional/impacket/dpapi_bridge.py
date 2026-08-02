@@ -29,8 +29,7 @@ _NETWORK_FILESYSTEMS = {
     "9p", "afs", "ceph", "cifs", "davfs", "glusterfs", "lustre", "nfs", "nfs4", "smb3", "virtiofs"
 }
 _LOCAL_FUSE_FILESYSTEMS = {
-    "fuse.bindfs", "fuse.dislocker", "fuse.encfs", "fuse.exfat", "fuse.mergerfs",
-    "fuse.ntfs", "fuse.ntfs-3g", "fuse.unionfs", "fuseblk",
+    "fuse.dislocker", "fuse.exfat", "fuse.ntfs", "fuse.ntfs-3g", "fuseblk",
 }
 
 
@@ -60,7 +59,7 @@ def _nearest_existing(value: pathlib.Path) -> pathlib.Path:
 
 def _mount_for(value: pathlib.Path) -> tuple[str, str, str]:
     resolved = os.path.abspath(value)
-    candidates: list[tuple[str, str, str]] = []
+    selected: tuple[str, str, str] | None = None
     with open("/proc/self/mounts", "r", encoding="utf-8") as mounts_file:
         for line in mounts_file:
             fields = line.rstrip("\n").split(" ")
@@ -69,10 +68,13 @@ def _mount_for(value: pathlib.Path) -> tuple[str, str, str]:
             source, target, filesystem = (_unescape_mount(fields[index]) for index in range(3))
             prefix = "/" if target == "/" else target.rstrip("/") + "/"
             if resolved == target or resolved.startswith(prefix):
-                candidates.append((source, target, filesystem.lower()))
-    if not candidates:
+                candidate = (source, target, filesystem.lower())
+                # Later records are the visible topmost layer for stacked mounts.
+                if selected is None or len(target) >= len(selected[1]):
+                    selected = candidate
+    if selected is None:
         raise ValueError("could not determine the local mount backing a protected path")
-    return max(candidates, key=lambda record: len(record[1]))
+    return selected
 
 
 def _assert_local_path(value: pathlib.Path, label: str) -> tuple[str, str, str]:
@@ -106,6 +108,8 @@ def _block_source_is_network(source: str) -> bool:
             timeout=30,
             env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
         )
+        if len(completed.stdout) > 64 * 1024:
+            raise ValueError("block-transport inventory exceeded its bounded output limit")
         document = json.loads(completed.stdout.decode("utf-8")) if completed.returncode == 0 else None
     except (OSError, subprocess.SubprocessError, UnicodeError, json.JSONDecodeError):
         document = None
@@ -149,13 +153,14 @@ def _assert_no_symlink_components(value: pathlib.Path) -> None:
 
 
 def _read_bounded(source: pathlib.Path, maximum: int, label: str) -> bytes:
+    expected_path = os.path.abspath(source)
     _assert_no_symlink_components(source)
     mount_before = _assert_local_path(source, label)
     descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
     try:
         before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError(f"{label} must be a regular, non-symbolic-link file")
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError(f"{label} must be a single-link regular, non-symbolic-link file")
         if before.st_size < 0 or before.st_size > maximum:
             raise ValueError(f"{label} exceeds its {maximum}-byte safety limit")
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
@@ -163,10 +168,17 @@ def _read_bounded(source: pathlib.Path, maximum: int, label: str) -> bytes:
         if len(value) > maximum:
             raise ValueError(f"{label} exceeds its {maximum}-byte safety limit")
         after = os.fstat(descriptor)
+        current = os.lstat(source)
         if (
             len(value) != before.st_size
             or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
             != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            or os.path.realpath(f"/proc/self/fd/{descriptor}") != expected_path
+            or os.path.realpath(source) != expected_path
             or _assert_local_path(source, label) != mount_before
         ):
             raise ValueError(f"{label} changed while it was being read")
@@ -177,6 +189,7 @@ def _read_bounded(source: pathlib.Path, maximum: int, label: str) -> bytes:
 
 def _private_no_clobber_write(destination: pathlib.Path, value: bytes) -> None:
     destination = pathlib.Path(os.path.abspath(destination))
+    expected_path = os.path.abspath(destination)
     _assert_no_symlink_components(destination)
     mount_before = _assert_local_path(destination, "output")
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -187,7 +200,15 @@ def _private_no_clobber_write(destination: pathlib.Path, value: bytes) -> None:
     opened = os.fstat(descriptor)
     try:
         current = os.lstat(destination)
-        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino) or opened.st_nlink != 1 or current.st_nlink != 1:
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+            or opened.st_nlink != 1
+            or current.st_nlink != 1
+            or os.path.realpath(f"/proc/self/fd/{descriptor}") != expected_path
+            or os.path.realpath(destination) != expected_path
+        ):
             raise ValueError("output path changed immediately after protected creation")
         if _assert_local_path(destination, "output") != mount_before:
             raise ValueError("output mount changed immediately before decrypted bytes were written")
@@ -199,7 +220,12 @@ def _private_no_clobber_write(destination: pathlib.Path, value: bytes) -> None:
         if _assert_local_path(destination, "output") != mount_before:
             raise ValueError("output mount changed while decrypted bytes were being written")
         current = os.lstat(destination)
-        if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1 or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+            or os.path.realpath(destination) != expected_path
+        ):
             raise ValueError("output path changed while decrypted bytes were being written")
         directory = os.open(destination.parent, os.O_RDONLY)
         try:

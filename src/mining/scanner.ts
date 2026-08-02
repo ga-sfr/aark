@@ -1,30 +1,68 @@
 import { constants } from "node:fs";
-import { lstat, open, readdir, realpath } from "node:fs/promises";
+import { availableParallelism } from "node:os";
+import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { Candidate } from "../core/types.js";
-import { acquireExclusiveLock, nearestExistingParent, walkRegularFiles } from "../core/fs-safe.js";
-import type { WalkedFile } from "../core/fs-safe.js";
+import { acquireExclusiveLock, nearestExistingParent, readDirectoryNamesBounded, walkRegularFiles } from "../core/fs-safe.js";
+import type { ExclusiveLock, WalkedFile } from "../core/fs-safe.js";
 import { filesystemIsNetwork, mountForPathFrom, mountIsNetworkBacked, mounts } from "../core/mounts.js";
 import type { MountRecord } from "../core/mounts.js";
+import {
+  assertStorageCapacity,
+  directoryLogicalBytes,
+  StorageBudget,
+  StorageQuotaError,
+  storagePolicyFromGiB,
+} from "../core/storage.js";
+import type { StoragePolicy } from "../core/storage.js";
 import { ArtifactStore } from "./artifacts.js";
-import { detectCryptographicKeys, detectDeepKeySchedules } from "./detectors/keys.js";
-import { detectConfigurationSecrets } from "./detectors/config-secrets.js";
-import { detectProviderCredentials } from "./detectors/providers.js";
-import { detectStructuredArtifacts } from "./detectors/structured.js";
-import type { DetectionContext, Detector } from "./detectors/types.js";
-import { detectWalletSecrets } from "./detectors/wallets.js";
-import type { MiningOptions, MiningProgress } from "./types.js";
+import type { DetectionContext } from "./detectors/types.js";
+import {
+  createScanManifest,
+  loadResumeInventory,
+  loadScanState,
+  newScanState,
+  readScanManifest,
+  SCAN_FILES_FILENAME,
+  SCAN_STATE_FILENAME,
+  verifyResumeArtifacts,
+  writeScanState,
+} from "./resume.js";
+import type {
+  FrozenScanFile,
+  ScanCursor,
+  ScanOperationalOptions,
+  ScanSemanticOptions,
+  ScanState,
+} from "./resume.js";
+import type { MiningOptions, MiningProgress, MiningRunStatus, SensitiveScanInventory } from "./types.js";
+import { isBoundedJsonValue, isSafeDetectorIdentifier, MAX_CANDIDATE_BYTES_PER_DETECTOR_JOB, MAX_DERIVED_ARTIFACT_BYTES_PER_CANDIDATE, MAX_INPUT_ROOTS, MAX_STREAMING_CANDIDATE_BYTES_PER_DETECTOR_JOB } from "./limits.js";
 import { MAX_DPAPI_BLOB_BYTES } from "./validators/dpapi.js";
+import type { DetectorBatchResult, DetectorJobKind } from "./worker-protocol.js";
+import { DetectorWorkerPool } from "./worker-pool.js";
 
-const STREAM_DETECTORS: Array<{ name: string; detector: Detector }> = [
-  { name: "cryptographic-keys", detector: detectCryptographicKeys },
-  { name: "configuration-secrets", detector: detectConfigurationSecrets },
-  { name: "wallet-secrets", detector: detectWalletSecrets },
-  { name: "provider-credentials", detector: detectProviderCredentials },
-];
 const MINIMUM_SAFE_OVERLAP = MAX_DPAPI_BLOB_BYTES + 1024 * 1024;
 const DEEP_SCAN_SLICE_BYTES = 1024 * 1024;
 const DEEP_SCAN_OVERLAP_BYTES = 256;
+const MAX_BUFFERED_SCAN_WINDOWS_BYTES = 256 * 1024 * 1024;
+const STREAMING_DETECTOR_KINDS = [
+  "cryptographic-keys",
+  "configuration-secrets",
+  "wallet-secrets",
+  "provider-credentials",
+] as const satisfies readonly DetectorJobKind[];
+const MINING_LOCK_FILENAME = ".aark-mining.lock";
+const LEGACY_MINING_LOCK_FILENAME = ".agetnic-mining.lock";
+const MINING_LOCK_FILENAMES = [MINING_LOCK_FILENAME, LEGACY_MINING_LOCK_FILENAME] as const;
+const PROVENANCE_VALUES = new Set([
+  "deleted-metadata",
+  "unallocated-carve",
+  "unallocated-stream",
+  "shadow-copy",
+  "residual-memory",
+  "allocated-reference",
+  "unknown",
+]);
 
 interface PathSafetySnapshot {
   path: string;
@@ -40,6 +78,47 @@ interface OutputSafetySnapshot extends PathSafetySnapshot {
   lockInode: number;
 }
 
+interface NormalizedMiningOptions extends MiningOptions {
+  workers: number;
+  minimumFreeGiB: number;
+  minimumFreePercent: number;
+}
+
+export interface MiningResumeOptions {
+  output: string;
+  workers?: number;
+  minimumFreeGiB?: number;
+  minimumFreePercent?: number;
+  maximumOutputGiB?: number;
+  signal?: AbortSignal;
+  progress?: (progress: MiningProgress) => void;
+}
+
+interface DetectorWork {
+  kind: DetectorJobKind;
+  data: Buffer;
+  context: DetectionContext;
+}
+
+interface DetectorWorkResult extends DetectorWork {
+  batches: DetectorBatchResult[];
+}
+
+interface ScanRuntime {
+  options: NormalizedMiningOptions;
+  policy: StoragePolicy;
+  inputSafety: PathSafetySnapshot[];
+  outputSafety: OutputSafetySnapshot;
+  lockPath: string;
+  locks: ExclusiveLock[];
+  store: ArtifactStore;
+  budget: StorageBudget;
+  pool: DetectorWorkerPool;
+  state: ScanState;
+  progress: MiningProgress;
+  isNetworkMount: (record: MountRecord) => Promise<boolean>;
+}
+
 class ArtifactWriteError extends Error {
   public override readonly name = "ArtifactWriteError";
 }
@@ -50,7 +129,7 @@ class ScanControlError extends Error {
 
 function inside(parent: string, child: string): boolean {
   const relative = path.relative(path.resolve(parent), path.resolve(child));
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 function interrupted(signal: AbortSignal | undefined): boolean {
@@ -126,6 +205,38 @@ async function assertOutputSafetyCurrent(expected: OutputSafetySnapshot, lockPat
   ) throw new Error("mining output, mount, or exclusive lock changed after preflight");
 }
 
+async function assertRuntimeOutputCurrent(runtime: Pick<ScanRuntime, "outputSafety" | "lockPath" | "locks">): Promise<void> {
+  for (const lock of runtime.locks) await lock.assertHeld();
+  await assertOutputSafetyCurrent(runtime.outputSafety, runtime.lockPath);
+}
+
+async function acquireMiningLocks(directory: string): Promise<ExclusiveLock[]> {
+  const locks: ExclusiveLock[] = [];
+  try {
+    for (const filename of [...MINING_LOCK_FILENAMES].sort()) {
+      locks.push(await acquireExclusiveLock(directory, filename));
+    }
+    return locks;
+  } catch (error) {
+    const releaseErrors: unknown[] = [];
+    for (const lock of [...locks].reverse()) {
+      try { await lock.release(); } catch (releaseError) { releaseErrors.push(releaseError); }
+    }
+    if (releaseErrors.length > 0) {
+      throw new AggregateError([error, ...releaseErrors], "mining lock acquisition failed and acquired locks could not all be released");
+    }
+    throw error;
+  }
+}
+
+async function releaseMiningLocks(locks: ExclusiveLock[]): Promise<void> {
+  const errors: unknown[] = [];
+  for (const lock of [...locks].reverse()) {
+    try { await lock.release(); } catch (error) { errors.push(error); }
+  }
+  if (errors.length > 0) throw new AggregateError(errors, "mining operation locks could not all be released");
+}
+
 async function canonicalCreationPath(output: string): Promise<string> {
   try {
     return await realpath(output);
@@ -142,7 +253,7 @@ async function assertFreshSafeOutput(inputs: string[], output: string): Promise<
     const metadata = await lstat(output);
     if (metadata.isSymbolicLink()) throw new Error("mining output must not be a symbolic link");
     if (!metadata.isDirectory()) throw new Error("mining output exists and is not a directory");
-    if ((await readdir(output)).length !== 0) throw new Error("mining output directory must be new or empty");
+    if ((await readDirectoryNamesBounded(output, 1)).length !== 0) throw new Error("mining output directory must be new or empty");
   } catch (error) {
     const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
     if (code !== "ENOENT") throw error;
@@ -162,11 +273,9 @@ async function assertFreshSafeOutput(inputs: string[], output: string): Promise<
   }
   const canonicalOutput = await canonicalCreationPath(output);
   for (const input of canonicalInputs) {
-    const canonicalInput = input.path;
-    if (input.directory && inside(canonicalInput, canonicalOutput)) throw new Error("mining output cannot be inside a scanned input directory");
-    if (canonicalInput === canonicalOutput) throw new Error("mining output cannot be an input");
+    if (input.directory && inside(input.path, canonicalOutput)) throw new Error("mining output cannot be inside a scanned input directory");
+    if (input.path === canonicalOutput) throw new Error("mining output cannot be an input");
   }
-
   const deduplicated = canonicalInputs.filter((candidate, index, all) =>
     all.findIndex((item) => item.path === candidate.path) === index
     && !all.some((parent) => parent.directory && parent.path !== candidate.path && inside(parent.path, candidate.path)));
@@ -175,37 +284,174 @@ async function assertFreshSafeOutput(inputs: string[], output: string): Promise<
 
 async function assertLockedFreshOutput(output: string): Promise<void> {
   const metadata = await lstat(output);
-  if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error("locked mining output must remain a real directory");
-  if (await realpath(output) !== output) throw new Error("mining output canonical path changed while its lock was acquired");
-  const entries = await readdir(output);
-  if (entries.length !== 1 || entries[0] !== ".agetnic-mining.lock") {
+  if (metadata.isSymbolicLink() || !metadata.isDirectory() || await realpath(output) !== output) {
+    throw new Error("locked mining output must remain a real canonical directory");
+  }
+  const entries = await readDirectoryNamesBounded(output, MINING_LOCK_FILENAMES.length + 1);
+  if (
+    entries.length !== MINING_LOCK_FILENAMES.length
+    || MINING_LOCK_FILENAMES.some((filename) => !entries.includes(filename))
+  ) {
     throw new Error("mining output changed between emptiness validation and exclusive lock acquisition");
   }
-  const lock = await lstat(path.join(output, ".agetnic-mining.lock"));
-  if (lock.isSymbolicLink() || !lock.isFile()) throw new Error("mining output lock is not a regular file");
 }
 
-async function runDetectors(
-  data: Buffer,
-  context: DetectionContext,
+async function assertLockedResumeOutput(output: string): Promise<void> {
+  const metadata = await lstat(output);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory() || await realpath(output) !== output) {
+    throw new Error("resumed mining output must remain a real canonical directory");
+  }
+  const allowed = new Set([
+    MINING_LOCK_FILENAME,
+    LEGACY_MINING_LOCK_FILENAME,
+    "artifacts",
+    "inventory-sensitive.json",
+    "manifest-redacted.json",
+    "final-report-sensitive.md",
+    "final-report-redacted.md",
+    SCAN_FILES_FILENAME,
+    SCAN_STATE_FILENAME,
+  ]);
+  const entries = await readDirectoryNamesBounded(output, allowed.size + 1);
+  if (
+    MINING_LOCK_FILENAMES.some((filename) => !entries.includes(filename))
+    || entries.some((entry) => !allowed.has(entry))
+  ) {
+    throw new Error("resumed mining output contains unexpected control or artifact entries");
+  }
+}
+
+function validateWorkerCount(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > 4) throw new Error("workers must be an integer from 1 through 4");
+  return value;
+}
+
+function validatedOptions(input: MiningOptions): NormalizedMiningOptions {
+  const options: NormalizedMiningOptions = {
+    ...input,
+    inputs: input.inputs.map((value) => path.resolve(value)),
+    output: path.resolve(input.output),
+    workers: validateWorkerCount(input.workers ?? Math.min(4, Math.max(1, availableParallelism() - 1))),
+    minimumFreeGiB: input.minimumFreeGiB ?? 5,
+    minimumFreePercent: input.minimumFreePercent ?? 5,
+  };
+  if (options.inputs.length === 0) throw new Error("at least one mining input is required");
+  if (options.inputs.length > MAX_INPUT_ROOTS) throw new Error(`mining accepts at most ${MAX_INPUT_ROOTS} input roots per scan`);
+  if (!PROVENANCE_VALUES.has(options.provenance)) throw new Error("mining provenance is not recognized");
+  for (const [label, value] of [["chunkBytes", options.chunkBytes], ["overlapBytes", options.overlapBytes], ["wholeFileBytes", options.wholeFileBytes]] as const) {
+    if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${label} must be a positive integer`);
+  }
+  if (options.chunkBytes < MINIMUM_SAFE_OVERLAP || options.chunkBytes > 128 * 1024 * 1024) throw new Error("chunkBytes must be between 17 MiB and 128 MiB");
+  if (options.overlapBytes < MINIMUM_SAFE_OVERLAP || options.overlapBytes > options.chunkBytes) throw new Error("overlapBytes must be between 17 MiB and chunkBytes so every supported streaming format can cross a chunk boundary");
+  if (options.wholeFileBytes > 256 * 1024 * 1024) throw new Error("wholeFileBytes must not exceed 256 MiB");
+  storagePolicyFromGiB(options.minimumFreeGiB, options.minimumFreePercent, options.maximumOutputGiB);
+  return options;
+}
+
+function semanticOptions(options: NormalizedMiningOptions): ScanSemanticOptions {
+  return {
+    inputs: [...options.inputs],
+    output: options.output,
+    provenance: options.provenance,
+    chunkBytes: options.chunkBytes,
+    overlapBytes: options.overlapBytes,
+    wholeFileBytes: options.wholeFileBytes,
+    deepKeySchedules: options.deepKeySchedules === true,
+  };
+}
+
+function operationalOptions(options: NormalizedMiningOptions): ScanOperationalOptions {
+  return {
+    workers: options.workers,
+    minimumFreeGiB: options.minimumFreeGiB,
+    minimumFreePercent: options.minimumFreePercent,
+    ...(options.maximumOutputGiB === undefined ? {} : { maximumOutputGiB: options.maximumOutputGiB }),
+  };
+}
+
+function normalizeCandidate(candidate: Candidate): Candidate {
+  return {
+    ...candidate,
+    value: Buffer.from(candidate.value),
+    validation: { method: candidate.validation.method, checks: { ...candidate.validation.checks } },
+    ...(candidate.derivedArtifacts === undefined ? {} : {
+      derivedArtifacts: candidate.derivedArtifacts.map((item) => ({ ...item, data: Buffer.from(item.data) })),
+    }),
+    ...(candidate.sensitiveMetadata === undefined ? {} : { sensitiveMetadata: { ...candidate.sensitiveMetadata } }),
+  };
+}
+
+function derivedArtifactsAreBounded(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!Array.isArray(value) || value.length > 16) return false;
+  let bytes = 0;
+  for (const artifact of value) {
+    if (
+      typeof artifact !== "object"
+      || artifact === null
+      || typeof artifact.filename !== "string"
+      || !(artifact.data instanceof Uint8Array)
+      || (artifact.mode !== undefined && !Number.isSafeInteger(artifact.mode))
+      || artifact.data.byteLength > MAX_DERIVED_ARTIFACT_BYTES_PER_CANDIDATE - bytes
+    ) return false;
+    bytes += artifact.data.byteLength;
+  }
+  return true;
+}
+
+async function commitDetectorResults(
+  result: DetectorWorkResult,
   sourcePath: string,
-  options: MiningOptions,
+  provenance: MiningOptions["provenance"],
   store: ArtifactStore,
-  detectors: Array<{ name: string; detector: Detector }>,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   let clean = true;
-  for (const { name, detector } of detectors) {
-    let candidates: Candidate[];
-    try {
-      candidates = detector(data, context);
-    } catch (error) {
-      store.recordError(sourcePath, `detector:${name}`, error);
+  let returnedCandidateBytes = 0;
+  const returnedCandidateByteLimit = result.kind === "structured"
+    ? MAX_CANDIDATE_BYTES_PER_DETECTOR_JOB
+    : MAX_STREAMING_CANDIDATE_BYTES_PER_DETECTOR_JOB;
+  for (const batch of result.batches) {
+    if (interrupted(signal)) throw new Error("scan paused");
+    if (batch.error !== undefined) {
+      store.recordError(sourcePath, `detector:${batch.detector}`, new Error(batch.error));
       clean = false;
-      continue;
     }
-    for (const candidate of candidates) {
+    for (const rawCandidate of batch.candidates) {
+      if (interrupted(signal)) throw new Error("scan paused");
       try {
-        const relativeOffset = candidate.offset - context.baseOffset;
+        if (
+          typeof rawCandidate !== "object"
+          || rawCandidate === null
+          || !isSafeDetectorIdentifier(rawCandidate.category)
+          || !["authenticated", "high", "medium", "marker-only"].includes(rawCandidate.confidence)
+          || typeof rawCandidate.extension !== "string"
+          || rawCandidate.extension.length < 1
+          || rawCandidate.extension.length > 64
+          || !(rawCandidate.value instanceof Uint8Array)
+          || typeof rawCandidate.validation !== "object"
+          || rawCandidate.validation === null
+          || !isSafeDetectorIdentifier(rawCandidate.validation.method)
+          || typeof rawCandidate.validation.checks !== "object"
+          || rawCandidate.validation.checks === null
+          || Array.isArray(rawCandidate.validation.checks)
+          || !isBoundedJsonValue(rawCandidate.validation.checks)
+          || (rawCandidate.sensitiveMetadata !== undefined && (
+            typeof rawCandidate.sensitiveMetadata !== "object"
+            || rawCandidate.sensitiveMetadata === null
+            || Array.isArray(rawCandidate.sensitiveMetadata)
+            || !isBoundedJsonValue(rawCandidate.sensitiveMetadata)
+          ))
+          || !derivedArtifactsAreBounded(rawCandidate.derivedArtifacts)
+        ) throw new Error("detector worker returned an invalid candidate");
+        let candidateBytes = rawCandidate.value.byteLength;
+        for (const artifact of rawCandidate.derivedArtifacts ?? []) candidateBytes += artifact.data.byteLength;
+        if (candidateBytes > returnedCandidateByteLimit - returnedCandidateBytes) {
+          throw new Error("detector worker exceeded its aggregate candidate byte limit");
+        }
+        returnedCandidateBytes += candidateBytes;
+        const candidate = normalizeCandidate(rawCandidate);
+        const relativeOffset = candidate.offset - result.context.baseOffset;
         const candidateEnd = relativeOffset + candidate.length;
         if (
           !Number.isSafeInteger(relativeOffset)
@@ -213,16 +459,15 @@ async function runDetectors(
           || !Number.isSafeInteger(candidate.length)
           || candidate.length < 1
           || !Number.isSafeInteger(candidateEnd)
-          || candidateEnd > data.length
-        ) {
-          throw new Error("validator returned a candidate outside the scanned window");
-        }
-        if (!data.subarray(relativeOffset, candidateEnd).equals(candidate.value)) {
+          || candidateEnd > result.data.length
+        ) throw new Error("validator returned a candidate outside the scanned window");
+        if (!result.data.subarray(relativeOffset, candidateEnd).equals(candidate.value)) {
           throw new Error("validator candidate bytes do not match its recorded source offset");
         }
-        await store.add(sourcePath, options.provenance, candidate);
+        await store.add(sourcePath, provenance, candidate);
       } catch (error) {
-        store.recordError(sourcePath, `artifact:${name}`, error);
+        if (error instanceof StorageQuotaError) throw error;
+        store.recordError(sourcePath, `artifact:${batch.detector}`, error);
         throw new ArtifactWriteError("could not safely persist a recovered artifact", { cause: error });
       }
     }
@@ -230,33 +475,113 @@ async function runDetectors(
   return clean;
 }
 
-async function runDeepKeyScheduleSlices(
-  data: Buffer,
-  context: DetectionContext,
+async function runDetectorWork(pool: DetectorWorkerPool, work: DetectorWork[], signal?: AbortSignal): Promise<DetectorWorkResult[]> {
+  const results = new Array<DetectorWorkResult>(work.length);
+  let next = 0;
+  const consumers = Array.from({ length: Math.min(pool.size, work.length) }, async () => {
+    while (true) {
+      if (signal?.aborted === true) throw new Error("scan paused");
+      const index = next++;
+      const item = work[index];
+      if (item === undefined) return;
+      let batches: DetectorBatchResult[];
+      try {
+        batches = await pool.run(item.kind, item.data, item.context);
+      } catch (error) {
+        if (interrupted(signal)) throw new Error("scan paused", { cause: error });
+        throw new ScanControlError("detector worker execution failed", { cause: error });
+      }
+      results[index] = { ...item, batches };
+    }
+  });
+  await Promise.all(consumers);
+  return results;
+}
+
+async function* runDetectorWorkOrdered(
+  pool: DetectorWorkerPool,
+  work: DetectorWork[],
+  signal?: AbortSignal,
+): AsyncGenerator<DetectorWorkResult> {
+  // Keep one queued job beyond the active worker count. This provides useful
+  // load balancing without allowing every chunk/family result in a buffered
+  // batch to accumulate in the main thread before deterministic commit.
+  const maximumOutstanding = Math.min(work.length, pool.size + 1);
+  const outstanding = new Map<number, Promise<DetectorWorkResult>>();
+  let nextToSchedule = 0;
+  const fill = (): void => {
+    while (outstanding.size < maximumOutstanding && nextToSchedule < work.length) {
+      const index = nextToSchedule++;
+      const item = work[index];
+      if (item === undefined) throw new Error("detector work ordering became inconsistent");
+      const pending = pool.run(item.kind, item.data, item.context)
+        .then((batches) => ({ ...item, batches }))
+        .catch((error: unknown) => {
+          if (interrupted(signal)) throw new Error("scan paused", { cause: error });
+          throw new ScanControlError("detector worker execution failed", { cause: error });
+        });
+      // The generator awaits each promise in order. Attach a rejection handler
+      // immediately for later jobs that can fail before their turn is reached.
+      void pending.catch(() => undefined);
+      outstanding.set(index, pending);
+    }
+  };
+  fill();
+  for (let index = 0; index < work.length; index += 1) {
+    if (interrupted(signal)) throw new Error("scan paused");
+    const pending = outstanding.get(index);
+    if (pending === undefined) throw new Error("detector work ordering became inconsistent");
+    const result = await pending;
+    outstanding.delete(index);
+    fill();
+    yield result;
+  }
+}
+
+async function commitDetectorWorkInBatches(
+  runtime: ScanRuntime,
+  work: DetectorWork[],
   sourcePath: string,
-  options: MiningOptions,
-  store: ArtifactStore,
+  assertSourceCurrent: () => Promise<void>,
 ): Promise<boolean> {
   let clean = true;
-  let primaryStart = 0;
-  while (primaryStart < data.length) {
-    if (options.signal?.aborted === true) throw new Error("scan interrupted");
-    const start = primaryStart === 0 ? 0 : primaryStart - DEEP_SCAN_OVERLAP_BYTES;
-    const end = Math.min(primaryStart + DEEP_SCAN_SLICE_BYTES, data.length);
-    const slice = data.subarray(start, end);
-    clean = await runDetectors(
-      slice,
-      { ...context, baseOffset: context.baseOffset + start, deepKeySchedules: true },
-      sourcePath,
-      options,
-      store,
-      [{ name: "deep-key-schedules", detector: detectDeepKeySchedules }],
-    ) && clean;
-    primaryStart = end;
-    if (primaryStart === data.length) break;
-    await new Promise<void>((resolve) => setImmediate(resolve));
+  for (let start = 0; start < work.length; start += runtime.pool.size) {
+    if (interrupted(runtime.options.signal)) throw new Error("scan paused");
+    const results = await runDetectorWork(
+      runtime.pool,
+      work.slice(start, start + runtime.pool.size),
+      runtime.options.signal,
+    );
+    await assertSourceCurrent();
+    for (const result of results) {
+      clean = await commitDetectorResults(
+        result,
+        sourcePath,
+        runtime.options.provenance,
+        runtime.store,
+        runtime.options.signal,
+      ) && clean;
+    }
   }
   return clean;
+}
+
+function workForWindow(data: Buffer, context: DetectionContext, deep: boolean, deepPrimaryStart = 0): DetectorWork[] {
+  const work: DetectorWork[] = STREAMING_DETECTOR_KINDS.map((kind) => ({ kind, data, context }));
+  if (!deep) return work;
+  const scanStart = deepPrimaryStart === 0 ? 0 : Math.max(0, deepPrimaryStart - DEEP_SCAN_OVERLAP_BYTES);
+  let primaryStart = scanStart;
+  while (primaryStart < data.length) {
+    const start = primaryStart === scanStart ? scanStart : primaryStart - DEEP_SCAN_OVERLAP_BYTES;
+    const end = Math.min(primaryStart + DEEP_SCAN_SLICE_BYTES, data.length);
+    work.push({
+      kind: "deep-key-schedules",
+      data: data.subarray(start, end),
+      context: { ...context, baseOffset: context.baseOffset + start, deepKeySchedules: true },
+    });
+    primaryStart = end;
+  }
+  return work;
 }
 
 async function assertOpenedFilePathCurrent(
@@ -286,135 +611,463 @@ async function assertOpenedFilePathCurrent(
   ) throw new Error("scan input path changed or crossed a symbolic-link component");
 }
 
-async function scanStream(
-  file: WalkedFile,
-  options: MiningOptions,
-  store: ArtifactStore,
-  onChunk: (bytes: number) => Promise<void>,
-): Promise<{ file: WalkedFile; detectorsClean: boolean }> {
-  const filename = file.path;
-  let tail = Buffer.alloc(0);
+function assertFileSnapshot(file: FrozenScanFile, metadata: Awaited<ReturnType<Awaited<ReturnType<typeof open>>["stat"]>>): void {
+  if (
+    !metadata.isFile()
+    || metadata.dev !== file.device
+    || metadata.ino !== file.inode
+    || metadata.size !== file.bytes
+    || metadata.mtimeMs !== file.modifiedMs
+    || metadata.ctimeMs !== file.changedMs
+  ) throw new Error("scan input changed from its frozen file manifest snapshot");
+}
+
+async function readExact(handle: Awaited<ReturnType<typeof open>>, start: number, bytes: number): Promise<Buffer> {
+  const data = Buffer.allocUnsafe(bytes);
   let consumed = 0;
-  let detectorsClean = true;
-  const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try {
-    const before = await handle.stat();
-    if (
-      !before.isFile()
-      || before.dev !== file.device
-      || before.ino !== file.inode
-      || before.size !== file.bytes
-      || before.mtimeMs !== file.modifiedMs
-      || before.ctimeMs !== file.changedMs
-      || !Number.isSafeInteger(before.size)
-      || before.size < 0
-    ) throw new Error("scan input changed after directory enumeration");
-    await assertOpenedFilePathCurrent(filename, handle, before);
-    const stream = handle.createReadStream({
-      autoClose: false,
-      highWaterMark: options.chunkBytes,
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
-    });
-    for await (const item of stream) {
-      if (options.signal?.aborted === true) throw new Error("scan interrupted");
-      const chunk = Buffer.isBuffer(item) ? item : Buffer.from(item);
-      const data = tail.length === 0 ? chunk : Buffer.concat([tail, chunk]);
-      const baseOffset = consumed - tail.length;
-      const context = { sourcePath: filename, baseOffset, wholeFile: false, deepKeySchedules: false };
-      detectorsClean = await runDetectors(data, context, filename, options, store, STREAM_DETECTORS) && detectorsClean;
-      if (options.deepKeySchedules === true) detectorsClean = await runDeepKeyScheduleSlices(data, context, filename, options, store) && detectorsClean;
-      consumed += chunk.length;
-      await onChunk(chunk.length);
-      tail = data.length <= options.overlapBytes ? Buffer.from(data) : Buffer.from(data.subarray(data.length - options.overlapBytes));
-    }
-    const after = await handle.stat();
-    if (
-      consumed !== before.size
-      || before.dev !== after.dev
-      || before.ino !== after.ino
-      || before.size !== after.size
-      || before.mtimeMs !== after.mtimeMs
-      || before.ctimeMs !== after.ctimeMs
-    ) throw new Error("scan input changed during streaming validation");
-    await assertOpenedFilePathCurrent(filename, handle, after);
-    return {
-      file: {
-        path: filename,
-        bytes: before.size,
-        device: before.dev,
-        inode: before.ino,
-        modifiedMs: before.mtimeMs,
-        changedMs: before.ctimeMs,
-      },
-      detectorsClean,
-    };
-  } finally {
-    await handle.close();
+  while (consumed < bytes) {
+    const result = await handle.read(data, consumed, bytes - consumed, start + consumed);
+    if (result.bytesRead === 0) break;
+    consumed += result.bytesRead;
   }
+  if (consumed !== bytes) throw new Error("scan input ended before its frozen file size");
+  return data;
 }
 
-async function readWholeFileBounded(file: WalkedFile, maximumBytes: number): Promise<Buffer | null> {
-  const filename = file.path;
-  const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try {
-    const before = await handle.stat();
-    if (
-      !before.isFile()
-      || before.dev !== file.device
-      || before.ino !== file.inode
-      || before.size !== file.bytes
-      || before.mtimeMs !== file.modifiedMs
-      || before.ctimeMs !== file.changedMs
-    ) throw new Error("scan input changed between streaming and whole-file validation");
-    await assertOpenedFilePathCurrent(filename, handle, before);
-    if (before.size > maximumBytes) return null;
-    const data = Buffer.allocUnsafe(before.size);
-    let consumed = 0;
-    while (consumed < data.length) {
-      const result = await handle.read(data, consumed, data.length - consumed, consumed);
-      if (result.bytesRead === 0) break;
-      consumed += result.bytesRead;
-    }
-    const probe = Buffer.allocUnsafe(1);
-    const extra = await handle.read(probe, 0, 1, consumed);
-    const after = await handle.stat();
-    if (
-      consumed !== before.size
-      || extra.bytesRead !== 0
-      || after.dev !== before.dev
-      || after.ino !== before.ino
-      || after.size !== before.size
-      || after.mtimeMs !== before.mtimeMs
-      || after.ctimeMs !== before.ctimeMs
-    ) {
-      throw new Error("scan input changed during whole-file validation");
-    }
-    await assertOpenedFilePathCurrent(filename, handle, after);
-    return data;
-  } finally {
-    await handle.close();
-  }
+function sameRootSnapshots(left: PathSafetySnapshot[], right: ScanState["inputRoots"]): boolean {
+  return left.length === right.length && left.every((item, index) => {
+    const expected = right[index];
+    return expected !== undefined
+      && item.path === expected.path
+      && item.device === expected.device
+      && item.inode === expected.inode
+      && item.kind === expected.kind
+      && item.mount === expected.mount;
+  });
 }
 
-function validatedOptions(input: MiningOptions): MiningOptions {
-  const options = {
-    ...input,
-    inputs: input.inputs.map((value) => path.resolve(value)),
-    output: path.resolve(input.output),
+function manifestFileIsAuthorized(filename: string, roots: PathSafetySnapshot[]): boolean {
+  return roots.some((root) => root.kind === "file"
+    ? filename === root.path
+    : filename !== root.path && inside(root.path, filename));
+}
+
+function assertResumeInventoryMatchesState(inventory: SensitiveScanInventory, state: ScanState): void {
+  const occurrences = inventory.findings.reduce((sum, finding) => sum + finding.occurrences.length, 0);
+  const scanErrors = inventory.errors.length + inventory.errorsOmitted;
+  if (
+    inventory.findings.length !== state.progress.uniqueFindings
+    || occurrences !== state.progress.occurrences
+    || scanErrors !== state.progress.scanErrors
+    || JSON.stringify(inventory.resumeCheckpoint) !== JSON.stringify(inventoryCheckpoint(state))
+    || inventory.findings.some((finding) => finding.occurrences.some((occurrence) => (
+      occurrence.provenance !== state.semantic.provenance
+      || !manifestFileIsAuthorized(occurrence.sourcePath, state.inputRoots)
+    )))
+  ) throw new Error("paused inventory counts, occurrences, or checkpoint do not match the resumable scan state");
+}
+
+function inventoryCheckpoint(state: ScanState): NonNullable<SensitiveScanInventory["resumeCheckpoint"]> {
+  return {
+    runId: state.runId,
+    status: state.status,
+    inventoryComplete: state.inventoryComplete,
+    semantic: { ...state.semantic, inputs: [...state.semantic.inputs] },
+    inputRoots: state.inputRoots.map((root) => ({ ...root })),
+    manifest: { ...state.manifest },
+    cursor: { ...state.cursor },
+    progress: { ...state.progress },
   };
-  if (options.inputs.length === 0) throw new Error("at least one mining input is required");
-  for (const [label, value] of [["chunkBytes", options.chunkBytes], ["overlapBytes", options.overlapBytes], ["wholeFileBytes", options.wholeFileBytes]] as const) {
-    if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${label} must be a positive integer`);
-  }
-  if (options.chunkBytes < MINIMUM_SAFE_OVERLAP || options.chunkBytes > 128 * 1024 * 1024) throw new Error("chunkBytes must be between 17 MiB and 128 MiB");
-  if (options.overlapBytes < MINIMUM_SAFE_OVERLAP || options.overlapBytes > options.chunkBytes) throw new Error("overlapBytes must be between 17 MiB and chunkBytes so every supported streaming format can cross a chunk boundary");
-  if (options.wholeFileBytes > 256 * 1024 * 1024) throw new Error("wholeFileBytes must not exceed 256 MiB");
-  return options;
 }
 
-export async function scanSensitiveMaterial(input: MiningOptions): Promise<Record<string, unknown>> {
-  const validated = validatedOptions(input);
-  const canonical = await assertFreshSafeOutput(validated.inputs, validated.output);
+async function publishProgress(runtime: ScanRuntime): Promise<void> {
+  Object.assign(runtime.progress, runtime.store.counts());
+  try {
+    runtime.options.progress?.({ ...runtime.progress });
+  } catch (error) {
+    throw new ScanControlError("progress callback failed", { cause: error });
+  }
+}
+
+async function createFrozenInputManifest(
+  options: NormalizedMiningOptions,
+  isNetworkMount: (record: MountRecord) => Promise<boolean>,
+  store: ArtifactStore,
+  budget: StorageBudget,
+  progress: MiningProgress,
+  assertSafeOutput: () => Promise<void>,
+): Promise<ScanState["manifest"]> {
+  progress.phase = "inventory";
+  progress.filesTotal = 0;
+  const walked = walkRegularFiles(options.inputs, {
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    onError: (sourcePath, error) => store.recordError(sourcePath, "walk-entry", error),
+    shouldEnterDirectory: async (directory) => {
+      const currentMounts = await mounts();
+      const mounted = mountForPathFrom(currentMounts, directory);
+      return mounted !== undefined && !(await isNetworkMount(mounted));
+    },
+  });
+  async function* tracked(): AsyncGenerator<WalkedFile> {
+    for await (const file of walked) {
+      if (interrupted(options.signal)) throw new Error("scan paused during input inventory");
+      progress.filesTotal = (progress.filesTotal ?? 0) + 1;
+      if (progress.filesTotal % 1_000 === 0) {
+        Object.assign(progress, store.counts());
+        try {
+          options.progress?.({ ...progress });
+        } catch (error) {
+          throw new ScanControlError("progress callback failed", { cause: error });
+        }
+      }
+      yield file;
+    }
+    if (interrupted(options.signal)) throw new Error("scan paused during input inventory");
+  }
+  const manifest = await createScanManifest(options.output, tracked(), budget, assertSafeOutput);
+  Object.assign(progress, store.counts());
+  return manifest;
+}
+
+async function* emptyManifestFiles(): AsyncGenerator<WalkedFile> {
+  return;
+}
+
+async function finalizeInventoryPause(
+  options: NormalizedMiningOptions,
+  state: ScanState,
+  store: ArtifactStore,
+  budget: StorageBudget,
+  progress: MiningProgress,
+  reason: NonNullable<ScanState["pauseReason"]>,
+): Promise<Record<string, unknown>> {
+  progress.phase = "inventory";
+  return await finalizeCleanPause(options, state, store, budget, progress, reason, `scan paused during input inventory: ${reason}`);
+}
+
+async function finalizeCleanPause(
+  options: NormalizedMiningOptions,
+  state: ScanState,
+  store: ArtifactStore,
+  budget: StorageBudget,
+  progress: MiningProgress,
+  reason: NonNullable<ScanState["pauseReason"]>,
+  message = `scan paused: ${reason}`,
+): Promise<Record<string, unknown>> {
+  Object.assign(progress, store.counts());
+  state.status = "paused";
+  state.resumable = true;
+  state.pauseReason = reason;
+  state.updatedAt = new Date().toISOString();
+  state.progress = { ...progress };
+  const inventory = await store.finalize("paused", progress, message, true, inventoryCheckpoint(state));
+  state.inventory = { filename: "inventory-sensitive.json", ...inventory };
+  await writeScanState(options.output, state, budget, true);
+  return resultObject("paused", progress, state, options.deepKeySchedules === true);
+}
+
+async function persistCheckpoint(runtime: ScanRuntime): Promise<void> {
+  runtime.state.updatedAt = new Date().toISOString();
+  runtime.state.progress = { ...runtime.progress };
+  const inventory = await runtime.store.checkpoint(runtime.progress, inventoryCheckpoint(runtime.state));
+  runtime.state.inventory = { filename: "inventory-sensitive.json", ...inventory };
+  await writeScanState(runtime.options.output, runtime.state, runtime.budget);
+}
+
+async function verifyCompletedManifestFiles(output: string, state: ScanState, inputRoots: PathSafetySnapshot[], signal?: AbortSignal): Promise<void> {
+  let cursorFileSeen = state.cursor.fileIndex === state.manifest.entries;
+  for await (const file of readScanManifest(output, state.manifest, signal)) {
+    if (interrupted(signal)) throw new Error("scan manifest verification was interrupted");
+    // Manifest creation visits each lexical path once. Its count and SHA-256
+    // are integrity-linked to both resume documents, so verification need not
+    // retain every path in memory merely to rediscover generation-time uniqueness.
+    if (!manifestFileIsAuthorized(file.path, inputRoots)) {
+      throw new Error("scan manifest contains a path outside the authorized input roots");
+    }
+    if (file.index === state.cursor.fileIndex) {
+      cursorFileSeen = true;
+      if (
+        state.cursor.phase === "stream"
+        && (
+          state.cursor.nextOffset > file.bytes
+          || (state.cursor.nextOffset !== file.bytes && state.cursor.nextOffset % state.semantic.chunkBytes !== 0)
+        )
+      ) throw new Error("scan resume cursor is not aligned with its frozen input file");
+    }
+    if (file.index > state.cursor.fileIndex || (file.index === state.cursor.fileIndex && state.cursor.nextOffset === 0 && state.cursor.phase === "stream")) continue;
+    const metadata = await lstat(file.path);
+    if (metadata.isSymbolicLink() || !metadata.isFile() || await realpath(file.path) !== file.path) {
+      throw new Error("a completed resume input is no longer a canonical regular file");
+    }
+    if (metadata.dev !== file.device || metadata.ino !== file.inode || metadata.size !== file.bytes || metadata.mtimeMs !== file.modifiedMs || metadata.ctimeMs !== file.changedMs) {
+      throw new Error("a completed or partial resume input changed after its checkpoint");
+    }
+  }
+  if (!cursorFileSeen) throw new Error("scan resume cursor does not reference its frozen input manifest");
+}
+
+async function processFile(runtime: ScanRuntime, file: FrozenScanFile, cursor: ScanCursor, maybeCheckpoint: (force?: boolean) => Promise<void>): Promise<boolean> {
+  const handle = await open(file.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  let clean = true;
+  try {
+    const assertSourceCurrent = async (): Promise<void> => {
+      const current = await handle.stat();
+      assertFileSnapshot(file, current);
+      await assertOpenedFilePathCurrent(file.path, handle, current);
+    };
+    await assertSourceCurrent();
+    if (cursor.phase === "stream") {
+      let offset = cursor.nextOffset;
+      while (offset < file.bytes) {
+        if (interrupted(runtime.options.signal)) throw new Error("scan paused");
+        if (runtime.options.deepKeySchedules === true) {
+          const primaryOffset = offset;
+          const primaryEnd = Math.min(file.bytes, primaryOffset + runtime.options.chunkBytes);
+          const windowStart = primaryOffset === 0 ? 0 : Math.max(0, primaryOffset - runtime.options.overlapBytes);
+          const data = await readExact(handle, windowStart, primaryEnd - windowStart);
+          const context: DetectionContext = { sourcePath: file.path, baseOffset: windowStart, wholeFile: false, deepKeySchedules: false };
+          clean = await commitDetectorWorkInBatches(
+            runtime,
+            workForWindow(data, context, true, primaryOffset - windowStart),
+            file.path,
+            assertSourceCurrent,
+          ) && clean;
+          if (interrupted(runtime.options.signal)) throw new Error("scan paused");
+          await assertSourceCurrent();
+          offset = primaryEnd;
+          runtime.state.cursor = { fileIndex: file.index, phase: "stream", nextOffset: offset };
+          runtime.progress.bytesScanned += primaryEnd - primaryOffset;
+          await assertRuntimeOutputCurrent(runtime);
+          await assertStorageCapacity(runtime.options.output, runtime.policy, runtime.budget.outputBytes());
+          await publishProgress(runtime);
+          await maybeCheckpoint();
+          continue;
+        }
+        const offsets: number[] = [];
+        const bufferedParallelism = Math.max(
+          1,
+          Math.floor(MAX_BUFFERED_SCAN_WINDOWS_BYTES / (runtime.options.chunkBytes + runtime.options.overlapBytes)),
+        );
+        const parallelChunks = Math.min(runtime.options.workers, bufferedParallelism);
+        for (let index = 0; index < parallelChunks && offset + index * runtime.options.chunkBytes < file.bytes; index += 1) {
+          offsets.push(offset + index * runtime.options.chunkBytes);
+        }
+        const windows = await Promise.all(offsets.map(async (primaryOffset) => {
+          const primaryEnd = Math.min(file.bytes, primaryOffset + runtime.options.chunkBytes);
+          const windowStart = primaryOffset === 0 ? 0 : Math.max(0, primaryOffset - runtime.options.overlapBytes);
+          const data = await readExact(handle, windowStart, primaryEnd - windowStart);
+          const context: DetectionContext = { sourcePath: file.path, baseOffset: windowStart, wholeFile: false, deepKeySchedules: false };
+          return { primaryOffset, primaryEnd, data, context };
+        }));
+        await assertSourceCurrent();
+        const orderedWork = windows.flatMap((window) => workForWindow(window.data, window.context, false));
+        let completedWork = 0;
+        for await (const result of runDetectorWorkOrdered(runtime.pool, orderedWork, runtime.options.signal)) {
+          if (interrupted(runtime.options.signal)) throw new Error("scan paused");
+          await assertSourceCurrent();
+          clean = await commitDetectorResults(result, file.path, runtime.options.provenance, runtime.store, runtime.options.signal) && clean;
+          completedWork += 1;
+          if (completedWork % STREAMING_DETECTOR_KINDS.length !== 0) continue;
+          const analyzedChunk = windows[Math.floor(completedWork / STREAMING_DETECTOR_KINDS.length) - 1];
+          if (analyzedChunk === undefined) throw new Error("detector chunk ordering became inconsistent");
+          if (interrupted(runtime.options.signal)) throw new Error("scan paused");
+          await assertSourceCurrent();
+          offset = analyzedChunk.primaryEnd;
+          runtime.state.cursor = { fileIndex: file.index, phase: "stream", nextOffset: offset };
+          runtime.progress.bytesScanned += analyzedChunk.primaryEnd - analyzedChunk.primaryOffset;
+          await assertRuntimeOutputCurrent(runtime);
+          await assertStorageCapacity(runtime.options.output, runtime.policy, runtime.budget.outputBytes());
+          await publishProgress(runtime);
+          await maybeCheckpoint();
+        }
+        if (completedWork !== orderedWork.length) throw new Error("detector work did not complete its ordered batch");
+        await assertSourceCurrent();
+      }
+      runtime.state.cursor = { fileIndex: file.index, phase: "whole-file", nextOffset: 0 };
+    }
+    if (file.bytes <= runtime.options.wholeFileBytes) {
+      if (interrupted(runtime.options.signal)) throw new Error("scan paused");
+      const data = await readExact(handle, 0, file.bytes);
+      const context: DetectionContext = {
+        sourcePath: file.path,
+        baseOffset: 0,
+        wholeFile: true,
+        deepKeySchedules: runtime.options.deepKeySchedules === true,
+      };
+      const [result] = await runDetectorWork(runtime.pool, [{ kind: "structured", data, context }], runtime.options.signal);
+      if (result === undefined) throw new Error("structured detector worker returned no result");
+      await assertSourceCurrent();
+      clean = await commitDetectorResults(result, file.path, runtime.options.provenance, runtime.store, runtime.options.signal) && clean;
+    }
+    await assertSourceCurrent();
+    return clean;
+  } finally {
+    await handle.close();
+  }
+}
+
+function resultObject(status: MiningRunStatus, progress: MiningProgress, state: ScanState, deep: boolean): Record<string, unknown> {
+  const complete = status === "complete" || status === "complete-with-errors";
+  return {
+    status,
+    complete,
+    resumable: status === "paused" && state.resumable,
+    ...(state.pauseReason === undefined ? {} : { pauseReason: state.pauseReason }),
+    allFilesScannedWithoutErrors: status === "complete",
+    filesTotal: progress.filesTotal ?? state.manifest.entries,
+    filesVisited: progress.filesVisited,
+    filesScanned: progress.filesScanned,
+    bytesScanned: progress.bytesScanned,
+    uniqueFindings: progress.uniqueFindings,
+    occurrences: progress.occurrences,
+    scanErrors: progress.scanErrors,
+    deepKeySchedules: deep,
+    workers: state.operational.workers,
+    valuesPrinted: false,
+    reports: { sensitive: "final-report-sensitive.md", redacted: "final-report-redacted.md" },
+    ...(status === "paused" ? { resumeCommand: "aark mine resume --output <OUTPUT_DIRECTORY>" } : {}),
+  };
+}
+
+function quotaReason(error: unknown): ScanState["pauseReason"] | undefined {
+  let current: unknown = error;
+  for (let depth = 0; depth < 8 && current !== undefined; depth += 1) {
+    if (current instanceof StorageQuotaError) return current.reason;
+    current = current instanceof Error && "cause" in current ? current.cause : undefined;
+  }
+  return undefined;
+}
+
+async function runManifest(runtime: ScanRuntime): Promise<Record<string, unknown>> {
+  let lastCheckpoint = Date.now();
+  let filesAtCheckpoint = runtime.progress.filesVisited;
+  const maybeCheckpoint = async (force = false): Promise<void> => {
+    if (force || Date.now() - lastCheckpoint >= 60_000 || runtime.progress.filesVisited - filesAtCheckpoint >= 25) {
+      await persistCheckpoint(runtime);
+      lastCheckpoint = Date.now();
+      filesAtCheckpoint = runtime.progress.filesVisited;
+    }
+  };
+  const abortPool = (): void => { void runtime.pool.close(true).catch(() => undefined); };
+  runtime.options.signal?.addEventListener("abort", abortPool, { once: true });
+  try {
+    runtime.state.status = "in-progress";
+    runtime.state.resumable = false;
+    delete runtime.state.pauseReason;
+    await persistCheckpoint(runtime);
+    for await (const file of readScanManifest(runtime.options.output, runtime.state.manifest, runtime.options.signal)) {
+      if (file.index < runtime.state.cursor.fileIndex) continue;
+      if (interrupted(runtime.options.signal)) throw new Error("scan paused");
+      if (!manifestFileIsAuthorized(file.path, runtime.inputSafety)) {
+        throw new ScanControlError("scan manifest contains a file outside the authorized input roots");
+      }
+      const continuing = file.index === runtime.state.cursor.fileIndex
+        && runtime.progress.filesVisited > file.index;
+      if (!continuing) runtime.progress.filesVisited += 1;
+      const currentMounts = await assertInputRootsCurrent(runtime.inputSafety);
+      const fileMount = mountForPathFrom(currentMounts, file.path);
+      if (fileMount === undefined || await runtime.isNetworkMount(fileMount)) {
+        runtime.store.recordError(file.path, "walk-entry", new Error("refusing to scan a network-mounted file"));
+        runtime.state.cursor = { fileIndex: file.index + 1, phase: "stream", nextOffset: 0 };
+        runtime.progress.phase = "stream";
+        await publishProgress(runtime);
+        await maybeCheckpoint();
+        continue;
+      }
+      runtime.progress.phase = runtime.state.cursor.phase;
+      let completelyScanned = false;
+      try {
+        completelyScanned = await processFile(runtime, file, runtime.state.cursor, maybeCheckpoint);
+      } catch (error) {
+        if (error instanceof ArtifactWriteError || error instanceof ScanControlError || quotaReason(error) !== undefined || interrupted(runtime.options.signal)) throw error;
+        runtime.store.recordError(file.path, "read-or-scan", error);
+      }
+      if (completelyScanned) runtime.progress.filesScanned += 1;
+      runtime.state.cursor = { fileIndex: file.index + 1, phase: "stream", nextOffset: 0 };
+      runtime.progress.phase = "stream";
+      await publishProgress(runtime);
+      await maybeCheckpoint();
+      if (interrupted(runtime.options.signal)) throw new Error("scan paused");
+    }
+    if (interrupted(runtime.options.signal)) throw new Error("scan paused");
+    await assertInputRootsCurrent(runtime.inputSafety);
+    await assertRuntimeOutputCurrent(runtime);
+    await assertStorageCapacity(runtime.options.output, runtime.policy, runtime.budget.outputBytes());
+    await runtime.pool.close();
+  } catch (error) {
+    const reason = interrupted(runtime.options.signal) ? "signal" : quotaReason(error);
+    Object.assign(runtime.progress, runtime.store.counts());
+    if (reason !== undefined) {
+      await runtime.pool.close(true).catch(() => undefined);
+      runtime.state.status = "paused";
+      runtime.state.resumable = true;
+      runtime.state.pauseReason = reason;
+      runtime.state.updatedAt = new Date().toISOString();
+      runtime.state.progress = { ...runtime.progress };
+      const inventory = await runtime.store.finalize("paused", runtime.progress, `scan paused: ${reason}`, true, inventoryCheckpoint(runtime.state));
+      runtime.state.inventory = { filename: "inventory-sensitive.json", ...inventory };
+      await writeScanState(runtime.options.output, runtime.state, runtime.budget, true);
+      return resultObject("paused", runtime.progress, runtime.state, runtime.options.deepKeySchedules === true);
+    }
+    runtime.store.recordError("<scan>", "scan-run", error);
+    await runtime.pool.close(true).catch(() => undefined);
+    Object.assign(runtime.progress, runtime.store.counts());
+    runtime.state.status = "failed";
+    runtime.state.resumable = false;
+    runtime.state.updatedAt = new Date().toISOString();
+    runtime.state.progress = { ...runtime.progress };
+    try {
+      const inventory = await runtime.store.finalize("failed", runtime.progress, error instanceof Error ? error.message : String(error), true, inventoryCheckpoint(runtime.state));
+      runtime.state.inventory = { filename: "inventory-sensitive.json", ...inventory };
+      await writeScanState(runtime.options.output, runtime.state, runtime.budget, true);
+    } catch (reportError) {
+      throw new AggregateError([error, reportError], "scan failed and final report generation also failed");
+    }
+    throw error;
+  } finally {
+    runtime.options.signal?.removeEventListener("abort", abortPool);
+  }
+
+  Object.assign(runtime.progress, runtime.store.counts());
+  runtime.progress.phase = "finalizing";
+  const status = runtime.progress.scanErrors === 0 ? "complete" : "complete-with-errors";
+  runtime.state.status = status;
+  runtime.state.resumable = false;
+  delete runtime.state.pauseReason;
+  runtime.state.updatedAt = new Date().toISOString();
+  runtime.state.progress = { ...runtime.progress };
+  try {
+    const inventory = await runtime.store.finalize(status, runtime.progress, undefined, false, inventoryCheckpoint(runtime.state));
+    runtime.state.inventory = { filename: "inventory-sensitive.json", ...inventory };
+    await writeScanState(runtime.options.output, runtime.state, runtime.budget);
+    return resultObject(status, runtime.progress, runtime.state, runtime.options.deepKeySchedules === true);
+  } catch (error) {
+    const reason = quotaReason(error);
+    if (reason !== undefined) {
+      return await finalizeCleanPause(runtime.options, runtime.state, runtime.store, runtime.budget, runtime.progress, reason);
+    }
+    runtime.store.recordError("<scan>", "finalize", error);
+    Object.assign(runtime.progress, runtime.store.counts());
+    runtime.state.status = "failed";
+    runtime.state.resumable = false;
+    delete runtime.state.pauseReason;
+    runtime.state.updatedAt = new Date().toISOString();
+    runtime.state.progress = { ...runtime.progress };
+    try {
+      const inventory = await runtime.store.finalize("failed", runtime.progress, error instanceof Error ? error.message : String(error), true, inventoryCheckpoint(runtime.state));
+      runtime.state.inventory = { filename: "inventory-sensitive.json", ...inventory };
+      await writeScanState(runtime.options.output, runtime.state, runtime.budget, true);
+    } catch (reportError) {
+      throw new AggregateError([error, reportError], "scan completion failed and its final failure report could not be fully written");
+    }
+    throw error;
+  }
+}
+
+async function mountSetup(inputs: string[], outputParent: string): Promise<{
+  inputSafety: PathSafetySnapshot[];
+  isNetworkMount: (record: MountRecord) => Promise<boolean>;
+}> {
   const mountSnapshot = await mounts();
   const networkMountCache = new Map<string, Promise<boolean>>();
   const isNetworkMount = async (record: MountRecord): Promise<boolean> => {
@@ -427,165 +1080,259 @@ export async function scanSensitiveMaterial(input: MiningOptions): Promise<Recor
     return await result;
   };
   const inputSafety: PathSafetySnapshot[] = [];
-  for (const inputRoot of canonical.inputs) {
+  for (const inputRoot of inputs) {
     const inputMount = mountForPathFrom(mountSnapshot, inputRoot);
     if (inputMount === undefined) throw new Error("could not determine the mount backing a mining input");
     if (await isNetworkMount(inputMount)) throw new Error("network-mounted mining inputs are not allowed");
     inputSafety.push(await pathSafetySnapshot(inputRoot, mountSnapshot));
   }
-  const outputMount = mountForPathFrom(mountSnapshot, await nearestExistingParent(canonical.output));
+  const outputMount = mountForPathFrom(mountSnapshot, outputParent);
   if (outputMount === undefined) throw new Error("could not determine the mount backing the mining output");
   if (await isNetworkMount(outputMount)) throw new Error("network-mounted mining outputs are not allowed");
-  if (path.resolve(outputMount.target) === canonical.output) {
-    throw new Error("mining output must be a dedicated subdirectory, not a filesystem mount root");
-  }
+  return { inputSafety, isNetworkMount };
+}
+
+export async function scanSensitiveMaterial(input: MiningOptions): Promise<Record<string, unknown>> {
+  const validated = validatedOptions(input);
+  const canonical = await assertFreshSafeOutput(validated.inputs, validated.output);
   const options = { ...validated, ...canonical };
-  const lock = await acquireExclusiveLock(options.output, ".agetnic-mining.lock");
+  const policy = storagePolicyFromGiB(options.minimumFreeGiB, options.minimumFreePercent, options.maximumOutputGiB);
+  const outputParent = await nearestExistingParent(options.output);
+  await assertStorageCapacity(outputParent, policy);
+  const setup = await mountSetup(options.inputs, outputParent);
+  const locks = await acquireMiningLocks(options.output);
+  const lock = locks.find((candidate) => path.basename(candidate.path) === MINING_LOCK_FILENAME);
+  if (lock === undefined) {
+    await releaseMiningLocks(locks);
+    throw new Error("current mining operation lock was not acquired");
+  }
   let runFailure: unknown;
   try {
-  await assertLockedFreshOutput(options.output);
-  const outputSafety = await outputSafetySnapshot(options.output, lock.path);
-  const assertSafeOutput = async (): Promise<void> => assertOutputSafetyCurrent(outputSafety, lock.path);
-  const store = new ArtifactStore(options.output, options.inputs, options.deepKeySchedules === true, assertSafeOutput);
-  await store.initialize();
-  const progress: MiningProgress = { filesVisited: 0, filesScanned: 0, bytesScanned: 0, uniqueFindings: 0, occurrences: 0, scanErrors: 0 };
-  let lastCheckpoint = Date.now();
-  const publishProgress = (): void => {
+    await assertLockedFreshOutput(options.output);
+    const outputSafety = await outputSafetySnapshot(options.output, lock.path);
+    const assertSafeOutput = async (): Promise<void> => {
+      for (const held of locks) await held.assertHeld();
+      await assertOutputSafetyCurrent(outputSafety, lock.path);
+    };
+    const budget = new StorageBudget(options.output, policy, await directoryLogicalBytes(options.output, options.signal));
+    const store = new ArtifactStore(options.output, options.inputs, options.deepKeySchedules === true, assertSafeOutput, budget);
+    await store.initialize();
+    const progress: MiningProgress = {
+      phase: "inventory",
+      filesTotal: 0,
+      filesVisited: 0,
+      filesScanned: 0,
+      bytesScanned: 0,
+      uniqueFindings: 0,
+      occurrences: 0,
+      scanErrors: 0,
+    };
+    let manifest: ScanState["manifest"];
     try {
-      options.progress?.({ ...progress });
+      manifest = await createFrozenInputManifest(options, setup.isNetworkMount, store, budget, progress, assertSafeOutput);
     } catch (error) {
-      throw new ScanControlError("progress callback failed", { cause: error });
-    }
-  };
-  const checkpoint = async (): Promise<void> => {
-    try {
-      await store.checkpoint(progress);
-    } catch (error) {
-      throw new ScanControlError("could not persist the mining checkpoint", { cause: error });
-    }
-  };
-  const updateProgress = async (bytes: number): Promise<void> => {
-    try {
-      await assertSafeOutput();
-    } catch (error) {
-      throw new ScanControlError("mining output safety changed during scanning", { cause: error });
-    }
-    progress.bytesScanned += bytes;
-    Object.assign(progress, store.counts());
-    publishProgress();
-    if (Date.now() - lastCheckpoint >= 60_000) {
-      await checkpoint();
-      lastCheckpoint = Date.now();
-    }
-  };
-
-  try {
-    if (interrupted(options.signal)) throw new Error("scan interrupted");
-    for await (const file of walkRegularFiles(options.inputs, {
-      onError: (sourcePath, error) => store.recordError(sourcePath, "walk-entry", error),
-      shouldEnterDirectory: async (directory) => {
-        const currentMounts = await mounts();
-        const mounted = mountForPathFrom(currentMounts, directory);
-        return mounted !== undefined && !(await isNetworkMount(mounted));
-      },
-    })) {
-      if (interrupted(options.signal)) throw new Error("scan interrupted");
-      const currentMounts = await assertInputRootsCurrent(inputSafety);
-      const fileMount = mountForPathFrom(currentMounts, file.path);
-      if (fileMount === undefined || await isNetworkMount(fileMount)) {
-        store.recordError(file.path, "walk-entry", new Error("refusing to scan a network-mounted file"));
-        continue;
-      }
-      progress.filesVisited += 1;
-      let completelyScanned = false;
-      try {
-        const streamed = await scanStream(file, options, store, updateProgress);
-        let detectorsClean = streamed.detectorsClean;
-        if (file.bytes <= options.wholeFileBytes) {
-          const data = await readWholeFileBounded(streamed.file, options.wholeFileBytes);
-          if (data !== null) {
-            detectorsClean = await runDetectors(
-              data,
-              { sourcePath: file.path, baseOffset: 0, wholeFile: true, deepKeySchedules: options.deepKeySchedules === true },
-              file.path,
-              options,
-              store,
-              [{ name: "structured-artifacts", detector: detectStructuredArtifacts }],
-            ) && detectorsClean;
-          }
-        }
-        completelyScanned = detectorsClean;
-      } catch (error) {
-        if (error instanceof ArtifactWriteError || error instanceof ScanControlError) throw error;
-        if (interrupted(options.signal)) throw error;
-        store.recordError(file.path, "read-or-scan", error);
-      }
-      if (completelyScanned) progress.filesScanned += 1;
+      const reason = interrupted(options.signal) ? "signal" : quotaReason(error);
+      const emptyManifest = await createScanManifest(options.output, emptyManifestFiles(), budget, assertSafeOutput);
+      const state = newScanState(semanticOptions(options), operationalOptions(options), emptyManifest, {
+        filename: "inventory-sensitive.json",
+        bytes: 0,
+        sha256: "0".repeat(64),
+      }, progress, setup.inputSafety);
+      state.inventoryComplete = false;
+      if (reason !== undefined) return await finalizeInventoryPause(options, state, store, budget, progress, reason);
+      store.recordError("<scan>", "input-inventory", error);
       Object.assign(progress, store.counts());
-      publishProgress();
-      if (progress.filesVisited % 25 === 0) {
-        await checkpoint();
-        lastCheckpoint = Date.now();
+      state.status = "failed";
+      state.resumable = false;
+      state.updatedAt = new Date().toISOString();
+      state.progress = { ...progress };
+      try {
+        const failedInventory = await store.finalize("failed", progress, error instanceof Error ? error.message : String(error), true, inventoryCheckpoint(state));
+        state.inventory = { filename: "inventory-sensitive.json", ...failedInventory };
+        await writeScanState(options.output, state, budget, true);
+      } catch (reportError) {
+        throw new AggregateError([error, reportError], "input inventory failed and final report generation also failed");
       }
+      throw error;
     }
-    if (interrupted(options.signal)) throw new Error("scan interrupted");
+    progress.filesTotal = manifest.entries;
+    progress.phase = "stream";
+    const state = newScanState(semanticOptions(options), operationalOptions(options), manifest, {
+      filename: "inventory-sensitive.json",
+      bytes: 0,
+      sha256: "0".repeat(64),
+    }, progress, setup.inputSafety);
+    let pool: DetectorWorkerPool;
     try {
-      await assertInputRootsCurrent(inputSafety);
+      const inventory = await store.checkpoint(progress, inventoryCheckpoint(state));
+      state.inventory = { filename: "inventory-sensitive.json", ...inventory };
+      await writeScanState(options.output, state, budget);
+      await verifyCompletedManifestFiles(options.output, state, setup.inputSafety, options.signal);
+      pool = new DetectorWorkerPool(options.workers);
     } catch (error) {
-      store.recordError("<inputs>", "final-input-safety", error);
+      const reason = interrupted(options.signal) ? "signal" : quotaReason(error);
+      if (reason !== undefined) {
+        return await finalizeCleanPause(options, state, store, budget, progress, reason);
+      }
+      store.recordError("<scan>", "manifest-or-worker-start", error);
+      Object.assign(progress, store.counts());
+      state.status = "failed";
+      state.resumable = false;
+      state.updatedAt = new Date().toISOString();
+      state.progress = { ...progress };
+      try {
+        const failedInventory = await store.finalize("failed", progress, error instanceof Error ? error.message : String(error), true, inventoryCheckpoint(state));
+        state.inventory = { filename: "inventory-sensitive.json", ...failedInventory };
+        await writeScanState(options.output, state, budget, true);
+      } catch (reportError) {
+        throw new AggregateError([error, reportError], "scan startup verification failed and final report generation also failed");
+      }
+      throw error;
     }
-    await assertSafeOutput();
-  } catch (error) {
-    store.recordError("<scan>", "scan-run", error);
-    Object.assign(progress, store.counts());
-    const status = interrupted(options.signal) ? "interrupted" : "failed";
-    try {
-      await store.finalize(status, progress, error instanceof Error ? error.message : String(error));
-    } catch (reportError) {
-      throw new AggregateError([error, reportError], "scan failed and final report generation also failed");
-    }
-    throw error;
-  }
-
-  Object.assign(progress, store.counts());
-  const status = progress.scanErrors === 0 ? "complete" : "complete-with-errors";
-  try {
-    await store.finalize(status, progress);
-  } catch (error) {
-    store.recordError("<scan>", "finalize", error);
-    Object.assign(progress, store.counts());
-    try {
-      await store.finalize("failed", progress, error instanceof Error ? error.message : String(error));
-    } catch (reportError) {
-      throw new AggregateError([error, reportError], "scan completion failed and its final failure report could not be fully written");
-    }
-    throw error;
-  }
-  return {
-    status,
-    complete: true,
-    allFilesScannedWithoutErrors: status === "complete",
-    filesVisited: progress.filesVisited,
-    filesScanned: progress.filesScanned,
-    bytesScanned: progress.bytesScanned,
-    uniqueFindings: progress.uniqueFindings,
-    occurrences: progress.occurrences,
-    scanErrors: progress.scanErrors,
-    deepKeySchedules: options.deepKeySchedules === true,
-    valuesPrinted: false,
-    reports: {
-      sensitive: "final-report-sensitive.md",
-      redacted: "final-report-redacted.md",
-    },
-  };
+    return await runManifest({
+      options,
+      policy,
+      inputSafety: setup.inputSafety,
+      outputSafety,
+      lockPath: lock.path,
+      locks,
+      store,
+      budget,
+      pool,
+      state,
+      progress,
+      isNetworkMount: setup.isNetworkMount,
+    });
   } catch (error) {
     runFailure = error;
     throw error;
   } finally {
     try {
-      await lock.release();
+      await releaseMiningLocks(locks);
     } catch (releaseError) {
-      if (runFailure !== undefined) throw new AggregateError([runFailure, releaseError], "scan failed and its exclusive output lock could not be released");
+      if (runFailure !== undefined) throw new AggregateError([runFailure, releaseError], "scan failed and its exclusive output locks could not be released");
+      throw releaseError;
+    }
+  }
+}
+
+function resumeOptions(state: ScanState, input: MiningResumeOptions): NormalizedMiningOptions {
+  const operational: ScanOperationalOptions = {
+    workers: validateWorkerCount(input.workers ?? state.operational.workers),
+    minimumFreeGiB: input.minimumFreeGiB ?? state.operational.minimumFreeGiB,
+    minimumFreePercent: input.minimumFreePercent ?? state.operational.minimumFreePercent,
+    ...(input.maximumOutputGiB === undefined
+      ? (state.operational.maximumOutputGiB === undefined ? {} : { maximumOutputGiB: state.operational.maximumOutputGiB })
+      : { maximumOutputGiB: input.maximumOutputGiB }),
+  };
+  return validatedOptions({
+    ...state.semantic,
+    ...operational,
+    output: input.output,
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
+    ...(input.progress === undefined ? {} : { progress: input.progress }),
+  });
+}
+
+export async function resumeSensitiveMaterial(input: MiningResumeOptions): Promise<Record<string, unknown>> {
+  const output = path.resolve(input.output);
+  const metadata = await lstat(output);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory() || await realpath(output) !== output) {
+    throw new Error("resume output must be an existing canonical directory");
+  }
+  const locks = await acquireMiningLocks(output);
+  const lock = locks.find((candidate) => path.basename(candidate.path) === MINING_LOCK_FILENAME);
+  if (lock === undefined) {
+    await releaseMiningLocks(locks);
+    throw new Error("current mining operation lock was not acquired");
+  }
+  let runFailure: unknown;
+  try {
+    await assertLockedResumeOutput(output);
+    const state = await loadScanState(output, input.signal);
+    if (state.status !== "paused" || !state.resumable) throw new Error("only a cleanly paused AARK scan can be resumed");
+    const options = resumeOptions(state, { ...input, output });
+    const policy = storagePolicyFromGiB(options.minimumFreeGiB, options.minimumFreePercent, options.maximumOutputGiB);
+    const setup = await mountSetup(options.inputs, output);
+    if (!sameRootSnapshots(setup.inputSafety, state.inputRoots)) throw new Error("input root identity or mount changed since the paused scan");
+    const outputSafety = await outputSafetySnapshot(output, lock.path);
+    const assertSafeOutput = async (): Promise<void> => {
+      for (const held of locks) await held.assertHeld();
+      await assertOutputSafetyCurrent(outputSafety, lock.path);
+    };
+    const budget = new StorageBudget(output, policy, await directoryLogicalBytes(output, options.signal));
+    const inventory: SensitiveScanInventory = await loadResumeInventory(output, state.inventory, options.signal);
+    if (JSON.stringify(inventory.inputRoots) !== JSON.stringify(state.semantic.inputs)) {
+      throw new Error("paused inventory input roots do not match the resumable scan state");
+    }
+    assertResumeInventoryMatchesState(inventory, state);
+    await verifyResumeArtifacts(output, inventory, options.signal);
+    state.operational = operationalOptions(options);
+    state.updatedAt = new Date().toISOString();
+    const store = new ArtifactStore(output, options.inputs, options.deepKeySchedules === true, assertSafeOutput, budget);
+    store.restore(inventory);
+    const progress: MiningProgress = { ...state.progress };
+    try {
+      await assertStorageCapacity(output, policy, budget.outputBytes());
+    } catch (error) {
+      if (error instanceof StorageQuotaError) return await finalizeCleanPause(options, state, store, budget, progress, error.reason);
+      throw error;
+    }
+    if (!state.inventoryComplete) {
+      for await (const _entry of readScanManifest(output, state.manifest, options.signal)) {
+        throw new Error("an incomplete input inventory must reference an empty scan manifest");
+      }
+      try {
+        state.manifest = await createFrozenInputManifest(options, setup.isNetworkMount, store, budget, progress, assertSafeOutput);
+        state.inventoryComplete = true;
+        state.cursor = { fileIndex: 0, phase: "stream", nextOffset: 0 };
+        progress.filesTotal = state.manifest.entries;
+        progress.phase = "stream";
+        if (interrupted(options.signal)) return await finalizeInventoryPause(options, state, store, budget, progress, "signal");
+        state.status = "paused";
+        state.resumable = true;
+        state.updatedAt = new Date().toISOString();
+        state.progress = { ...progress };
+        const checkpoint = await store.finalize("paused", progress, "input inventory rebuilt; detector execution has not started", false, inventoryCheckpoint(state));
+        state.inventory = { filename: "inventory-sensitive.json", ...checkpoint };
+        await writeScanState(output, state, budget);
+      } catch (error) {
+        const reason = interrupted(options.signal) ? "signal" : quotaReason(error);
+        if (reason === undefined) throw error;
+        return await finalizeInventoryPause(options, state, store, budget, progress, reason);
+      }
+    }
+    try {
+      await verifyCompletedManifestFiles(output, state, setup.inputSafety, options.signal);
+    } catch (error) {
+      if (interrupted(options.signal)) {
+        return await finalizeCleanPause(options, state, store, budget, progress, "signal");
+      }
+      throw error;
+    }
+    const runtime: ScanRuntime = {
+      options,
+      policy,
+      inputSafety: setup.inputSafety,
+      outputSafety,
+      lockPath: lock.path,
+      locks,
+      store,
+      budget,
+      pool: new DetectorWorkerPool(options.workers),
+      state,
+      progress,
+      isNetworkMount: setup.isNetworkMount,
+    };
+    return await runManifest(runtime);
+  } catch (error) {
+    runFailure = error;
+    throw error;
+  } finally {
+    try {
+      await releaseMiningLocks(locks);
+    } catch (releaseError) {
+      if (runFailure !== undefined) throw new AggregateError([runFailure, releaseError], "resume failed and its exclusive output locks could not be released");
       throw releaseError;
     }
   }

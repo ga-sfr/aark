@@ -3,10 +3,11 @@ import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
 import { assertNoSymlinkComponents, safeJoin } from "../core/fs-safe.js";
 import { sha256Hex } from "../core/crypto.js";
+import { MAX_SENSITIVE_INVENTORY_BYTES } from "./limits.js";
 import type { SensitiveScanInventory } from "./types.js";
 
 const MAX_REVEAL_BYTES = 256 * 1024 * 1024;
-const TERMINAL_STATUSES = new Set(["complete", "complete-with-errors", "failed", "interrupted"]);
+const TERMINAL_STATUSES = new Set(["paused", "complete", "complete-with-errors", "failed", "interrupted"]);
 const SUPPORTED_INVENTORY_TOOLS = new Set(["aark", "agetnic-tools"]);
 
 async function readStableRegularFile(filename: string, maximumBytes: number, expected?: { dev: number; ino: number }): Promise<Buffer> {
@@ -29,6 +30,7 @@ async function readStableRegularFile(filename: string, maximumBytes: number, exp
     const probe = Buffer.allocUnsafe(1);
     const extra = await handle.read(probe, 0, 1, consumed);
     const after = await handle.stat();
+    const current = await lstat(filename);
     if (
       consumed !== before.size
       || extra.bytesRead !== 0
@@ -38,6 +40,14 @@ async function readStableRegularFile(filename: string, maximumBytes: number, exp
       || before.size !== after.size
       || before.mtimeMs !== after.mtimeMs
       || before.ctimeMs !== after.ctimeMs
+      || current.isSymbolicLink()
+      || !current.isFile()
+      || current.nlink !== 1
+      || current.dev !== after.dev
+      || current.ino !== after.ino
+      || current.size !== after.size
+      || current.mtimeMs !== after.mtimeMs
+      || current.ctimeMs !== after.ctimeMs
     ) throw new Error("reveal input changed while it was being read");
     return data;
   } finally {
@@ -65,7 +75,7 @@ export async function readValidatedRevealArtifact(input: string): Promise<Buffer
   if (inventoryMetadata.isSymbolicLink() || !inventoryMetadata.isFile()) throw new Error("the adjacent mining inventory is not a regular file");
   let inventory: SensitiveScanInventory;
   try {
-    inventory = JSON.parse((await readStableRegularFile(inventoryPath, MAX_REVEAL_BYTES, inventoryMetadata)).toString("utf8")) as SensitiveScanInventory;
+    inventory = JSON.parse((await readStableRegularFile(inventoryPath, MAX_SENSITIVE_INVENTORY_BYTES, inventoryMetadata)).toString("utf8")) as SensitiveScanInventory;
   } catch (error) {
     throw new Error("the adjacent mining inventory is not valid JSON", { cause: error });
   }

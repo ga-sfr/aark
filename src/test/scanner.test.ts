@@ -9,7 +9,7 @@ import { entropyToMnemonic } from "@scure/bip39";
 import { wordlist as english } from "@scure/bip39/wordlists/english.js";
 import { sha256Hex } from "../core/crypto.js";
 import { ArtifactStore } from "../mining/artifacts.js";
-import { scanSensitiveMaterial } from "../mining/scanner.js";
+import { resumeSensitiveMaterial, scanSensitiveMaterial } from "../mining/scanner.js";
 import type { SensitiveScanInventory } from "../mining/types.js";
 import { expandAesKey } from "../mining/validators/aes.js";
 import { BITCOIN_ALPHABET, encodeBase58Check } from "./helpers.js";
@@ -51,6 +51,23 @@ test("artifact publication revalidates output safety before exact writes", async
   assert.deepEqual(await readdir(path.join(output, "artifacts")), []);
 });
 
+test("an output child whose name begins with two dots is still rejected inside an input", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-containment-test-"));
+  const input = path.join(root, "input");
+  await mkdir(input);
+  await assert.rejects(scanSensitiveMaterial({
+    inputs: [input],
+    output: path.join(input, "..results"),
+    provenance: "unknown",
+    chunkBytes: 17 * 1024 * 1024,
+    overlapBytes: 17 * 1024 * 1024,
+    wholeFileBytes: 1024 * 1024,
+    workers: 1,
+    minimumFreeGiB: 0,
+    minimumFreePercent: 0,
+  }), /cannot be inside a scanned input directory/);
+});
+
 test("scanner keeps exact values local while default manifests stay redacted", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "agetnic-test-"));
   const input = path.join(root, "recovered");
@@ -86,9 +103,12 @@ test("scanner keeps exact values local while default manifests stay redacted", a
     chunkBytes: 17 * 1024 * 1024,
     overlapBytes: 17 * 1024 * 1024,
     wholeFileBytes: 1024 * 1024,
+    minimumFreeGiB: 0,
+    minimumFreePercent: 0,
   });
   assert.equal(result.complete, true);
   assert.equal(result.filesVisited, 4);
+  await assert.rejects(access(path.join(output, ".aark-mining.lock")));
   await assert.rejects(access(path.join(output, ".agetnic-mining.lock")));
 
   const inventoryText = await readFile(path.join(output, "inventory-sensitive.json"), "utf8");
@@ -176,6 +196,8 @@ test("scanner canonicalizes overlapping roots so each file is scanned once", asy
     chunkBytes: 17 * 1024 * 1024,
     overlapBytes: 17 * 1024 * 1024,
     wholeFileBytes: 1024 * 1024,
+    minimumFreeGiB: 0,
+    minimumFreePercent: 0,
   });
   assert.equal(result.filesScanned, 1);
   const inventory = JSON.parse(await readFile(path.join(output, "inventory-sensitive.json"), "utf8")) as SensitiveScanInventory;
@@ -199,6 +221,8 @@ test("deep scan recovers an AES key whose expanded schedule crosses an internal 
     overlapBytes: 17 * 1024 * 1024,
     wholeFileBytes: 1,
     deepKeySchedules: true,
+    minimumFreeGiB: 0,
+    minimumFreePercent: 0,
   });
   assert.equal(result.status, "complete");
   const inventory = JSON.parse(await readFile(path.join(output, "inventory-sensitive.json"), "utf8")) as SensitiveScanInventory;
@@ -208,7 +232,7 @@ test("deep scan recovers an AES key whose expanded schedule crosses an internal 
   assert.ok((await artifactContents(output)).some((artifact) => artifact.equals(key)));
 });
 
-test("interrupted scans still emit both final reports with an explicit status", async () => {
+test("gracefully paused scans emit reports and resumable state", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "agetnic-interrupt-test-"));
   const input = path.join(root, "recovered");
   const output = path.join(root, "mined");
@@ -216,46 +240,87 @@ test("interrupted scans still emit both final reports with an explicit status", 
   await writeFile(path.join(input, "file.bin"), randomBytes(64));
   const controller = new AbortController();
   controller.abort();
-  await assert.rejects(scanSensitiveMaterial({
+  const result = await scanSensitiveMaterial({
     inputs: [input],
     output,
     provenance: "unknown",
     chunkBytes: 17 * 1024 * 1024,
     overlapBytes: 17 * 1024 * 1024,
     wholeFileBytes: 1024 * 1024,
+    minimumFreeGiB: 0,
+    minimumFreePercent: 0,
     signal: controller.signal,
-  }), /interrupted/);
+  });
+  assert.equal(result.status, "paused");
+  assert.equal(result.resumable, true);
   const inventory = JSON.parse(await readFile(path.join(output, "inventory-sensitive.json"), "utf8")) as SensitiveScanInventory;
-  assert.equal(inventory.status, "interrupted");
+  assert.equal(inventory.status, "paused");
   assert.equal(inventory.complete, false);
-  assert.match(await readFile(path.join(output, "final-report-sensitive.md"), "utf8"), /Status: interrupted/);
-  assert.match(await readFile(path.join(output, "final-report-redacted.md"), "utf8"), /Status: interrupted/);
+  assert.match(await readFile(path.join(output, "final-report-sensitive.md"), "utf8"), /Status: paused/);
+  assert.match(await readFile(path.join(output, "final-report-redacted.md"), "utf8"), /Status: paused/);
+  const pausedState = await readFile(path.join(output, "scan-state-sensitive.json"), "utf8");
+  assert.match(pausedState, /"resumable": true/);
+  assert.match(pausedState, /"inventoryComplete": false/);
   assert.match(await readFile(path.join(output, "final-report-sensitive.md"), "utf8"), /absence cannot be concluded/);
+  await assert.rejects(access(path.join(output, ".aark-mining.lock")));
   await assert.rejects(access(path.join(output, ".agetnic-mining.lock")));
+  await writeFile(path.join(output, ".agetnic-mining.lock"), "synthetic stale compatibility lock\n");
+  await assert.rejects(resumeSensitiveMaterial({ output }), /exclusive operation lock/);
+  unlinkSync(path.join(output, ".agetnic-mining.lock"));
+  const resumed = await resumeSensitiveMaterial({ output });
+  assert.equal(resumed.status, "complete");
+  assert.equal(resumed.filesScanned, 1);
 });
 
-test("an interruption during a file is not misreported as a completed scan", async () => {
+test("a pause during a file resumes from its committed chunk", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "agetnic-mid-interrupt-test-"));
   const input = path.join(root, "recovered");
   const output = path.join(root, "mined");
   await mkdir(input);
-  await writeFile(path.join(input, "large.bin"), Buffer.alloc(3 * 1024 * 1024));
+  await writeFile(path.join(input, "large.bin"), Buffer.alloc(20 * 1024 * 1024));
   const controller = new AbortController();
-  await assert.rejects(scanSensitiveMaterial({
+  const result = await scanSensitiveMaterial({
     inputs: [input],
     output,
     provenance: "unknown",
     chunkBytes: 17 * 1024 * 1024,
     overlapBytes: 17 * 1024 * 1024,
     wholeFileBytes: 1024 * 1024,
+    workers: 2,
+    minimumFreeGiB: 0,
+    minimumFreePercent: 0,
     signal: controller.signal,
     progress: (progress) => {
       if (progress.bytesScanned >= 1024 * 1024) controller.abort();
     },
-  }));
+  });
+  assert.equal(result.status, "paused");
   const inventory = JSON.parse(await readFile(path.join(output, "inventory-sensitive.json"), "utf8")) as SensitiveScanInventory;
-  assert.equal(inventory.status, "interrupted");
+  assert.equal(inventory.status, "paused");
   assert.equal(inventory.complete, false);
+  const manifestPath = path.join(output, "scan-files-sensitive.ndjson");
+  const manifest = await readFile(manifestPath);
+  await writeFile(manifestPath, Buffer.concat([manifest, Buffer.from("tampered\n")]));
+  await assert.rejects(resumeSensitiveMaterial({ output }), /manifest/);
+  await writeFile(manifestPath, manifest);
+  const statePath = path.join(output, "scan-state-sensitive.json");
+  const storedState = await readFile(statePath);
+  const state = JSON.parse(storedState.toString("utf8")) as {
+    cursor: { fileIndex: number; phase: string; nextOffset: number };
+    progress: { phase?: string; bytesScanned: number; filesVisited: number };
+  };
+  state.cursor = { fileIndex: 0, phase: "stream", nextOffset: 0 };
+  state.progress.phase = "stream";
+  state.progress.bytesScanned = 0;
+  state.progress.filesVisited = 1;
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`);
+  await assert.rejects(resumeSensitiveMaterial({ output }), /checkpoint/);
+  await writeFile(statePath, storedState);
+  const resumed = await resumeSensitiveMaterial({ output });
+  assert.equal(resumed.status, "complete");
+  assert.equal(resumed.filesVisited, 1);
+  assert.equal(resumed.filesScanned, 1);
+  assert.equal(resumed.bytesScanned, 20 * 1024 * 1024);
 });
 
 test("a changing input produces complete-with-errors reports instead of a false clean result", async () => {
@@ -271,6 +336,8 @@ test("a changing input produces complete-with-errors reports instead of a false 
     chunkBytes: 17 * 1024 * 1024,
     overlapBytes: 17 * 1024 * 1024,
     wholeFileBytes: 2 * 1024 * 1024,
+    minimumFreeGiB: 0,
+    minimumFreePercent: 0,
     progress: () => {
       if (!removed) {
         removed = true;
@@ -297,11 +364,14 @@ test("fatal scan-control errors still produce failed reports and release the out
     chunkBytes: 17 * 1024 * 1024,
     overlapBytes: 17 * 1024 * 1024,
     wholeFileBytes: 1024 * 1024,
+    minimumFreeGiB: 0,
+    minimumFreePercent: 0,
     progress: () => {
       throw new Error("synthetic progress failure");
     },
   }), /progress callback failed/);
   assert.match(await readFile(path.join(output, "final-report-sensitive.md"), "utf8"), /Status: failed/);
   assert.match(await readFile(path.join(output, "final-report-redacted.md"), "utf8"), /Status: failed/);
+  await assert.rejects(access(path.join(output, ".aark-mining.lock")));
   await assert.rejects(access(path.join(output, ".agetnic-mining.lock")));
 });

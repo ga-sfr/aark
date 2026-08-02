@@ -11,3 +11,5 @@ Before opening a pull request:
 5. Run `npm run check` and inspect the staged diff for secrets. The repository audit intentionally rejects license files and private-key/wallet fixture extensions.
 
 External commands must be invoked with an argument array and `shell: false`. Any command capable of modifying source media must be rejected or require a narrowly scoped, explicit opt-in with documented consequences.
+
+Mining detector workers must stay pure and accept only bounded byte buffers plus immutable detection context. Candidate byte/offset verification, deterministic ordering and IDs, deduplication, capacity accounting, checkpoints, reports, and artifact writes belong to the main thread. Tests for detector changes must demonstrate equivalent findings with worker counts `1` and `4`; pause/resume changes must test a committed mid-file chunk and tampered-state rejection.

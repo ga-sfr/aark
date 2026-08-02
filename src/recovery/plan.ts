@@ -11,6 +11,7 @@ function step(value: Omit<RecoveryStep, "sourceMutationExpected">): RecoveryStep
 
 export function buildRecoveryPlan(config: RecoveryConfig): RecoveryPlan {
   const root = path.resolve(config.destination);
+  const storage = config.storage ?? { minFreeGiB: 5, minFreePercent: 5 };
   const steps: RecoveryStep[] = [];
   if (config.image.enabled) {
     steps.push(step({
@@ -91,7 +92,7 @@ export function buildRecoveryPlan(config: RecoveryConfig): RecoveryPlan {
       destinationWritesExpected: true,
       optional: true,
       partialSuccessExitCodes: [1],
-      notes: ["The optimistic overwrite-cluster option is intentionally not enabled.", "The default percentage filter attempts all matching records without triggering ntfsundelete's misleading exit 1 behavior for an explicit zero threshold."],
+      notes: ["The optimistic overwrite-cluster option is intentionally not enabled.", "The percentage option is a scan filter and is intentionally omitted from undelete mode, which attempts every matching record."],
     }));
   }
   if (config.stages.unallocatedStream) {
@@ -187,6 +188,8 @@ export function buildRecoveryPlan(config: RecoveryConfig): RecoveryPlan {
     source: config.source,
     analysisSource,
     destination: root,
+    requireReadOnlySource: config.requireReadOnlySource,
+    storage,
     steps,
     warnings: [
       "Never write recovery output to the source device.",

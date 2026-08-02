@@ -22,12 +22,14 @@ export interface SourceSafety {
   kind: "block-device" | "regular-file";
   bytes: number;
   regularFileIdentity: { device: number; inode: number; bytes: number; modifiedMs: number; changedMs: number } | null;
+  blockDeviceIdentity: { device: number; inode: number; rawDevice: number } | null;
   kernelReadOnly: boolean | null;
   writableMounts: string[];
   sourceTopDevices: string[];
   sourceTopDevice: string | null;
   destinationDevices: string[];
   destinationDevice: string | null;
+  destinationFilesystemDevice: number;
   destinationMountSource: string | null;
   destinationBackingKind: "block-device" | "local-non-block" | "network" | "unresolved";
   deviceComparisonCertain: boolean;
@@ -47,6 +49,7 @@ export function blockDeviceIsNetworkBacked(device: string, transport?: string | 
 async function topDevices(input: string): Promise<{ devices: string[]; networkBacked: boolean }> {
   const result = await captureCommand("lsblk", ["--inverse", "--json", "--paths", "--output", "PATH,TYPE,TRAN,SUBSYSTEMS", input], { maxCaptureBytes: 64 * 1024, timeoutMs: 30_000 });
   if (result.exitCode !== 0) return { devices: [], networkBacked: false };
+  if (result.stdoutTruncated) throw new Error("lsblk output exceeded its bounded safety limit while resolving physical devices");
   let document: { blockdevices?: LsblkNode[] };
   try {
     document = JSON.parse(result.stdout.toString("utf8")) as { blockdevices?: LsblkNode[] };
@@ -61,25 +64,29 @@ async function topDevices(input: string): Promise<{ devices: string[]; networkBa
 
 async function destinationBacking(destination: string): Promise<{
   devices: string[];
+  filesystemDevice: number;
   mountSource: string | null;
   kind: "block-device" | "local-non-block" | "network" | "unresolved";
 }> {
   const existing = await nearestExistingParent(destination);
-  const mounted = await mountForPath(await realpath(existing));
-  if (mounted === undefined) return { devices: [], mountSource: null, kind: "unresolved" };
+  const resolvedExisting = await realpath(existing);
+  const filesystemDevice = (await stat(resolvedExisting)).dev;
+  const mounted = await mountForPath(resolvedExisting);
+  if (mounted === undefined) return { devices: [], filesystemDevice, mountSource: null, kind: "unresolved" };
   const source = mounted.source;
   if (source.startsWith("/dev/")) {
     const resolution = await topDevices(source.replace(/\[[^\]]*\]$/, ""));
     return {
       devices: resolution.devices,
+      filesystemDevice,
       mountSource: source,
       kind: resolution.networkBacked ? "network" : resolution.devices.length === 0 ? "unresolved" : "block-device",
     };
   }
   const filesystem = mounted.filesystem.toLowerCase();
-  if (filesystemIsNetwork(mounted)) return { devices: [], mountSource: source, kind: "network" };
-  if (["ramfs", "tmpfs"].includes(filesystem)) return { devices: [], mountSource: source, kind: "local-non-block" };
-  return { devices: [], mountSource: source || null, kind: "unresolved" };
+  if (filesystemIsNetwork(mounted)) return { devices: [], filesystemDevice, mountSource: source, kind: "network" };
+  if (["ramfs", "tmpfs"].includes(filesystem)) return { devices: [], filesystemDevice, mountSource: source, kind: "local-non-block" };
+  return { devices: [], filesystemDevice, mountSource: source || null, kind: "unresolved" };
 }
 
 export async function inspectSourceSafety(source: string, destination: string): Promise<SourceSafety> {
@@ -87,10 +94,11 @@ export async function inspectSourceSafety(source: string, destination: string): 
   const resolvedSource = await realpath(source);
   const metadata = await stat(resolvedSource);
   if (!metadata.isBlockDevice() && !metadata.isFile()) throw new Error("source must be a block device or regular image file");
+  let regularFileMount: Awaited<ReturnType<typeof mountForPath>>;
   if (metadata.isFile()) {
-    const sourceMount = await mountForPath(resolvedSource);
-    if (sourceMount === undefined) throw new Error("could not determine the mount backing the recovery image");
-    if (await mountIsNetworkBacked(sourceMount)) throw new Error("network-mounted recovery sources are not allowed");
+    regularFileMount = await mountForPath(resolvedSource);
+    if (regularFileMount === undefined) throw new Error("could not determine the mount backing the recovery image");
+    if (await mountIsNetworkBacked(regularFileMount)) throw new Error("network-mounted recovery sources are not allowed");
   }
   const reasons: string[] = [];
   let kernelReadOnly: boolean | null = null;
@@ -105,6 +113,7 @@ export async function inspectSourceSafety(source: string, destination: string): 
       { maxCaptureBytes: 1024 * 1024, timeoutMs: 30_000 },
     );
     if (result.exitCode !== 0) throw new Error("lsblk could not inspect the source device");
+    if (result.stdoutTruncated) throw new Error("lsblk output exceeded its bounded safety limit while inspecting the source");
     let document: { blockdevices?: LsblkNode[] };
     try {
       document = JSON.parse(result.stdout.toString("utf8")) as { blockdevices?: LsblkNode[] };
@@ -119,7 +128,9 @@ export async function inspectSourceSafety(source: string, destination: string): 
     if (Number.isSafeInteger(selectedBytes) && (selectedBytes ?? 0) >= 0) sourceBytes = selectedBytes ?? 0;
     for (const node of nodes) {
       for (const mountpoint of node.mountpoints ?? []) {
-        if (mountpoint === null) continue;
+        // lsblk also reports pseudo-labels such as "[SWAP]" in MOUNTPOINTS.
+        // Only real absolute mount paths are meaningful to the mount table.
+        if (mountpoint === null || !path.isAbsolute(mountpoint)) continue;
         const mounted = await mountForPath(mountpoint);
         if (!mountIsReadOnly(mounted)) writableMounts.push(mountpoint);
       }
@@ -129,13 +140,18 @@ export async function inspectSourceSafety(source: string, destination: string): 
     sourceTopDevices = sourceResolution.devices;
     if (!kernelReadOnly) reasons.push("kernel does not report the block device read-only");
     if (writableMounts.length > 0) reasons.push("source or a child volume has a writable mount");
+  } else if (regularFileMount?.source.startsWith("/dev/") === true) {
+    const sourceResolution = await topDevices(regularFileMount.source.replace(/\[[^\]]*\]$/, ""));
+    if (sourceResolution.networkBacked) throw new Error("network-backed recovery image files are not allowed");
+    sourceTopDevices = sourceResolution.devices;
   }
 
   const destinationInfo = await destinationBacking(destination);
   const destinationDevices = destinationInfo.devices;
   const deviceComparisonCertain = destinationInfo.kind === "local-non-block"
     || (sourceTopDevices.length > 0 && destinationInfo.kind === "block-device" && destinationDevices.length > 0);
-  const destinationOnSourceDevice = sourceTopDevices.some((device) => destinationDevices.includes(device));
+  const destinationOnSourceDevice = metadata.isBlockDevice()
+    && sourceTopDevices.some((device) => destinationDevices.includes(device));
   if (destinationOnSourceDevice) reasons.push("destination resolves to the same physical block device as the source");
   if (metadata.isBlockDevice() && !deviceComparisonCertain) reasons.push("could not prove that the destination is independent of the source block device");
   if (path.resolve(destination) === path.resolve(source)) reasons.push("destination and source resolve to the same path");
@@ -146,12 +162,16 @@ export async function inspectSourceSafety(source: string, destination: string): 
     regularFileIdentity: metadata.isFile()
       ? { device: metadata.dev, inode: metadata.ino, bytes: metadata.size, modifiedMs: metadata.mtimeMs, changedMs: metadata.ctimeMs }
       : null,
+    blockDeviceIdentity: metadata.isBlockDevice()
+      ? { device: metadata.dev, inode: metadata.ino, rawDevice: metadata.rdev }
+      : null,
     kernelReadOnly,
     writableMounts,
     sourceTopDevices,
     sourceTopDevice: sourceTopDevices[0] ?? null,
     destinationDevices,
     destinationDevice: destinationDevices[0] ?? null,
+    destinationFilesystemDevice: destinationInfo.filesystemDevice,
     destinationMountSource: destinationInfo.mountSource,
     destinationBackingKind: destinationInfo.kind,
     deviceComparisonCertain,

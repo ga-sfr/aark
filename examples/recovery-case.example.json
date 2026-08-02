@@ -6,6 +6,10 @@
   "requireReadOnlySource": true,
   "execute": false,
   "sectorOffset": 0,
+  "storage": {
+    "minFreeGiB": 5,
+    "minFreePercent": 5
+  },
   "image": {
     "enabled": true,
     "path": "/mnt/separate-recovery-disk/old-drive-001/evidence/source.img",

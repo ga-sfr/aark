@@ -44,6 +44,7 @@ __pycache__/
 *.py[cod]
 
 # Local forensic cases and sensitive output
+.aark-*.lock
 .agetnic-*.lock
 cases/
 recovery-output/
@@ -56,6 +57,7 @@ final-report-redacted.md
 manifest-redacted.json
 plan-redacted.json
 *-sensitive.json
+*-sensitive.ndjson
 *-sensitive.log
 *-final-report-sensitive.md
 *-final-report-redacted.md

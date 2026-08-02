@@ -11,6 +11,8 @@ import { parseCngPrivateBlob } from "../mining/validators/cng.js";
 import { decodeChromiumDpapiWrapper, parseDpapiBlob, parseDpapiMasterKeyFile } from "../mining/validators/dpapi.js";
 import { findPgpPrivateBlocks, findPrivateKeyBlocks, findPuttyPrivateKeys, findSsh2PrivateBlocks } from "../mining/validators/pem.js";
 import { validStellarSecretSeed, validTezosSecretKey, validXrpFamilySeed } from "../mining/validators/wallet-formats.js";
+import { detectStructuredArtifacts } from "../mining/detectors/structured.js";
+import { MAX_STRUCTURED_JSON_PARSE_BYTES } from "../mining/limits.js";
 import { ageSecretKey, base32Encode, BITCOIN_ALPHABET, crc16Xmodem, encodeBase58Check, RIPPLE_ALPHABET } from "./helpers.js";
 
 function u32(value: number): Buffer {
@@ -64,6 +66,51 @@ test("BIP39 scanner validates checksums and preserves exact local whitespace", (
   assert.equal(hits[0]?.value.toString("utf8"), embedded);
   assert.equal(hits[0]?.language, "english");
   assert.equal(hits[0]?.words, 12);
+
+  const boundaryTrap = Buffer.from(`x${mnemonic}:${mnemonic}`, "utf8");
+  const [bounded] = findBip39Mnemonics(boundaryTrap);
+  assert.ok(bounded);
+  assert.equal(bounded.offset, Buffer.byteLength(`x${mnemonic}:`, "utf8"));
+  assert.equal(bounded.value.toString("utf8"), mnemonic);
+
+  let validationDebits = 0;
+  const stopped = findBip39Mnemonics(
+    Buffer.from(mnemonic, "utf8"),
+    Number.MAX_SAFE_INTEGER,
+    undefined,
+    Number.MAX_SAFE_INTEGER,
+    undefined,
+    () => {
+      validationDebits += 1;
+      return false;
+    },
+  );
+  assert.equal(validationDebits, 1);
+  assert.equal(stopped.length, 0);
+
+  const afterOversizedToken = Buffer.from(`${"a".repeat(1024 * 1024)} ${mnemonic}`, "utf8");
+  const [afterOversizedHit] = findBip39Mnemonics(afterOversizedToken);
+  assert.ok(afterOversizedHit);
+  assert.equal(afterOversizedHit.offset, 1024 * 1024 + 1);
+  assert.equal(afterOversizedHit.value.toString("utf8"), mnemonic);
+});
+
+test("structured detection reports oversized JSON without parsing an amplified object graph", () => {
+  const data = Buffer.alloc(MAX_STRUCTURED_JSON_PARSE_BYTES + 1, 0x20);
+  data[0] = 0x7b;
+  const runtimeState = {
+    candidateLimitReached: false,
+    validationLimitReached: false,
+    structuralValidations: 0,
+    candidateBytes: 0,
+  };
+  assert.deepEqual(detectStructuredArtifacts(data, {
+    sourcePath: "/oversized.json",
+    baseOffset: 0,
+    wholeFile: true,
+    runtimeState,
+  }), []);
+  assert.equal(runtimeState.validationLimitReached, true);
 });
 
 test("PEM, DPAPI, CNG, and age validators require complete structures", () => {
@@ -77,6 +124,8 @@ test("PEM, DPAPI, CNG, and age validators require complete structures", () => {
   assert.equal(parseDpapiBlob(dpapi.subarray(0, -1)), null);
   const wrapper = Buffer.concat([Buffer.from("DPAPI"), dpapi]).toString("base64");
   assert.ok(decodeChromiumDpapiWrapper(wrapper)?.equals(dpapi));
+  const wrapperWithTrailingBytes = Buffer.concat([Buffer.from("DPAPI"), dpapi, Buffer.from([0])]).toString("base64");
+  assert.equal(decodeChromiumDpapiWrapper(wrapperWithTrailingBytes), null);
   const masterKey = dpapiMasterKeyFixture();
   assert.equal(parseDpapiMasterKeyFile(masterKey)?.guid, "12345678-1234-1234-1234-123456789abc");
   assert.equal(parseDpapiMasterKeyFile(masterKey.subarray(0, -1)), null);

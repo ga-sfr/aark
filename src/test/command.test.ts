@@ -122,6 +122,34 @@ test("command runner terminates a process when its safety invariant fails", asyn
   assert.ok(Date.now() - started < 2_000);
 });
 
+test("command runner reports bounded capture truncation", async () => {
+  const result = await captureCommand(process.execPath, ["-e", "process.stdout.write('abcdef'); process.stderr.write('uvwxyz')"], {
+    maxCaptureBytes: 3,
+  });
+  assert.equal(result.stdout.toString("utf8"), "abc");
+  assert.equal(result.stderr.toString("utf8"), "uvw");
+  assert.equal(result.stdoutTruncated, true);
+  assert.equal(result.stderrTruncated, true);
+});
+
+test("a safety check that finishes after process exit still invalidates the command", async () => {
+  let markStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  let rejectSafety: ((error: Error) => void) | undefined;
+  const pendingSafety = new Promise<void>((_resolve, reject) => { rejectSafety = reject; });
+  const command = captureCommand(process.execPath, ["-e", "setTimeout(() => {}, 40)"], {
+    safetyCheckIntervalMs: 10,
+    safetyCheck: async () => {
+      markStarted?.();
+      await pendingSafety;
+    },
+  });
+  await started;
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  rejectSafety?.(new Error("late synthetic safety failure"));
+  await assert.rejects(command, /command safety invariant failed during execution/);
+});
+
 test("command cancellation terminates descendants in the isolated process group", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "agetnic-command-tree-"));
   const survived = path.join(root, "descendant-survived");
@@ -141,6 +169,25 @@ test("command cancellation terminates descendants in the isolated process group"
   const result = await captureCommand(process.execPath, ["-e", parent], { signal: controller.signal, killGraceMs: 40 });
   clearTimeout(timer);
   assert.equal(result.terminationReason, "abort");
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  await assert.rejects(access(survived));
+});
+
+test("normal command completion also terminates leftover descendants", { skip: process.platform === "win32" }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-command-normal-tree-"));
+  const survived = path.join(root, "descendant-survived");
+  const descendant = [
+    "const fs=require('node:fs');",
+    `setTimeout(()=>fs.writeFileSync(${JSON.stringify(survived)},'unexpected'),300);`,
+    "setInterval(()=>{},1000);",
+  ].join("");
+  const parent = [
+    "const {spawn}=require('node:child_process');",
+    `spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:'ignore'});`,
+  ].join("");
+  const result = await captureCommand(process.execPath, ["-e", parent], { killGraceMs: 40 });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.terminationReason, null);
   await new Promise((resolve) => setTimeout(resolve, 400));
   await assert.rejects(access(survived));
 });

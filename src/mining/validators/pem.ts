@@ -1,6 +1,7 @@
 import { createPrivateKey } from "node:crypto";
 import { validateOpenPgpSecretKeyring } from "./containers.js";
 import { decodedText } from "../text.js";
+import { MAX_ARMORED_MARKERS_PER_VALIDATOR, MAX_ARMORED_SEARCH_BYTES_PER_VALIDATOR } from "../limits.js";
 
 export interface ArmoredValidation {
   category: string;
@@ -11,6 +12,11 @@ export interface ArmoredValidation {
 }
 
 const BEGIN = /-----BEGIN ((?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY)-----/g;
+
+function checkedMaximumHits(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error("armored key hit limit must be a non-negative safe integer");
+  return value;
+}
 
 function decodeCanonicalBase64(value: string): Buffer | null {
   if (value.length === 0 || value.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return null;
@@ -107,17 +113,38 @@ function legacyPemEncryption(lines: string[], decoded: Buffer): boolean {
   return parameters !== undefined && iv?.length === parameters.ivHex && decoded.length >= parameters.block && decoded.length % parameters.block === 0;
 }
 
-export function findPrivateKeyBlocks(data: Buffer): Array<{ offset: number; validation: ArmoredValidation }> {
+export function findPrivateKeyBlocks(
+  data: Buffer,
+  maximumHits = Number.MAX_SAFE_INTEGER,
+  onLimit?: () => void,
+  onMarkerLimit?: () => void,
+): Array<{ offset: number; validation: ArmoredValidation }> {
+  checkedMaximumHits(maximumHits);
   const text = decodedText(data, "latin1");
   const results: Array<{ offset: number; validation: ArmoredValidation }> = [];
+  let markers = 0;
+  let searchedBytes = 0;
   BEGIN.lastIndex = 0;
   for (const match of text.matchAll(BEGIN)) {
     const label = match[1];
     const offset = match.index;
     if (label === undefined || offset === undefined) continue;
+    if (markers >= MAX_ARMORED_MARKERS_PER_VALIDATOR) {
+      onMarkerLimit?.();
+      return results;
+    }
+    markers += 1;
     const footer = `-----END ${label}-----`;
-    const endIndex = text.indexOf(footer, offset + match[0].length);
-    if (endIndex < 0 || endIndex - offset > 4 * 1024 * 1024) continue;
+    const searchStart = offset + match[0].length;
+    const bounded = data.subarray(searchStart, Math.min(data.length, offset + 4 * 1024 * 1024 + Buffer.byteLength(footer)));
+    if (searchedBytes + bounded.length > MAX_ARMORED_SEARCH_BYTES_PER_VALIDATOR) {
+      onMarkerLimit?.();
+      return results;
+    }
+    searchedBytes += bounded.length;
+    const relativeEnd = bounded.indexOf(Buffer.from(footer, "ascii"));
+    if (relativeEnd < 0) continue;
+    const endIndex = searchStart + relativeEnd;
     let end = endIndex + footer.length;
     while (end < text.length && (text[end] === "\r" || text[end] === "\n")) end += 1;
     const value = data.subarray(offset, end);
@@ -135,6 +162,10 @@ export function findPrivateKeyBlocks(data: Buffer): Array<{ offset: number; vali
       parsed = true;
     } catch {
       if (!encryptedPkcs8 && !openSsh && !legacyEncrypted) continue;
+    }
+    if (results.length >= maximumHits) {
+      onLimit?.();
+      return results;
     }
     results.push({
       offset,
@@ -157,22 +188,47 @@ export function findPrivateKeyBlocks(data: Buffer): Array<{ offset: number; vali
   return results;
 }
 
-export function findPgpPrivateBlocks(data: Buffer): Array<{ offset: number; validation: ArmoredValidation }> {
+export function findPgpPrivateBlocks(
+  data: Buffer,
+  maximumHits = Number.MAX_SAFE_INTEGER,
+  onLimit?: () => void,
+  onMarkerLimit?: () => void,
+): Array<{ offset: number; validation: ArmoredValidation }> {
+  checkedMaximumHits(maximumHits);
   const begin = Buffer.from("-----BEGIN PGP PRIVATE KEY BLOCK-----", "ascii");
   const end = Buffer.from("-----END PGP PRIVATE KEY BLOCK-----", "ascii");
   const output = [];
   let cursor = 0;
+  let markers = 0;
+  let searchedBytes = 0;
   while (cursor < data.length) {
     const offset = data.indexOf(begin, cursor);
     if (offset < 0) break;
-    const ending = data.indexOf(end, offset + begin.length);
-    if (ending >= 0 && ending - offset <= 8 * 1024 * 1024) {
+    if (markers >= MAX_ARMORED_MARKERS_PER_VALIDATOR) {
+      onMarkerLimit?.();
+      return output;
+    }
+    markers += 1;
+    const searchStart = offset + begin.length;
+    const bounded = data.subarray(searchStart, Math.min(data.length, offset + 8 * 1024 * 1024 + end.length));
+    if (searchedBytes + bounded.length > MAX_ARMORED_SEARCH_BYTES_PER_VALIDATOR) {
+      onMarkerLimit?.();
+      return output;
+    }
+    searchedBytes += bounded.length;
+    const relativeEnd = bounded.indexOf(end);
+    const ending = relativeEnd < 0 ? -1 : searchStart + relativeEnd;
+    if (ending >= 0) {
       const value = data.subarray(offset, ending + end.length);
       const body = value.toString("ascii").split(/\r?\n/).filter((line) => line !== "" && !line.startsWith("-----") && !line.includes(":") && !line.startsWith("="));
       try {
         const decoded = decodeCanonicalBase64(body.join(""));
         const packetValidation = decoded === null ? null : validateOpenPgpSecretKeyring(decoded);
         if (packetValidation !== null) {
+          if (output.length >= maximumHits) {
+            onLimit?.();
+            return output;
+          }
           output.push({
             offset,
             validation: {
@@ -199,16 +255,36 @@ export function findPgpPrivateBlocks(data: Buffer): Array<{ offset: number; vali
   return output;
 }
 
-export function findPuttyPrivateKeys(data: Buffer): Array<{ offset: number; validation: ArmoredValidation }> {
+export function findPuttyPrivateKeys(
+  data: Buffer,
+  maximumHits = Number.MAX_SAFE_INTEGER,
+  onLimit?: () => void,
+  onMarkerLimit?: () => void,
+): Array<{ offset: number; validation: ArmoredValidation }> {
+  checkedMaximumHits(maximumHits);
   const text = decodedText(data, "latin1");
   const header = /^PuTTY-User-Key-File-(\d+):\s*([^\r\n]+)$/gm;
   const output = [];
+  let markers = 0;
+  let searchedBytes = 0;
   for (const match of text.matchAll(header)) {
     const offset = match.index;
     const version = Number(match[1]);
     const algorithm = match[2]?.trim();
     if (offset === undefined || ![2, 3].includes(version) || algorithm === undefined || !/^ssh-[A-Za-z0-9@._+-]+$/.test(algorithm)) continue;
-    const tail = text.slice(offset, Math.min(text.length, offset + 4 * 1024 * 1024));
+    if (markers >= MAX_ARMORED_MARKERS_PER_VALIDATOR) {
+      onMarkerLimit?.();
+      return output;
+    }
+    markers += 1;
+    const tailEnd = Math.min(text.length, offset + 4 * 1024 * 1024);
+    const tailBytes = tailEnd - offset;
+    if (searchedBytes + tailBytes > MAX_ARMORED_SEARCH_BYTES_PER_VALIDATOR) {
+      onMarkerLimit?.();
+      return output;
+    }
+    searchedBytes += tailBytes;
+    const tail = text.slice(offset, tailEnd);
     const lines = tail.split(/\r?\n/);
     const encryption = /^Encryption:\s*(none|aes256-cbc)$/.exec(lines[1] ?? "");
     if (encryption === null || !/^Comment:\s*[^\0]*$/.test(lines[2] ?? "")) continue;
@@ -255,6 +331,10 @@ export function findPuttyPrivateKeys(data: Buffer): Array<{ offset: number; vali
       return position;
     })();
     const value = Buffer.from(tail.slice(0, Math.max(end, originalEnd)), "latin1");
+    if (output.length >= maximumHits) {
+      onLimit?.();
+      return output;
+    }
     output.push({
       offset,
       validation: {
@@ -279,21 +359,46 @@ export function findPuttyPrivateKeys(data: Buffer): Array<{ offset: number; vali
   return output;
 }
 
-export function findSsh2PrivateBlocks(data: Buffer): Array<{ offset: number; validation: ArmoredValidation }> {
+export function findSsh2PrivateBlocks(
+  data: Buffer,
+  maximumHits = Number.MAX_SAFE_INTEGER,
+  onLimit?: () => void,
+  onMarkerLimit?: () => void,
+): Array<{ offset: number; validation: ArmoredValidation }> {
+  checkedMaximumHits(maximumHits);
   const begin = Buffer.from("---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----", "ascii");
   const end = Buffer.from("---- END SSH2 ENCRYPTED PRIVATE KEY ----", "ascii");
   const output: Array<{ offset: number; validation: ArmoredValidation }> = [];
   let cursor = 0;
+  let markers = 0;
+  let searchedBytes = 0;
   while (cursor < data.length) {
     const offset = data.indexOf(begin, cursor);
     if (offset < 0) break;
-    const ending = data.indexOf(end, offset + begin.length);
-    if (ending >= 0 && ending - offset <= 4 * 1024 * 1024) {
+    if (markers >= MAX_ARMORED_MARKERS_PER_VALIDATOR) {
+      onMarkerLimit?.();
+      return output;
+    }
+    markers += 1;
+    const searchStart = offset + begin.length;
+    const bounded = data.subarray(searchStart, Math.min(data.length, offset + 4 * 1024 * 1024 + end.length));
+    if (searchedBytes + bounded.length > MAX_ARMORED_SEARCH_BYTES_PER_VALIDATOR) {
+      onMarkerLimit?.();
+      return output;
+    }
+    searchedBytes += bounded.length;
+    const relativeEnd = bounded.indexOf(end);
+    const ending = relativeEnd < 0 ? -1 : searchStart + relativeEnd;
+    if (ending >= 0) {
       const value = data.subarray(offset, ending + end.length);
       const lines = value.toString("ascii").split(/\r?\n/);
       const encoded = lines.filter((line) => line !== "" && !line.startsWith("----") && !line.includes(":")).join("");
       const decoded = decodeCanonicalBase64(encoded);
       if (decoded !== null && decoded.length >= 32 && decoded.readUInt32BE(0) === 0x3f6ff9eb) {
+        if (output.length >= maximumHits) {
+          onLimit?.();
+          return output;
+        }
         output.push({
           offset,
           validation: {

@@ -1,10 +1,10 @@
 # Mining architecture
 
-The mining layer is an offline scanner for local recovery outputs. It accepts regular files and directory trees, refuses known network-mounted inputs and outputs, does not follow symbolic links, and does not open network connections. It is designed for carved files, deleted-metadata exports, raw filesystem-unallocated streams, shadow-copy exports, and residual-memory files.
+The mining layer is an offline scanner for local recovery outputs. It accepts regular files and directory trees, refuses known network-mounted inputs and outputs, does not follow symbolic links, and does not open network connections. It is designed for carved files, deleted-metadata exports, raw filesystem-unallocated streams, shadow-copy exports, and residual-memory files. An authorized agent may run and resume it without human interaction; the safe automation contract is in [AGENTS.md](../AGENTS.md).
 
 ## Output contract
 
-A scan writes three kinds of local output:
+A scan writes these related local outputs:
 
 | Output | Contents | Handling |
 | --- | --- | --- |
@@ -12,11 +12,13 @@ A scan writes three kinds of local output:
 | `final-report-redacted.md` | Human-readable counts, wallet result, categories, and possible access without local locations or identifiers | Shareable only after review; mode `0644` |
 | `artifacts/finding-NNNNNN/` | Exact recovered values plus deterministic derived formats such as PKCS#8 | Secret; files are mode `0600` where supported |
 | `inventory-sensitive.json` | Source paths, byte offsets, SHA-256 fingerprints, provenance, sensitive metadata, artifact mappings, and integrity hashes for every exact/derived artifact | Secret; mode `0600` |
+| `scan-state-sensitive.json` | Semantic options, operational settings, committed cursor, progress, and hashes of the frozen manifest and inventory | Secret; mode `0600`; do not edit |
+| `scan-files-sensitive.ndjson` | Deterministically ordered, frozen identity/size/time snapshot for every input file | Secret; mode `0600`; do not edit |
 | `manifest-redacted.json` | Aggregate counts, categories, validation methods, generic artifact IDs, and error counts | Values, paths, offsets, and fingerprints omitted |
 
 “Redacted by default” applies to routine output and the shareable manifest, not the recovered artifacts. Exact bytes remain available to the owner for manual verification. `aark mine reveal <artifact>` is the only command that deliberately copies an artifact to stdout; it accepts only a file referenced by the finalized adjacent mining inventory and verifies its recorded size and SHA-256 hash before printing any bytes.
 
-On completion, failure, or interruption after output initialization, the sensitive final report states the exact run status, whether cryptocurrency-related material was detected so far, separates direct keys/seeds from wallet or keystore containers, categorizes every credential type by possible access, and points to every exact artifact and source occurrence. It also lists local scan errors. The report does not duplicate secret values that already exist in the artifact files. Report generation is entirely local and deterministic. If the output itself becomes unsafe, substituted, or unwritable, report publication may be refused because writing there is no longer trustworthy.
+On completion, clean pause, or failure after output initialization, the sensitive final report states the exact run status, whether cryptocurrency-related material was detected so far, separates direct keys/seeds from wallet or keystore containers, categorizes every credential type by possible access, and points to every exact artifact and source occurrence. It also lists local scan errors. The report does not duplicate secret values that already exist in the artifact files. Report generation is entirely local and deterministic. If the output itself becomes unsafe, substituted, or unwritable, report publication may be refused because writing there is no longer trustworthy.
 
 The category counts in the redacted manifest can still reveal that a type of credential exists. Review even the redacted file before publishing it.
 
@@ -35,13 +37,35 @@ aark mine scan /case/recovery/unallocated/free-space.raw \
 
 Whole-file validation is capped at 256 MiB and streaming chunks at 128 MiB to keep accidental memory use bounded. Raising the whole-file limit is useful for unusually large browser databases or password vaults; it does not affect streaming detection of embedded keys and tokens.
 
-The output directory must be new or empty, cannot be nested inside an input directory, and cannot be a filesystem mount root. Canonical duplicate or nested input roots are collapsed so a file is not scanned twice. An exclusive output lock prevents concurrent scans from racing in one result tree, and emptiness is rechecked while that lock is held. File identity, size, modification time, and change time are checked before and after streaming and again before whole-file validation; a mutation is recorded as an error instead of mixing different byte snapshots under one source location. An in-progress checkpoint is written every 25 visited files or 60 seconds. If a scan is interrupted, both final reports identify the interruption; preserve that output and rerun into a new directory because automatic in-place resume is not implemented yet.
+Pure detector families run in a bounded `worker_threads` pool. `--workers` accepts `1` through `4`; the default is the number of available CPUs minus one, bounded to that range. Non-deep scans pre-read a bounded group of primary windows and feed their detector-family jobs through an ordered scheduler. At most `workers + 1` detector responses are outstanding, so a slow early job applies backpressure instead of allowing every potentially large result to accumulate in the main thread. Deep scans keep one streaming window in flight while overlapping 1 MiB schedule slices run and commit in deterministic worker-sized batches, bounding result memory without serializing the CPU-heavy pass. Worker completion order never controls output order: the main thread commits chunks and detector families deterministically, verifies candidate bytes against the source window, deduplicates, assigns IDs, updates storage accounting, and performs every artifact and checkpoint write.
+
+Whole-file binary/container validation may accept files up to the configured 256 MiB ceiling, but untrusted JSON parsing has a separate 32 MiB ceiling to bound parser amplification. A larger JSON-shaped file is left untouched, the structured detector records that its validation limit was reached, and the scan completes with an error rather than risking process exhaustion. Expensive cryptographic parses are likewise capped at 64 attempts per detector job.
+
+Each streaming detector job may return at most 10,000 candidates, 64 MiB of aggregate primary-plus-derived candidate bytes, and 100,000 candidate-shaped structural validations; the single whole-file structured job has a 320 MiB result ceiling so it can retain one maximum-size 256 MiB container plus the 64 MiB derived-export allowance. Each armor parser applies tighter bounds of 1,000 markers and 64 MiB of aggregate bounded searches to avoid repeated multi-megabyte work through malformed data. Derived exports are limited to 16 files and 64 MiB in aggregate per candidate. If a bounded window reaches one of these limits, AARK retains and commits validated results already returned, records a detector error, and finishes as `complete-with-errors` unless another failure occurs. In-memory resume metadata is also bounded to 10,000 unique findings, 20,000 exact occurrences, 1,000 detailed errors, and a 128 MiB serialized inventory. Reaching a finding or occurrence bound is a non-resumable failure rather than an OOM or a false-complete result; already published exact artifacts remain in the failed output. Split exceptionally dense sources into smaller, separately labeled scans.
+
+Use `--workers 1` for a lower-memory run. Larger chunk and overlap settings multiply the bounded in-flight memory cost; the default `32/17` MiB pair is recommended unless a known container requires a different whole-file limit.
+
+The output directory must be new or empty, cannot be nested inside an input directory, and cannot be a filesystem mount root. A scan accepts at most 128 input roots; canonical duplicate or nested roots are collapsed so a file is not scanned twice. Deterministic directory inventory is bounded to 100,000 entries in one directory, a 100,000-entry pending frontier, and 100,000 visited directories. Crossing a bound fails a root inventory or records an incomplete nested-directory error instead of risking an out-of-memory exit; split an unusually wide or directory-heavy tree into smaller input roots. A current-and-legacy compatibility lock pair prevents concurrent AARK versions from racing in one result tree, and emptiness is rechecked while both locks are held. File identity, size, modification time, and change time are frozen in the scan manifest and checked around streaming and whole-file validation; a mutation is recorded as an error instead of mixing different byte snapshots under one source location. An in-progress checkpoint is written every 25 visited files or 60 seconds.
 
 Input-root identity and mount backing are revalidated while walking. The output directory, its mount, and the acquired lock are revalidated before sensitive writes and at streaming-window boundaries. A mount swap or disappearing lock fails the scan instead of silently redirecting exact artifacts.
 
+## Capacity guard and pause/resume
+
+Before and during a scan, AARK reserves the larger of `--min-free-gib` (default `5`) and `--min-free-percent` (default `5`) on the output filesystem. `--max-output-gib` optionally caps the logical size of the complete mining output tree. The free-space boundary is checked before writes and at each committed streaming chunk. A small amount of reserved space can still be used to publish the paused reports, inventory, and state; this may put final control metadata slightly above the logical cap.
+
+`SIGINT`, `SIGTERM`, a reached reserve, or a reached cap discards or settles in-flight detector work, commits no partial chunk cursor, publishes a `paused` inventory and reports, and exits with code `75`. The JSON result includes `resumable: true`, `pauseReason`, and a `resumeCommand`. Preserve the entire output unchanged, correct the capacity condition if necessary, and run:
+
+```bash
+aark mine resume --output /case/mining-unallocated
+```
+
+If the pause happens while AARK is still freezing the deterministic input inventory, the partial manifest is discarded. Resume safely rebuilds that inventory from the unchanged input roots before detector work begins.
+
+Resume reuses immutable semantic settings such as inputs, provenance, chunk geometry, whole-file threshold, and deep-scan mode. It can override operational settings with `--workers`, `--min-free-gib`, `--min-free-percent`, or `--max-output-gib`. The hashed paused inventory mirrors the state run ID, semantic settings, input-root identities, manifest, committed cursor, and progress. Before starting workers AARK requires that mirror to agree with the state file, then verifies every completed or partial input snapshot and every exact artifact directory, file size, and hash. Only a clean state marked `paused` and `resumable: true` is accepted. Failed, hard-killed, edited, or incomplete output trees must be retained for diagnosis and scanned again into a new directory.
+
 ### Deep expanded-key scan
 
-For raw memory, hibernation, swap, or unallocated streams, `--deep-key-schedules` tests every byte position for a complete AES-128/192/256 encryption-key expansion recurrence and checks initialized ChaCha states. An AES match recovers the original key and preserves the full schedule as a derived artifact; a ChaCha match preserves the 64-byte state alongside its exact key bytes. This mode is CPU-intensive, so it is explicit rather than the unnoticed default. Its exhaustive pass is internally divided into overlapping 1 MiB slices with event-loop yields so cancellation and checkpoints are not blocked for an entire streaming window:
+For raw memory, hibernation, swap, or unallocated streams, `--deep-key-schedules` tests every byte position for a complete AES-128/192/256 encryption-key expansion recurrence and checks initialized ChaCha states. An AES match recovers the original key and preserves the full schedule as a derived artifact; a ChaCha match preserves the 64-byte state alongside its exact key bytes. This mode is CPU-intensive, so it is explicit rather than the unnoticed default. Its exhaustive pass is internally divided into overlapping 1 MiB worker jobs so the configured pool can process bounded slices in parallel:
 
 ```bash
 aark mine scan /case/recovery/residual-memory \
@@ -49,6 +73,10 @@ aark mine scan /case/recovery/residual-memory \
   --provenance residual-memory \
   --deep-key-schedules
 ```
+
+## Post-scan cleanup
+
+Only an error-free result whose exact status is `complete` can authorize AARK cleanup. `complete-with-errors`, paused, interrupted, failed, edited, or changed-input scans are never accepted. Multiple complete mining outputs may collectively cover recovery directories scanned under different provenance labels. Cleanup retains each full mining output—especially exact artifacts, the sensitive inventory, and frozen integrity metadata—while it can remove the bulky recovered copy after a fresh end-user decision. See [Cleanup workflow](cleanup.md).
 
 ## Validation levels
 

@@ -53,14 +53,10 @@ export function filesystemIsNetwork(record: MountRecord | undefined): boolean {
   const filesystem = record.filesystem.toLowerCase();
   const known = new Set(["9p", "afs", "ceph", "cifs", "davfs", "glusterfs", "lustre", "nfs", "nfs4", "smb3", "virtiofs"]);
   const knownLocalFuse = new Set([
-    "fuse.bindfs",
     "fuse.dislocker",
-    "fuse.encfs",
     "fuse.exfat",
-    "fuse.mergerfs",
     "fuse.ntfs",
     "fuse.ntfs-3g",
-    "fuse.unionfs",
     "fuseblk",
   ]);
   return known.has(filesystem)
@@ -103,6 +99,7 @@ export async function mountIsNetworkBacked(record: MountRecord | undefined): Pro
     timeoutMs: 30_000,
   });
   if (result.exitCode !== 0) throw new Error("could not resolve the physical transport backing a protected mount");
+  if (result.stdoutTruncated) throw new Error("lsblk output exceeded its bounded safety limit while resolving a protected mount");
   let document: { blockdevices?: LsblkTransportNode[] };
   try {
     document = JSON.parse(result.stdout.toString("utf8")) as { blockdevices?: LsblkTransportNode[] };

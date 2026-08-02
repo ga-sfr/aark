@@ -1,0 +1,1287 @@
+import { createHash, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import type { Stats } from "node:fs";
+import { lstat, open, opendir, readlink, realpath, rename, rm } from "node:fs/promises";
+import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import {
+  acquireExclusiveLock,
+  assertNoSymlinkComponents,
+  atomicWriteFile,
+  atomicWriteJson,
+  MAX_WALK_DIRECTORIES,
+  MAX_WALK_DIRECTORY_ENTRIES,
+  MAX_WALK_PENDING_ENTRIES,
+  readDirectoryNamesBounded,
+  readJson,
+  safeJoin,
+  syncDirectory,
+  walkRegularFiles,
+} from "./core/fs-safe.js";
+import type { ExclusiveLock, WalkedFile } from "./core/fs-safe.js";
+import { filesystemIsNetwork, mountForPathFrom, mountIsNetworkBacked, mounts } from "./core/mounts.js";
+import type { MountRecord } from "./core/mounts.js";
+import {
+  loadCompletedInventory,
+  loadScanState,
+  readScanManifest,
+  verifyResumeArtifacts,
+} from "./mining/resume.js";
+import type { ScanState } from "./mining/resume.js";
+import type { SensitiveScanInventory } from "./mining/types.js";
+
+const RECOVERY_LOCK_FILENAMES = [".aark-recovery.lock", ".agetnic-recovery.lock"] as const;
+const MINING_LOCK_FILENAMES = [".aark-mining.lock", ".agetnic-mining.lock"] as const;
+const CLEANUP_SENSITIVE_REPORT = "cleanup-final-report-sensitive.md";
+const CLEANUP_REDACTED_REPORT = "cleanup-final-report-redacted.md";
+const CLEANUP_REDACTED_MANIFEST = "cleanup-manifest-redacted.json";
+const MAX_CASE_STATE_BYTES = 16 * 1024 * 1024;
+const MAX_CLEANUP_FAILURE_BYTES = 8 * 1024;
+const MAX_RETAINED_CONTROL_BYTES = 256 * 1024 * 1024;
+const TOKEN = /^[a-f0-9]{64}$/;
+const RUN_ID = /^[0-9A-Za-z][0-9A-Za-z._-]{0,255}$/;
+const CLEANUP_QUARANTINE_PREFIX = ".aark-cleanup-pending-";
+
+export interface CleanupOptions {
+  caseDirectory: string;
+  miningOutputs: string[];
+  includeEvidence?: boolean;
+  signal?: AbortSignal;
+}
+
+export interface CleanupRunOptions extends CleanupOptions {
+  approvalToken: string;
+  execute: boolean;
+  confirmDeleteRecoveredCopy: boolean;
+  confirmDeleteEvidence?: boolean;
+}
+
+export interface CleanupPlanResult {
+  version: 1;
+  tool: "aark";
+  layer: "cleanup";
+  status: "ready";
+  destructive: true;
+  valuesPrinted: false;
+  pathsRedacted: true;
+  recoveryStatus: "complete" | "complete-with-warnings";
+  miningScansVerified: number;
+  scannedFilesVerified: string;
+  findingsRetained: string;
+  markerOnlyFindingsWithoutArtifacts: string;
+  artifactFilesRetained: string;
+  deletion: {
+    directories: number;
+    filesystemEntries: string;
+    regularFiles: string;
+    logicalBytes: string;
+    recoveredCopyLogicalBytes: string;
+    evidenceCopyLogicalBytes: string;
+    intermediateLogicalBytes: string;
+    recoveredCopyIncluded: boolean;
+    evidenceCopyIncluded: boolean;
+    evidenceCopyPresent: boolean;
+    intermediateLogsAndRunsIncluded: boolean;
+  };
+  retained: {
+    recoveryFinalReports: true;
+    cleanupFinalReports: true;
+    miningFinalReports: true;
+    exactFindingArtifacts: true;
+    minimalIntegrityMetadata: true;
+    evidenceCopy: boolean;
+  };
+  approvalToken: string;
+  approvalRequired: true;
+  requirements: string[];
+}
+
+interface RootSnapshot {
+  path: string;
+  device: number;
+  inode: number;
+  mount: string;
+}
+
+interface TargetSnapshot {
+  name: "recovery" | "evidence" | "logs" | "runs";
+  path: string;
+  device: number;
+  inode: number;
+  modifiedMs: number;
+  changedMs: number;
+  filesystemEntries: bigint;
+  regularFiles: bigint;
+  logicalBytes: bigint;
+  contentDigest: string;
+  requiresScanCoverage: boolean;
+}
+
+interface VerifiedMiningOutput {
+  root: RootSnapshot;
+  state: ScanState;
+  scannedFiles: number;
+  findings: number;
+  markerOnlyFindings: number;
+  artifactFiles: number;
+  controlDigest: string;
+}
+
+interface CoverageIndex {
+  files: Set<string>;
+  directories: Set<string>;
+}
+
+interface VerifiedRecoveryCase {
+  status: "complete" | "complete-with-warnings";
+  runId: string;
+  controlDigest: string;
+}
+
+interface RecoveryCaseState {
+  version?: unknown;
+  runId?: unknown;
+  status?: unknown;
+  startedAt?: unknown;
+  finishedAt?: unknown;
+  currentStep?: unknown;
+  failure?: unknown;
+  plan?: unknown;
+  results?: unknown;
+}
+
+interface InternalCleanupPlan {
+  public: CleanupPlanResult;
+  caseRoot: RootSnapshot;
+  recovery: VerifiedRecoveryCase;
+  mining: VerifiedMiningOutput[];
+  coverage: CoverageIndex;
+  targets: TargetSnapshot[];
+  introducedLocks: Set<string>;
+}
+
+function interrupted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) throw new Error("cleanup verification was interrupted");
+}
+
+function inside(root: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function mountIdentity(record: MountRecord): string {
+  return JSON.stringify({
+    source: record.source,
+    target: path.resolve(record.target),
+    filesystem: record.filesystem.toLowerCase(),
+    options: [...record.options].sort(),
+  });
+}
+
+function boundedString(value: unknown, maximumBytes = 4 * 1024): value is string {
+  return typeof value === "string" && Buffer.byteLength(value) <= maximumBytes;
+}
+
+function errorCode(error: unknown): string | undefined {
+  return error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+}
+
+function bytewiseLexical(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function entryKind(metadata: Stats): "directory" | "file" | "symlink" | "block-device" | "character-device" | "fifo" | "socket" | "other" {
+  if (metadata.isDirectory()) return "directory";
+  if (metadata.isFile()) return "file";
+  if (metadata.isSymbolicLink()) return "symlink";
+  if (metadata.isBlockDevice()) return "block-device";
+  if (metadata.isCharacterDevice()) return "character-device";
+  if (metadata.isFIFO()) return "fifo";
+  if (metadata.isSocket()) return "socket";
+  return "other";
+}
+
+function assertBoundedEntryMetadata(metadata: Stats): void {
+  for (const value of [metadata.dev, metadata.ino, metadata.mode, metadata.nlink, metadata.uid, metadata.gid, metadata.rdev, metadata.mtimeMs, metadata.ctimeMs]) {
+    if (!Number.isFinite(value) || value < 0) throw new Error("cleanup target contains filesystem metadata outside valid numeric bounds");
+  }
+  if (!Number.isSafeInteger(metadata.size) || metadata.size < 0) {
+    throw new Error("cleanup target contains an entry whose size exceeds safe numeric bounds");
+  }
+}
+
+function sameEntryMetadata(left: Stats, right: Stats): boolean {
+  return entryKind(left) === entryKind(right)
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.mode === right.mode
+    && left.nlink === right.nlink
+    && left.uid === right.uid
+    && left.gid === right.gid
+    && left.rdev === right.rdev
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs;
+}
+
+function boundedFailure(error: unknown): string | undefined {
+  if (error === undefined) return undefined;
+  const value = error instanceof Error ? error.message : String(error);
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.length <= MAX_CLEANUP_FAILURE_BYTES) return value;
+  const suffix = "...[truncated]";
+  return `${bytes.subarray(0, MAX_CLEANUP_FAILURE_BYTES - Buffer.byteLength(suffix)).toString("utf8").replace(/\uFFFD+$/u, "")}${suffix}`;
+}
+
+async function existingRealDirectory(input: string, label: string): Promise<string> {
+  const resolved = path.resolve(input);
+  const metadata = await lstat(resolved);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error(`${label} must be a real directory`);
+  if (await realpath(resolved) !== resolved) throw new Error(`${label} must be supplied by its canonical path`);
+  return resolved;
+}
+
+async function pathExists(filename: string): Promise<boolean> {
+  try {
+    await lstat(filename);
+    return true;
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function assertRegularControlFile(root: string, filename: string): Promise<void> {
+  const target = safeJoin(root, filename);
+  await assertNoSymlinkComponents(root, target);
+  const metadata = await lstat(target);
+  if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.nlink !== 1 || await realpath(target) !== target) {
+    throw new Error("required cleanup control input must remain a single-link canonical regular file");
+  }
+}
+
+interface ControlFingerprint {
+  filename: string;
+  bytes: number;
+  sha256: string;
+}
+
+async function stableControlFingerprint(
+  root: string,
+  filename: string,
+  signal?: AbortSignal,
+): Promise<ControlFingerprint> {
+  interrupted(signal);
+  await assertRegularControlFile(root, filename);
+  const target = safeJoin(root, filename);
+  const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const before = await handle.stat();
+    if (
+      !before.isFile()
+      || before.nlink !== 1
+      || !Number.isSafeInteger(before.size)
+      || before.size < 0
+      || before.size > MAX_RETAINED_CONTROL_BYTES
+    ) throw new Error("retained cleanup control input is not a bounded single-link regular file");
+    const digest = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let offset = 0;
+    while (offset < before.size) {
+      interrupted(signal);
+      const read = await handle.read(buffer, 0, Math.min(buffer.length, before.size - offset), offset);
+      if (read.bytesRead === 0) throw new Error("retained cleanup control input ended while it was being hashed");
+      digest.update(buffer.subarray(0, read.bytesRead));
+      offset += read.bytesRead;
+    }
+    const probe = Buffer.allocUnsafe(1);
+    const extra = await handle.read(probe, 0, 1, offset);
+    const after = await handle.stat();
+    const current = await lstat(target);
+    if (
+      extra.bytesRead !== 0
+      || !after.isFile()
+      || after.nlink !== 1
+      || before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs
+      || before.ctimeMs !== after.ctimeMs
+      || current.isSymbolicLink()
+      || !current.isFile()
+      || current.nlink !== 1
+      || current.dev !== after.dev
+      || current.ino !== after.ino
+      || current.size !== after.size
+      || current.mtimeMs !== after.mtimeMs
+      || current.ctimeMs !== after.ctimeMs
+      || await realpath(target) !== target
+    ) throw new Error("retained cleanup control input changed while it was being hashed");
+    return { filename, bytes: after.size, sha256: digest.digest("hex") };
+  } finally {
+    await handle.close();
+  }
+}
+
+function digestControlFingerprints(fingerprints: ControlFingerprint[]): string {
+  return createHash("sha256").update(JSON.stringify(fingerprints)).digest("hex");
+}
+
+async function rootSnapshot(
+  root: string,
+  records: MountRecord[],
+  networkCache: Map<string, Promise<boolean>>,
+  label: string,
+): Promise<RootSnapshot> {
+  const canonical = await existingRealDirectory(root, label);
+  const metadata = await lstat(canonical);
+  const mounted = mountForPathFrom(records, canonical);
+  if (mounted === undefined) throw new Error(`could not determine the mount backing ${label}`);
+  const identity = mountIdentity(mounted);
+  let network = networkCache.get(identity);
+  if (network === undefined) {
+    network = filesystemIsNetwork(mounted) ? Promise.resolve(true) : mountIsNetworkBacked(mounted);
+    networkCache.set(identity, network);
+  }
+  if (await network) throw new Error(`${label} must be on a local filesystem and block transport`);
+  if (path.resolve(mounted.target) === canonical) throw new Error(`${label} must be a dedicated subdirectory, not a mount root`);
+  if (records.some((record) => {
+    const target = path.resolve(record.target);
+    return target !== canonical && inside(canonical, target);
+  })) throw new Error(`${label} must not contain nested mounts`);
+  return { path: canonical, device: metadata.dev, inode: metadata.ino, mount: identity };
+}
+
+async function assertRootCurrent(expected: RootSnapshot): Promise<void> {
+  const records = await mounts();
+  const cache = new Map<string, Promise<boolean>>();
+  const current = await rootSnapshot(expected.path, records, cache, "protected cleanup directory");
+  if (current.device !== expected.device || current.inode !== expected.inode || current.mount !== expected.mount) {
+    throw new Error("a protected cleanup directory or its mount changed during verification");
+  }
+}
+
+async function assertNoOperationLocks(root: string, filenames: readonly string[]): Promise<void> {
+  for (const filename of filenames) {
+    if (await pathExists(safeJoin(root, filename))) {
+      throw new Error("an operation lock already exists; another process may be active or a prior process may have stopped abruptly");
+    }
+  }
+}
+
+async function assertNoCleanupQuarantine(caseRoot: string): Promise<void> {
+  const entries = await readDirectoryNamesBounded(caseRoot, 256);
+  if (entries.some((entry) => entry.startsWith(CLEANUP_QUARANTINE_PREFIX))) {
+    throw new Error("the case contains an unfinished cleanup quarantine; inspect it locally before another cleanup attempt");
+  }
+}
+
+function recoveryPlanRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("recovery case contains an invalid plan");
+  return value as Record<string, unknown>;
+}
+
+async function verifyRecoveryCase(caseRoot: string, signal?: AbortSignal): Promise<VerifiedRecoveryCase> {
+  interrupted(signal);
+  const retainedControls = [
+    "case-sensitive.json",
+    "plan-redacted.json",
+    "manifest-redacted.json",
+    "final-report-sensitive.md",
+    "final-report-redacted.md",
+  ] as const;
+  for (const filename of retainedControls) await assertRegularControlFile(caseRoot, filename);
+
+  const state = await readJson<RecoveryCaseState>(safeJoin(caseRoot, "case-sensitive.json"), MAX_CASE_STATE_BYTES);
+  const plan = recoveryPlanRecord(state.plan);
+  const status = String(state.status);
+  if (
+    state.version !== 1
+    || !boundedString(state.runId, 256)
+    || !RUN_ID.test(state.runId)
+    || !["complete", "complete-with-warnings"].includes(status)
+    || !boundedString(state.startedAt, 128)
+    || !boundedString(state.finishedAt, 128)
+    || state.currentStep !== null
+    || state.failure !== null
+    || !Array.isArray(state.results)
+    || plan.version !== 1
+    || plan.destination !== caseRoot
+    || !Array.isArray(plan.steps)
+  ) throw new Error("cleanup requires a terminal successful AARK recovery case");
+  if (state.results.length !== plan.steps.length) {
+    throw new Error("completed recovery state does not account for every planned stage");
+  }
+  const stateResults = state.results as unknown[];
+  let hasWarnings = false;
+  for (let index = 0; index < plan.steps.length; index += 1) {
+    const step = recoveryPlanRecord(plan.steps[index]);
+    const result = recoveryPlanRecord(stateResults[index]);
+    const stepId = step.id;
+    const resultStatus = result.status;
+    if (
+      !boundedString(stepId, 128)
+      || !/^[a-z0-9][a-z0-9.-]{0,127}$/.test(stepId)
+      || typeof step.optional !== "boolean"
+      || result.id !== stepId
+      || !["completed", "completed-with-warnings", "failed", "skipped-missing-optional-tool"].includes(String(resultStatus))
+      || (resultStatus !== "completed" && step.optional !== true)
+    ) throw new Error("completed recovery state contains an invalid or unaccounted stage result");
+    if (resultStatus !== "completed") hasWarnings = true;
+  }
+  if ((status === "complete-with-warnings") !== hasWarnings) {
+    throw new Error("completed recovery status does not match its stage outcomes");
+  }
+
+  const manifest = await readJson<Record<string, unknown>>(safeJoin(caseRoot, "manifest-redacted.json"));
+  const manifestResults = Array.isArray(manifest.results) ? manifest.results : [];
+  if (
+    manifest.tool !== "aark"
+    || manifest.layer !== "recovery"
+    || manifest.runId !== state.runId
+    || manifest.status !== status
+    || manifest.complete !== true
+    || manifest.finishedAt !== state.finishedAt
+    || manifestResults.length !== stateResults.length
+    || manifestResults.some((entry, index) => {
+      const result = typeof entry === "object" && entry !== null && !Array.isArray(entry) ? entry as Record<string, unknown> : {};
+      const sensitive = recoveryPlanRecord(stateResults[index]);
+      return result.id !== sensitive.id || result.status !== sensitive.status;
+    })
+  ) throw new Error("recovery state and final redacted manifest do not describe the same completed run");
+
+  const fingerprints: ControlFingerprint[] = [];
+  for (const filename of retainedControls) {
+    interrupted(signal);
+    const current = await stableControlFingerprint(caseRoot, filename, signal);
+    const perRun = await stableControlFingerprint(caseRoot, path.join("runs", `${state.runId}-${filename === "case-sensitive.json" ? "sensitive.json" : filename}`), signal);
+    if (current.bytes !== perRun.bytes || current.sha256 !== perRun.sha256) {
+      throw new Error("retained recovery controls do not match the completed run copies");
+    }
+    fingerprints.push(current);
+  }
+  return {
+    status: status as "complete" | "complete-with-warnings",
+    runId: state.runId,
+    controlDigest: digestControlFingerprints(fingerprints),
+  };
+}
+
+function checkpointForState(state: ScanState): NonNullable<SensitiveScanInventory["resumeCheckpoint"]> {
+  return {
+    runId: state.runId,
+    status: state.status,
+    inventoryComplete: state.inventoryComplete,
+    semantic: { ...state.semantic, inputs: [...state.semantic.inputs] },
+    inputRoots: state.inputRoots.map((root) => ({ ...root })),
+    manifest: { ...state.manifest },
+    cursor: { ...state.cursor },
+    progress: { ...state.progress },
+  };
+}
+
+function fileIsAuthorized(filename: string, roots: ScanState["inputRoots"]): boolean {
+  return roots.some((root) => root.kind === "file"
+    ? filename === root.path
+    : filename !== root.path && inside(root.path, filename));
+}
+
+function buildCoverageIndex(roots: ScanState["inputRoots"]): CoverageIndex {
+  const files = new Set<string>();
+  const directories = new Set<string>();
+  for (const root of roots) (root.kind === "file" ? files : directories).add(root.path);
+  return { files, directories };
+}
+
+function indexedFileIsAuthorized(filename: string, coverage: CoverageIndex): boolean {
+  if (coverage.files.has(filename)) return true;
+  let cursor = path.dirname(filename);
+  while (true) {
+    if (coverage.directories.has(cursor)) return true;
+    const parent = path.dirname(cursor);
+    if (parent === cursor) return false;
+    cursor = parent;
+  }
+}
+
+function assertCompletedInventoryMatchesState(inventory: SensitiveScanInventory, state: ScanState): void {
+  const occurrences = inventory.findings.reduce((sum, finding) => sum + finding.occurrences.length, 0);
+  const artifactFiles = inventory.findings.reduce((sum, finding) => sum + finding.artifactFiles.length, 0);
+  if (
+    state.status !== "complete"
+    || state.resumable
+    || !state.inventoryComplete
+    || state.pauseReason !== undefined
+    || state.cursor.fileIndex !== state.manifest.entries
+    || state.cursor.phase !== "stream"
+    || state.cursor.nextOffset !== 0
+    || state.progress.phase !== "finalizing"
+    || state.progress.filesTotal !== state.manifest.entries
+    || state.progress.filesVisited !== state.manifest.entries
+    || state.progress.filesScanned !== state.manifest.entries
+    || state.progress.scanErrors !== 0
+    || inventory.status !== "complete"
+    || inventory.complete !== true
+    || inventory.outputRoot !== state.semantic.output
+    || !isDeepStrictEqual(inventory.inputRoots, state.semantic.inputs)
+    || inventory.findings.length !== state.progress.uniqueFindings
+    || occurrences !== state.progress.occurrences
+    || inventory.errors.length !== 0
+    || inventory.errorsOmitted !== 0
+    || inventory.failureMessage !== undefined
+    || inventory.resumeCheckpoint === undefined
+    || !isDeepStrictEqual(inventory.resumeCheckpoint, checkpointForState(state))
+    || inventory.findings.some((finding) => finding.occurrences.some((occurrence) => (
+      occurrence.provenance !== state.semantic.provenance
+      || !fileIsAuthorized(occurrence.sourcePath, state.inputRoots)
+    )))
+    || !Number.isSafeInteger(artifactFiles)
+  ) throw new Error("cleanup requires an exact error-free completed mining checkpoint");
+}
+
+async function assertInputRootsCurrent(state: ScanState, signal?: AbortSignal): Promise<void> {
+  const records = await mounts();
+  const networkCache = new Map<string, Promise<boolean>>();
+  for (const expected of state.inputRoots) {
+    interrupted(signal);
+    if (path.resolve(expected.path) !== expected.path) throw new Error("completed mining input root is not canonical");
+    const metadata = await lstat(expected.path);
+    if (metadata.isSymbolicLink() || (expected.kind === "file" ? !metadata.isFile() : !metadata.isDirectory())) {
+      throw new Error("completed mining input root changed kind");
+    }
+    if (await realpath(expected.path) !== expected.path) throw new Error("completed mining input root changed canonical path");
+    const mounted = mountForPathFrom(records, expected.path);
+    if (mounted === undefined) throw new Error("could not determine the mount backing a completed mining input");
+    const identity = mountIdentity(mounted);
+    let network = networkCache.get(identity);
+    if (network === undefined) {
+      network = filesystemIsNetwork(mounted) ? Promise.resolve(true) : mountIsNetworkBacked(mounted);
+      networkCache.set(identity, network);
+    }
+    if (
+      metadata.dev !== expected.device
+      || metadata.ino !== expected.inode
+      || identity !== expected.mount
+      || await network
+    ) throw new Error("completed mining input root identity or mount changed after scanning");
+  }
+}
+
+function sameWalkedFile(left: WalkedFile, right: WalkedFile): boolean {
+  return left.path === right.path
+    && left.bytes === right.bytes
+    && left.device === right.device
+    && left.inode === right.inode
+    && left.modifiedMs === right.modifiedMs
+    && left.changedMs === right.changedMs;
+}
+
+async function verifyLiveManifest(state: ScanState, output: string, ignoredPaths: Set<string>, signal?: AbortSignal): Promise<void> {
+  await assertInputRootsCurrent(state, signal);
+  const expected = readScanManifest(output, state.manifest, signal)[Symbol.asyncIterator]();
+  const networkCache = new Map<string, Promise<boolean>>();
+  const walked = walkRegularFiles(state.semantic.inputs, {
+    ...(signal === undefined ? {} : { signal }),
+    onError: (_source, error) => { throw new Error("a completed mining input can no longer be enumerated exactly", { cause: error }); },
+    shouldEnterDirectory: async (directory) => {
+      const records = await mounts();
+      const mounted = mountForPathFrom(records, directory);
+      if (mounted === undefined) return false;
+      const identity = mountIdentity(mounted);
+      let network = networkCache.get(identity);
+      if (network === undefined) {
+        network = filesystemIsNetwork(mounted) ? Promise.resolve(true) : mountIsNetworkBacked(mounted);
+        networkCache.set(identity, network);
+      }
+      return !(await network);
+    },
+  })[Symbol.asyncIterator]();
+  const nextLive = async (): Promise<IteratorResult<WalkedFile>> => {
+    while (true) {
+      const next = await walked.next();
+      if (next.done === true || !ignoredPaths.has(next.value.path)) return next;
+    }
+  };
+  try {
+    while (true) {
+      interrupted(signal);
+      const expectedEntry = await expected.next();
+      const liveEntry = await nextLive();
+      if (expectedEntry.done === true || liveEntry.done === true) {
+        if (expectedEntry.done !== liveEntry.done) throw new Error("completed mining input file set changed after scanning");
+        break;
+      }
+      if (!sameWalkedFile(expectedEntry.value, liveEntry.value)) {
+        throw new Error("completed mining input file identity, size, time, or order changed after scanning");
+      }
+      const records = await mounts();
+      const mounted = mountForPathFrom(records, liveEntry.value.path);
+      if (mounted === undefined) throw new Error("could not determine the mount backing a completed mining file");
+      const identity = mountIdentity(mounted);
+      let network = networkCache.get(identity);
+      if (network === undefined) {
+        network = filesystemIsNetwork(mounted) ? Promise.resolve(true) : mountIsNetworkBacked(mounted);
+        networkCache.set(identity, network);
+      }
+      if (await network) throw new Error("a completed mining file moved onto a network-backed mount");
+    }
+  } finally {
+    await expected.return?.(undefined);
+    await walked.return?.(undefined);
+  }
+  await assertInputRootsCurrent(state, signal);
+}
+
+async function verifyMiningOutput(
+  root: RootSnapshot,
+  introducedLocks: Set<string>,
+  signal?: AbortSignal,
+): Promise<VerifiedMiningOutput> {
+  interrupted(signal);
+  for (const filename of [
+    "scan-state-sensitive.json",
+    "scan-files-sensitive.ndjson",
+    "inventory-sensitive.json",
+    "manifest-redacted.json",
+    "final-report-sensitive.md",
+    "final-report-redacted.md",
+  ]) await assertRegularControlFile(root.path, filename);
+  const state = await loadScanState(root.path, signal);
+  const inventory = await loadCompletedInventory(root.path, state.inventory, signal);
+  assertCompletedInventoryMatchesState(inventory, state);
+  await verifyResumeArtifacts(root.path, inventory, signal);
+  await verifyLiveManifest(state, root.path, introducedLocks, signal);
+  await assertRootCurrent(root);
+  const controlFingerprints: ControlFingerprint[] = [];
+  for (const filename of [
+    "scan-state-sensitive.json",
+    "inventory-sensitive.json",
+    "manifest-redacted.json",
+    "final-report-sensitive.md",
+    "final-report-redacted.md",
+  ]) controlFingerprints.push(await stableControlFingerprint(root.path, filename, signal));
+  return {
+    root,
+    state,
+    scannedFiles: state.manifest.entries,
+    findings: inventory.findings.length,
+    markerOnlyFindings: inventory.findings.filter((finding) => finding.confidence === "marker-only").length,
+    artifactFiles: inventory.findings.reduce((sum, finding) => sum + finding.artifactFiles.length, 0),
+    controlDigest: digestControlFingerprints(controlFingerprints),
+  };
+}
+
+async function targetSnapshot(
+  caseRoot: RootSnapshot,
+  name: TargetSnapshot["name"],
+  requiresScanCoverage: boolean,
+  coverage: CoverageIndex,
+  signal?: AbortSignal,
+  explicitTarget?: string,
+  coveragePathRoot?: string,
+): Promise<TargetSnapshot | undefined> {
+  interrupted(signal);
+  const target = explicitTarget === undefined ? safeJoin(caseRoot.path, name) : safeJoin(caseRoot.path, path.relative(caseRoot.path, explicitTarget));
+  let before: Awaited<ReturnType<typeof lstat>>;
+  try {
+    before = await lstat(target);
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return undefined;
+    throw error;
+  }
+  if (before.isSymbolicLink() || !before.isDirectory() || await realpath(target) !== target) {
+    throw new Error("cleanup deletion targets must remain real canonical directories");
+  }
+  let filesystemEntries = 0n;
+  let regularFiles = 0n;
+  let logicalBytes = 0n;
+  const contentHash = createHash("sha256");
+  type Work = { phase: "enter"; filename: string } | { phase: "exit"; filename: string; relative: string; before: Stats };
+  const pending: Work[] = [{ phase: "enter", filename: target }];
+  let pendingEntries = 1;
+  let directories = 0;
+  const targetMounts = await mounts();
+  while (pending.length > 0) {
+    interrupted(signal);
+    const work = pending.pop();
+    if (work === undefined) break;
+    if (work.phase === "exit") {
+      const afterDirectory = await lstat(work.filename);
+      assertBoundedEntryMetadata(afterDirectory);
+      if (!sameEntryMetadata(work.before, afterDirectory)) {
+        throw new Error("cleanup deletion target changed while it was being measured");
+      }
+      if (work.filename !== target) {
+        contentHash.update(`${JSON.stringify({
+          path: work.relative,
+          kind: "directory",
+          device: afterDirectory.dev,
+          inode: afterDirectory.ino,
+          mode: afterDirectory.mode,
+          links: afterDirectory.nlink,
+          owner: afterDirectory.uid,
+          group: afterDirectory.gid,
+          bytes: afterDirectory.size,
+          modifiedMs: afterDirectory.mtimeMs,
+          changedMs: afterDirectory.ctimeMs,
+        })}\n`);
+      }
+      continue;
+    }
+
+    pendingEntries -= 1;
+    const metadata = await lstat(work.filename);
+    assertBoundedEntryMetadata(metadata);
+    const relative = path.relative(target, work.filename);
+    const kind = entryKind(metadata);
+    if (work.filename !== target) filesystemEntries += 1n;
+
+    if (kind === "directory") {
+      directories += 1;
+      if (directories > MAX_WALK_DIRECTORIES) {
+        throw new Error(`cleanup target exceeds the ${MAX_WALK_DIRECTORIES}-directory verification limit`);
+      }
+      const mounted = mountForPathFrom(targetMounts, work.filename);
+      if (mounted === undefined || mountIdentity(mounted) !== caseRoot.mount) {
+        throw new Error("cleanup target crosses a mount boundary");
+      }
+      const directory = await opendir(work.filename);
+      const children: string[] = [];
+      try {
+        for await (const entry of directory) {
+          interrupted(signal);
+          if (children.length >= MAX_WALK_DIRECTORY_ENTRIES) {
+            throw new Error(`cleanup target directory exceeds the ${MAX_WALK_DIRECTORY_ENTRIES}-entry verification limit`);
+          }
+          children.push(path.join(work.filename, entry.name));
+        }
+      } finally {
+        await directory.close().catch((error: unknown) => {
+          if (errorCode(error) !== "ERR_DIR_CLOSED") throw error;
+        });
+      }
+      if (pendingEntries + children.length > MAX_WALK_PENDING_ENTRIES) {
+        throw new Error(`cleanup target exceeds the ${MAX_WALK_PENDING_ENTRIES}-entry verification frontier limit`);
+      }
+      pendingEntries += children.length;
+      children.sort((left, right) => bytewiseLexical(right, left));
+      pending.push({ phase: "exit", filename: work.filename, relative, before: metadata });
+      for (const child of children) pending.push({ phase: "enter", filename: child });
+      continue;
+    }
+
+    let linkTarget: string | undefined;
+    if (kind === "symlink") linkTarget = await readlink(work.filename);
+    const current = await lstat(work.filename);
+    assertBoundedEntryMetadata(current);
+    if (!sameEntryMetadata(metadata, current)) {
+      throw new Error("cleanup deletion target changed while it was being measured");
+    }
+    if (kind === "file") {
+      regularFiles += 1n;
+      logicalBytes += BigInt(metadata.size);
+      const coveragePath = coveragePathRoot === undefined
+        ? work.filename
+        : path.join(coveragePathRoot, relative);
+      if (requiresScanCoverage && !indexedFileIsAuthorized(coveragePath, coverage)) {
+        throw new Error("at least one recovered-data file is not covered by an error-free completed mining scan");
+      }
+    }
+    contentHash.update(`${JSON.stringify({
+      path: relative,
+      kind,
+      device: metadata.dev,
+      inode: metadata.ino,
+      mode: metadata.mode,
+      links: metadata.nlink,
+      owner: metadata.uid,
+      group: metadata.gid,
+      deviceType: metadata.rdev,
+      bytes: metadata.size,
+      modifiedMs: metadata.mtimeMs,
+      changedMs: metadata.ctimeMs,
+      ...(linkTarget === undefined ? {} : { linkTarget }),
+    })}\n`);
+  }
+  const after = await lstat(target);
+  if (
+    after.isSymbolicLink()
+    || !after.isDirectory()
+    || before.dev !== after.dev
+    || before.ino !== after.ino
+    || before.mtimeMs !== after.mtimeMs
+    || before.ctimeMs !== after.ctimeMs
+    || await realpath(target) !== target
+  ) throw new Error("cleanup deletion target changed while it was being measured");
+  return {
+    name,
+    path: target,
+    device: after.dev,
+    inode: after.ino,
+    modifiedMs: after.mtimeMs,
+    changedMs: after.ctimeMs,
+    filesystemEntries,
+    regularFiles,
+    logicalBytes,
+    contentDigest: contentHash.digest("hex"),
+    requiresScanCoverage,
+  };
+}
+
+function targetIdentity(target: TargetSnapshot): Record<string, unknown> {
+  return {
+    name: target.name,
+    path: target.path,
+    device: target.device,
+    inode: target.inode,
+    modifiedMs: target.modifiedMs,
+    changedMs: target.changedMs,
+    filesystemEntries: target.filesystemEntries.toString(),
+    regularFiles: target.regularFiles.toString(),
+    logicalBytes: target.logicalBytes.toString(),
+    contentDigest: target.contentDigest,
+    requiresScanCoverage: target.requiresScanCoverage,
+  };
+}
+
+function approvalToken(
+  caseRoot: RootSnapshot,
+  recovery: VerifiedRecoveryCase,
+  mining: VerifiedMiningOutput[],
+  targets: TargetSnapshot[],
+  includeEvidence: boolean,
+): string {
+  const material = {
+    version: 1,
+    case: { ...caseRoot, recovery },
+    includeEvidence,
+    mining: mining.map((item) => ({
+      root: item.root,
+      runId: item.state.runId,
+      manifest: item.state.manifest,
+      inventory: item.state.inventory,
+      progress: item.state.progress,
+      controlDigest: item.controlDigest,
+    })),
+    targets: targets.map(targetIdentity),
+  };
+  return createHash("sha256").update(JSON.stringify(material)).digest("hex");
+}
+
+function normalizeOptions(options: CleanupOptions): { caseDirectory: string; miningOutputs: string[]; includeEvidence: boolean; signal?: AbortSignal } {
+  if (options.miningOutputs.length < 1 || options.miningOutputs.length > 128) {
+    throw new Error("cleanup requires from 1 through 128 completed mining output directories");
+  }
+  const caseDirectory = path.resolve(options.caseDirectory);
+  const miningOutputs = [...new Set(options.miningOutputs.map((value) => path.resolve(value)))].sort(bytewiseLexical);
+  if (miningOutputs.length !== options.miningOutputs.length) throw new Error("cleanup mining output directories must be unique");
+  if (miningOutputs.some((output) => output === caseDirectory)) throw new Error("a mining output cannot also be the recovery case root");
+  for (let index = 0; index < miningOutputs.length; index += 1) {
+    for (let other = index + 1; other < miningOutputs.length; other += 1) {
+      const left = miningOutputs[index];
+      const right = miningOutputs[other];
+      if (left !== undefined && right !== undefined && (inside(left, right) || inside(right, left))) {
+        throw new Error("cleanup mining output directories must not contain one another");
+      }
+    }
+  }
+  return {
+    caseDirectory,
+    miningOutputs,
+    includeEvidence: options.includeEvidence === true,
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  };
+}
+
+async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveLock[]): Promise<InternalCleanupPlan> {
+  const normalized = normalizeOptions(options);
+  interrupted(normalized.signal);
+  const records = await mounts();
+  const networkCache = new Map<string, Promise<boolean>>();
+  const caseRoot = await rootSnapshot(normalized.caseDirectory, records, networkCache, "recovery case root");
+  await assertNoCleanupQuarantine(caseRoot.path);
+  const miningRoots: RootSnapshot[] = [];
+  for (const output of normalized.miningOutputs) {
+    miningRoots.push(await rootSnapshot(output, records, networkCache, "mining output"));
+  }
+  for (const root of miningRoots) {
+    for (const name of ["recovery", "evidence", "logs", "runs"] as const) {
+      const target = safeJoin(caseRoot.path, name);
+      if (inside(target, root.path) || inside(root.path, target)) {
+        throw new Error("a retained mining output overlaps an AARK-managed cleanup deletion target");
+      }
+    }
+  }
+  if (heldLocks === undefined) {
+    await assertNoOperationLocks(caseRoot.path, RECOVERY_LOCK_FILENAMES);
+    for (const root of miningRoots) await assertNoOperationLocks(root.path, MINING_LOCK_FILENAMES);
+  } else {
+    for (const lock of heldLocks) await lock.assertHeld();
+  }
+  const introducedLocks = new Set<string>([
+    ...RECOVERY_LOCK_FILENAMES.map((filename) => safeJoin(caseRoot.path, filename)),
+    ...miningRoots.flatMap((root) => MINING_LOCK_FILENAMES.map((filename) => safeJoin(root.path, filename))),
+  ]);
+  if (heldLocks === undefined) introducedLocks.clear();
+
+  const recoveryCase = await verifyRecoveryCase(caseRoot.path, normalized.signal);
+  const mining: VerifiedMiningOutput[] = [];
+  for (const root of miningRoots) mining.push(await verifyMiningOutput(root, introducedLocks, normalized.signal));
+  const coverage = buildCoverageIndex(mining.flatMap((item) => item.state.inputRoots));
+
+  const targets: TargetSnapshot[] = [];
+  const recovery = await targetSnapshot(caseRoot, "recovery", true, coverage, normalized.signal);
+  if (recovery !== undefined) targets.push(recovery);
+  const evidencePresent = await pathExists(safeJoin(caseRoot.path, "evidence"));
+  if (normalized.includeEvidence) {
+    const evidence = await targetSnapshot(caseRoot, "evidence", true, coverage, normalized.signal);
+    if (evidence !== undefined) targets.push(evidence);
+  }
+  for (const name of ["logs", "runs"] as const) {
+    const target = await targetSnapshot(caseRoot, name, false, coverage, normalized.signal);
+    if (target !== undefined) targets.push(target);
+  }
+  if (recovery === undefined && !targets.some((target) => target.name === "evidence")) {
+    throw new Error("the completed case has no selected recovered-data copy to clean up");
+  }
+  await assertRootCurrent(caseRoot);
+  for (const root of miningRoots) await assertRootCurrent(root);
+  if (heldLocks !== undefined) {
+    for (const lock of heldLocks) await lock.assertHeld();
+  } else {
+    await assertNoOperationLocks(caseRoot.path, RECOVERY_LOCK_FILENAMES);
+    for (const root of miningRoots) await assertNoOperationLocks(root.path, MINING_LOCK_FILENAMES);
+  }
+
+  const scannedFiles = mining.reduce((sum, item) => sum + BigInt(item.scannedFiles), 0n);
+  const findings = mining.reduce((sum, item) => sum + BigInt(item.findings), 0n);
+  const markerOnlyFindings = mining.reduce((sum, item) => sum + BigInt(item.markerOnlyFindings), 0n);
+  const artifacts = mining.reduce((sum, item) => sum + BigInt(item.artifactFiles), 0n);
+  const deletedEntries = targets.reduce((sum, target) => sum + target.filesystemEntries, 0n);
+  const deletedFiles = targets.reduce((sum, target) => sum + target.regularFiles, 0n);
+  const deletedBytes = targets.reduce((sum, target) => sum + target.logicalBytes, 0n);
+  const recoveredBytes = targets.find((target) => target.name === "recovery")?.logicalBytes ?? 0n;
+  const evidenceBytes = targets.find((target) => target.name === "evidence")?.logicalBytes ?? 0n;
+  const intermediateBytes = targets
+    .filter((target) => target.name === "logs" || target.name === "runs")
+    .reduce((sum, target) => sum + target.logicalBytes, 0n);
+  const token = approvalToken(caseRoot, recoveryCase, mining, targets, normalized.includeEvidence);
+  const publicPlan: CleanupPlanResult = {
+    version: 1,
+    tool: "aark",
+    layer: "cleanup",
+    status: "ready",
+    destructive: true,
+    valuesPrinted: false,
+    pathsRedacted: true,
+    recoveryStatus: recoveryCase.status,
+    miningScansVerified: mining.length,
+    scannedFilesVerified: scannedFiles.toString(),
+    findingsRetained: findings.toString(),
+    markerOnlyFindingsWithoutArtifacts: markerOnlyFindings.toString(),
+    artifactFilesRetained: artifacts.toString(),
+    deletion: {
+      directories: targets.length,
+      filesystemEntries: deletedEntries.toString(),
+      regularFiles: deletedFiles.toString(),
+      logicalBytes: deletedBytes.toString(),
+      recoveredCopyLogicalBytes: recoveredBytes.toString(),
+      evidenceCopyLogicalBytes: evidenceBytes.toString(),
+      intermediateLogicalBytes: intermediateBytes.toString(),
+      recoveredCopyIncluded: recovery !== undefined,
+      evidenceCopyIncluded: targets.some((target) => target.name === "evidence"),
+      evidenceCopyPresent: evidencePresent,
+      intermediateLogsAndRunsIncluded: targets.some((target) => target.name === "logs" || target.name === "runs"),
+    },
+    retained: {
+      recoveryFinalReports: true,
+      cleanupFinalReports: true,
+      miningFinalReports: true,
+      exactFindingArtifacts: true,
+      minimalIntegrityMetadata: true,
+      evidenceCopy: evidencePresent && !targets.some((target) => target.name === "evidence"),
+    },
+    approvalToken: token,
+    approvalRequired: true,
+    requirements: [
+      "Show this aggregate, path-redacted plan to the end user and obtain explicit approval before cleanup run.",
+      "Pass the exact approval token plus --execute and --confirm-delete-recovered-copy.",
+      ...(markerOnlyFindings > 0n ? ["Review every marker-only finding before cleanup; marker-only locations have no exact exported artifact and their recovered source context will be removed."] : []),
+      ...(normalized.includeEvidence ? ["Deleting the evidence copy additionally requires --confirm-delete-evidence."] : []),
+    ],
+  };
+  return { public: publicPlan, caseRoot, recovery: recoveryCase, mining, coverage, targets, introducedLocks };
+}
+
+export async function planCleanup(options: CleanupOptions): Promise<CleanupPlanResult> {
+  return (await buildInternalPlan(options)).public;
+}
+
+function reportText(
+  plan: InternalCleanupPlan,
+  status: "authorized-in-progress" | "complete" | "failed-partial" | "interrupted-partial",
+  completedTargets: string[],
+  failure?: unknown,
+): { sensitive: string; redacted: string; manifest: Record<string, unknown> } {
+  const generatedAt = new Date().toISOString();
+  const failureMessage = boundedFailure(failure);
+  const common = [
+    `- Status: ${status}`,
+    `- Generated: ${generatedAt}`,
+    `- Approved plan token: ${plan.public.approvalToken}`,
+    `- Completed deletions: ${completedTargets.length} of ${plan.targets.length} selected directories`,
+    `- Planned filesystem entries: ${plan.public.deletion.filesystemEntries}`,
+    `- Planned regular files: ${plan.public.deletion.regularFiles}`,
+    `- Planned logical bytes: ${plan.public.deletion.logicalBytes}`,
+    `- Mining scans verified: ${plan.public.miningScansVerified}`,
+    `- Exact finding artifacts retained: ${plan.public.artifactFilesRetained}`,
+    `- Marker-only findings without artifacts: ${plan.public.markerOnlyFindingsWithoutArtifacts}`,
+  ];
+  const sensitive = [
+    "# AARK cleanup final report",
+    "",
+    "> Sensitive local report: it records local case, mining-output, and deletion paths. Do not publish it.",
+    "",
+    ...common,
+    `- Recovery case: \`${JSON.stringify(plan.caseRoot.path).replace(/`/g, "\\u0060")}\``,
+    `- Retained mining outputs: ${plan.mining.map((item) => `\`${JSON.stringify(item.root.path).replace(/`/g, "\\u0060")}\``).join(", ")}`,
+    `- Selected directories: ${plan.targets.map((target) => `\`${JSON.stringify(target.path).replace(/`/g, "\\u0060")}\``).join(", ")}`,
+    `- Completely removed directories: ${completedTargets.length === 0 ? "none" : completedTargets.map((target) => `\`${JSON.stringify(target).replace(/`/g, "\\u0060")}\``).join(", ")}`,
+    ...(failureMessage === undefined ? [] : [`- Failure detail: \`${JSON.stringify(failureMessage).replace(/`/g, "\\u0060")}\``]),
+    "",
+    "The retained mining outputs contain final reports, exact finding artifacts, and the bounded integrity metadata required to map and verify those artifacts. Root recovery reports and redacted manifests remain in the case. Removed recovery reports describe historical paths that no longer exist after successful cleanup.",
+    "",
+  ].join("\n");
+  const redacted = [
+    "# AARK cleanup final report (redacted)",
+    "",
+    "> This report omits all local paths, finding values, categories, fingerprints, and failure details.",
+    "",
+    ...common,
+    "",
+    "Exact finding artifacts, final reports, and their minimal integrity metadata were retained locally. No recovered value was printed or uploaded.",
+    "",
+  ].join("\n");
+  return {
+    sensitive,
+    redacted,
+    manifest: {
+      version: 1,
+      tool: "aark",
+      layer: "cleanup",
+      status,
+      generatedAt,
+      pathsRedacted: true,
+      valuesRedacted: true,
+      approvedPlanToken: plan.public.approvalToken,
+      selectedDirectories: plan.targets.length,
+      completedDeletions: completedTargets.length,
+      plannedFilesystemEntries: plan.public.deletion.filesystemEntries,
+      plannedRegularFiles: plan.public.deletion.regularFiles,
+      plannedLogicalBytes: plan.public.deletion.logicalBytes,
+      miningScansVerified: plan.public.miningScansVerified,
+      artifactFilesRetained: plan.public.artifactFilesRetained,
+      markerOnlyFindingsWithoutArtifacts: plan.public.markerOnlyFindingsWithoutArtifacts,
+      reports: { sensitive: CLEANUP_SENSITIVE_REPORT, redacted: CLEANUP_REDACTED_REPORT },
+    },
+  };
+}
+
+async function writeCleanupReports(
+  plan: InternalCleanupPlan,
+  locks: ExclusiveLock[],
+  status: "authorized-in-progress" | "complete" | "failed-partial" | "interrupted-partial",
+  completedTargets: string[],
+  failure?: unknown,
+): Promise<void> {
+  for (const lock of locks) await lock.assertHeld();
+  await assertRootCurrent(plan.caseRoot);
+  const reports = reportText(plan, status, completedTargets, failure);
+  await atomicWriteFile(safeJoin(plan.caseRoot.path, CLEANUP_SENSITIVE_REPORT), reports.sensitive, 0o600);
+  await atomicWriteFile(safeJoin(plan.caseRoot.path, CLEANUP_REDACTED_REPORT), reports.redacted, 0o644);
+  await atomicWriteJson(safeJoin(plan.caseRoot.path, CLEANUP_REDACTED_MANIFEST), reports.manifest, 0o644);
+  for (const lock of locks) await lock.assertHeld();
+  await assertRootCurrent(plan.caseRoot);
+}
+
+async function assertTargetCurrent(
+  plan: InternalCleanupPlan,
+  target: TargetSnapshot,
+  locks: ExclusiveLock[],
+  signal?: AbortSignal,
+): Promise<void> {
+  interrupted(signal);
+  for (const lock of locks) await lock.assertHeld();
+  await assertRootCurrent(plan.caseRoot);
+  const metadata = await lstat(target.path);
+  if (
+    metadata.isSymbolicLink()
+    || !metadata.isDirectory()
+    || metadata.dev !== target.device
+    || metadata.ino !== target.inode
+    || metadata.mtimeMs !== target.modifiedMs
+    || metadata.ctimeMs !== target.changedMs
+    || await realpath(target.path) !== target.path
+  ) throw new Error("a cleanup deletion target changed after approval");
+  for (const lock of locks) await lock.assertHeld();
+  await assertRootCurrent(plan.caseRoot);
+}
+
+async function assertTargetRemoved(target: TargetSnapshot): Promise<void> {
+  try {
+    await lstat(target.path);
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return;
+    throw error;
+  }
+  throw new Error("a cleanup deletion target was recreated before deletion could be recorded as complete");
+}
+
+async function removeApprovedTarget(
+  plan: InternalCleanupPlan,
+  target: TargetSnapshot,
+  locks: ExclusiveLock[],
+  signal?: AbortSignal,
+): Promise<void> {
+  await assertTargetCurrent(plan, target, locks, signal);
+  const quarantine = safeJoin(plan.caseRoot.path, `${CLEANUP_QUARANTINE_PREFIX}${target.name}-${randomUUID()}`);
+  await assertNoSymlinkComponents(plan.caseRoot.path, quarantine);
+  if (await pathExists(quarantine)) throw new Error("cleanup quarantine path unexpectedly already exists");
+  for (const lock of locks) await lock.assertHeld();
+  await rename(target.path, quarantine);
+  await syncDirectory(plan.caseRoot.path);
+  const moved = await lstat(quarantine);
+  if (
+    moved.isSymbolicLink()
+    || !moved.isDirectory()
+    || moved.dev !== target.device
+    || moved.ino !== target.inode
+    || await realpath(quarantine) !== quarantine
+  ) {
+    throw new Error("cleanup target changed during protected quarantine; the quarantined tree was not deleted");
+  }
+  if (await pathExists(target.path)) {
+    throw new Error("cleanup target was recreated during protected quarantine; the quarantined tree was not deleted");
+  }
+  const quarantined = await targetSnapshot(
+    plan.caseRoot,
+    target.name,
+    target.requiresScanCoverage,
+    plan.coverage,
+    signal,
+    quarantine,
+    target.path,
+  );
+  if (
+    quarantined === undefined
+    || quarantined.device !== target.device
+    || quarantined.inode !== target.inode
+    || quarantined.filesystemEntries !== target.filesystemEntries
+    || quarantined.regularFiles !== target.regularFiles
+    || quarantined.logicalBytes !== target.logicalBytes
+    || quarantined.contentDigest !== target.contentDigest
+    || quarantined.requiresScanCoverage !== target.requiresScanCoverage
+  ) {
+    throw new Error("cleanup target contents changed after approval; the quarantined tree was not deleted");
+  }
+  for (const lock of locks) await lock.assertHeld();
+  await assertRootCurrent(plan.caseRoot);
+  await rm(quarantine, { recursive: true, force: false, maxRetries: 0 });
+  await syncDirectory(plan.caseRoot.path);
+  if (await pathExists(quarantine)) throw new Error("cleanup quarantine still exists after recursive deletion");
+  await assertTargetRemoved(target);
+}
+
+async function acquireCleanupLocks(caseDirectory: string, miningOutputs: string[]): Promise<ExclusiveLock[]> {
+  const requests = [
+    ...RECOVERY_LOCK_FILENAMES.map((filename) => ({ root: caseDirectory, filename })),
+    ...miningOutputs.flatMap((root) => MINING_LOCK_FILENAMES.map((filename) => ({ root, filename }))),
+  ].sort((left, right) => bytewiseLexical(left.root, right.root) || bytewiseLexical(left.filename, right.filename));
+  const locks: ExclusiveLock[] = [];
+  try {
+    for (const request of requests) locks.push(await acquireExclusiveLock(request.root, request.filename));
+    return locks;
+  } catch (error) {
+    const releaseErrors: unknown[] = [];
+    for (const lock of [...locks].reverse()) {
+      try { await lock.release(); } catch (releaseError) { releaseErrors.push(releaseError); }
+    }
+    if (releaseErrors.length > 0) throw new AggregateError([error, ...releaseErrors], "cleanup lock acquisition failed and acquired locks could not all be released");
+    throw error;
+  }
+}
+
+async function releaseCleanupLocks(locks: ExclusiveLock[]): Promise<void> {
+  const errors: unknown[] = [];
+  for (const lock of [...locks].reverse()) {
+    try { await lock.release(); } catch (error) { errors.push(error); }
+  }
+  if (errors.length > 0) throw new AggregateError(errors, "cleanup operation locks could not all be released");
+}
+
+export async function runCleanup(options: CleanupRunOptions): Promise<Record<string, unknown>> {
+  if (!options.execute || !options.confirmDeleteRecoveredCopy) {
+    throw new Error("cleanup deletion requires both --execute and --confirm-delete-recovered-copy");
+  }
+  if (options.includeEvidence === true && options.confirmDeleteEvidence !== true) {
+    throw new Error("evidence-copy deletion additionally requires --confirm-delete-evidence");
+  }
+  if (!TOKEN.test(options.approvalToken)) throw new Error("cleanup requires the exact 64-character approval token from cleanup plan");
+  const normalized = normalizeOptions(options);
+  for (const root of [normalized.caseDirectory, ...normalized.miningOutputs]) {
+    await existingRealDirectory(root, "cleanup root");
+  }
+  await assertNoOperationLocks(normalized.caseDirectory, RECOVERY_LOCK_FILENAMES);
+  for (const root of normalized.miningOutputs) await assertNoOperationLocks(root, MINING_LOCK_FILENAMES);
+  const locks = await acquireCleanupLocks(normalized.caseDirectory, normalized.miningOutputs);
+  let operationError: unknown;
+  try {
+    const plan = await buildInternalPlan(normalized, locks);
+    if (plan.public.approvalToken !== options.approvalToken) {
+      throw new Error("cleanup inputs changed after planning; run cleanup plan again and obtain fresh approval");
+    }
+    const completedTargets: string[] = [];
+    try {
+      await writeCleanupReports(plan, locks, "authorized-in-progress", completedTargets);
+      for (const target of plan.targets) {
+        interrupted(normalized.signal);
+        await removeApprovedTarget(plan, target, locks, normalized.signal);
+        completedTargets.push(target.path);
+      }
+      await writeCleanupReports(plan, locks, "complete", completedTargets);
+    } catch (error) {
+      const status = normalized.signal?.aborted === true ? "interrupted-partial" : "failed-partial";
+      try {
+        await writeCleanupReports(plan, locks, status, completedTargets, error);
+      } catch (reportError) {
+        throw new AggregateError([error, reportError], "cleanup failed and its partial-deletion report could not be written");
+      }
+      throw error;
+    }
+    return {
+      version: 1,
+      tool: "aark",
+      layer: "cleanup",
+      status: "complete",
+      deletedDirectories: completedTargets.length,
+      deletedFilesystemEntries: plan.public.deletion.filesystemEntries,
+      deletedRegularFiles: plan.public.deletion.regularFiles,
+      deletedLogicalBytes: plan.public.deletion.logicalBytes,
+      miningScansVerified: plan.public.miningScansVerified,
+      artifactFilesRetained: plan.public.artifactFilesRetained,
+      evidenceCopyDeleted: plan.public.deletion.evidenceCopyIncluded,
+      valuesPrinted: false,
+      reports: { sensitive: CLEANUP_SENSITIVE_REPORT, redacted: CLEANUP_REDACTED_REPORT },
+    };
+  } catch (error) {
+    operationError = error;
+    throw error;
+  } finally {
+    try {
+      await releaseCleanupLocks(locks);
+    } catch (releaseError) {
+      if (operationError !== undefined) throw new AggregateError([operationError, releaseError], "cleanup failed and its operation locks could not all be released");
+      throw releaseError;
+    }
+  }
+}

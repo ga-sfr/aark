@@ -14,12 +14,24 @@ export interface WalkedFile {
 export interface WalkOptions {
   onError?: (input: string, error: unknown) => void;
   shouldEnterDirectory?: (input: string) => boolean | Promise<boolean>;
+  signal?: AbortSignal;
+  maximumDirectoryEntries?: number;
+  maximumPendingEntries?: number;
+  maximumDirectories?: number;
 }
+
+export const MAX_WALK_DIRECTORY_ENTRIES = 100_000;
+export const MAX_WALK_PENDING_ENTRIES = 100_000;
+export const MAX_WALK_DIRECTORIES = 100_000;
 
 export interface ExclusiveLock {
   path: string;
   assertHeld: () => Promise<void>;
   release: () => Promise<void>;
+}
+
+function bytewiseLexical(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function unsupportedModeOperation(error: unknown): boolean {
@@ -50,7 +62,13 @@ export async function syncDirectory(directory: string): Promise<void> {
     await handle.sync();
   } catch (error) {
     const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
-    if (code !== "EINVAL" && code !== "EOPNOTSUPP" && code !== "ENOTSUP" && code !== "ENOSYS") throw error;
+    if (
+      code !== "EINVAL"
+      && code !== "EOPNOTSUPP"
+      && code !== "ENOTSUP"
+      && code !== "ENOSYS"
+      && !(process.platform === "win32" && code === "EPERM")
+    ) throw error;
     // Directory fsync is not implemented by every destination filesystem.
   } finally {
     await handle?.close().catch(() => undefined);
@@ -73,13 +91,37 @@ export async function acquireExclusiveLock(directory: string, filename: string):
     if (code === "EEXIST") throw new Error("an exclusive operation lock already exists; another process may be active or a prior process may have stopped abruptly", { cause: error });
     throw error;
   }
+  let openedLock: Awaited<ReturnType<typeof handle.stat>>;
+  try {
+    openedLock = await handle.stat();
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
+  }
+  if (!openedLock.isFile() || openedLock.nlink !== 1) {
+    await handle.close().catch(() => undefined);
+    try {
+      const current = await lstat(lockPath);
+      if (current.dev === openedLock.dev && current.ino === openedLock.ino) {
+        await unlink(lockPath);
+        await syncDirectory(root).catch(() => undefined);
+      }
+    } catch {
+      // Missing or substituted lock paths are not safe cleanup targets.
+    }
+    throw new Error("exclusive lock must be a single-link regular file");
+  }
   try {
     await handle.writeFile(`${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })}\n`);
     await handle.sync();
     await syncDirectory(root);
   } catch (error) {
     await handle.close().catch(() => undefined);
-    const removed = await unlink(lockPath).then(() => true, () => false);
+    const removed = await lstat(lockPath).then(async (current) => {
+      if (current.dev !== openedLock.dev || current.ino !== openedLock.ino) return false;
+      await unlink(lockPath);
+      return true;
+    }, () => false).catch(() => false);
     if (removed) await syncDirectory(root).catch(() => undefined);
     throw error;
   }
@@ -129,28 +171,95 @@ export async function acquireExclusiveLock(directory: string, filename: string):
 }
 
 export async function atomicWriteFile(destination: string, data: Uint8Array | string, mode = 0o600): Promise<void> {
-  await ensurePrivateDirectory(path.dirname(destination));
-  const temporary = `${destination}.tmp-${process.pid}-${randomUUID()}`;
-  let published = false;
+  const parent = path.dirname(destination);
+  await ensurePrivateDirectory(parent);
+  await assertNoSymlinkComponents(parent, destination);
+  let priorDestination: { device: number; inode: number; bytes: number; modifiedMs: number; changedMs: number } | undefined;
   try {
-    const handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, mode);
-    try {
-      await handle.writeFile(data);
-      await handle.sync();
-    } finally {
-      await handle.close();
+    const existing = await lstat(destination);
+    if (existing.isSymbolicLink() || !existing.isFile() || existing.nlink !== 1) {
+      throw new Error("atomic output destination must remain a single-link regular file");
     }
+    priorDestination = {
+      device: existing.dev,
+      inode: existing.ino,
+      bytes: existing.size,
+      modifiedMs: existing.mtimeMs,
+      changedMs: existing.ctimeMs,
+    };
+  } catch (error) {
+    const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+    if (code !== "ENOENT") throw error;
+  }
+  const assertDestinationUnchanged = async (): Promise<void> => {
     try {
-      await chmod(temporary, mode);
+      const current = await lstat(destination);
+      if (
+        priorDestination === undefined
+        || current.isSymbolicLink()
+        || !current.isFile()
+        || current.nlink !== 1
+        || current.dev !== priorDestination.device
+        || current.ino !== priorDestination.inode
+        || current.size !== priorDestination.bytes
+        || current.mtimeMs !== priorDestination.modifiedMs
+        || current.ctimeMs !== priorDestination.changedMs
+      ) throw new Error("atomic output destination changed before publication");
+    } catch (error) {
+      const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+      if (code === "ENOENT" && priorDestination === undefined) return;
+      throw error;
+    }
+  };
+  const temporary = `${destination}.tmp-${process.pid}-${randomUUID()}`;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  let identity: { device: number; inode: number } | undefined;
+  let renamed = false;
+  try {
+    handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, mode);
+    const opened = await handle.stat();
+    identity = { device: opened.dev, inode: opened.ino };
+    if (!opened.isFile() || opened.nlink !== 1) throw new Error("atomic temporary output must be a single-link regular file");
+    await handle.writeFile(data);
+    try {
+      await handle.chmod(mode);
     } catch (error) {
       if (!unsupportedModeOperation(error)) throw error;
       // Non-Unix destination filesystems may not implement chmod; the manifest warns about mode enforcement.
     }
+    await handle.sync();
+    const currentTemporary = await lstat(temporary);
+    if (
+      currentTemporary.isSymbolicLink()
+      || !currentTemporary.isFile()
+      || currentTemporary.nlink !== 1
+      || currentTemporary.dev !== identity.device
+      || currentTemporary.ino !== identity.inode
+    ) throw new Error("atomic temporary output path changed before publication");
+    await assertDestinationUnchanged();
     await rename(temporary, destination);
-    published = true;
-    await syncDirectory(path.dirname(destination));
+    renamed = true;
+    const currentDestination = await lstat(destination);
+    if (
+      currentDestination.isSymbolicLink()
+      || !currentDestination.isFile()
+      || currentDestination.nlink !== 1
+      || currentDestination.dev !== identity.device
+      || currentDestination.ino !== identity.inode
+    ) throw new Error("atomic output path changed during publication");
+    await handle.close();
+    handle = undefined;
+    await syncDirectory(parent);
   } finally {
-    if (!published) await unlink(temporary).catch(() => undefined);
+    await handle?.close().catch(() => undefined);
+    if (!renamed && identity !== undefined) {
+      try {
+        const current = await lstat(temporary);
+        if (current.dev === identity.device && current.ino === identity.inode) await unlink(temporary);
+      } catch {
+        // Missing or substituted temporary paths are not safe cleanup targets.
+      }
+    }
   }
 }
 
@@ -161,8 +270,8 @@ export async function atomicWriteJson(destination: string, value: unknown, mode 
 export function safeJoin(root: string, ...parts: string[]): string {
   const resolvedRoot = path.resolve(root);
   const result = path.resolve(resolvedRoot, ...parts);
-  const descendantPrefix = resolvedRoot.endsWith(path.sep) ? resolvedRoot : `${resolvedRoot}${path.sep}`;
-  if (result !== resolvedRoot && !result.startsWith(descendantPrefix)) {
+  const relative = path.relative(resolvedRoot, result);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     throw new Error("refusing path traversal outside output root");
   }
   return result;
@@ -209,7 +318,7 @@ export async function readJson<T>(filename: string, maximumBytes = 16 * 1024 * 1
   const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const before = await handle.stat();
-    if (!before.isFile()) throw new Error("JSON input must be a regular, non-symbolic-link file");
+    if (!before.isFile() || before.nlink !== 1) throw new Error("JSON input must be a single-link regular, non-symbolic-link file");
     if (!Number.isSafeInteger(before.size) || before.size < 0 || before.size > maximumBytes) {
       throw new Error("JSON input exceeds its bounded size limit");
     }
@@ -223,14 +332,24 @@ export async function readJson<T>(filename: string, maximumBytes = 16 * 1024 * 1
     const probe = Buffer.allocUnsafe(1);
     const extra = await handle.read(probe, 0, 1, consumed);
     const after = await handle.stat();
+    const current = await lstat(filename);
     if (
       consumed !== before.size
       || extra.bytesRead !== 0
       || before.dev !== after.dev
       || before.ino !== after.ino
+      || after.nlink !== 1
       || before.size !== after.size
       || before.mtimeMs !== after.mtimeMs
       || before.ctimeMs !== after.ctimeMs
+      || current.isSymbolicLink()
+      || !current.isFile()
+      || current.nlink !== 1
+      || current.dev !== after.dev
+      || current.ino !== after.ino
+      || current.size !== after.size
+      || current.mtimeMs !== after.mtimeMs
+      || current.ctimeMs !== after.ctimeMs
     ) throw new Error("JSON input changed while it was being read");
     try {
       return JSON.parse(data.toString("utf8")) as T;
@@ -242,23 +361,69 @@ export async function readJson<T>(filename: string, maximumBytes = 16 * 1024 * 1
   }
 }
 
+export async function readDirectoryNamesBounded(directory: string, maximumEntries: number): Promise<string[]> {
+  if (!Number.isSafeInteger(maximumEntries) || maximumEntries < 0) {
+    throw new Error("directory entry limit must be a non-negative safe integer");
+  }
+  const names: string[] = [];
+  const handle = await opendir(directory);
+  for await (const entry of handle) {
+    if (names.length >= maximumEntries) throw new Error("directory contains more entries than its bounded control layout permits");
+    names.push(entry.name);
+  }
+  return names;
+}
+
 export async function* walkRegularFiles(roots: string[], options: WalkOptions = {}): AsyncGenerator<WalkedFile> {
+  const aborted = (): boolean => options.signal?.aborted === true;
+  const maximumDirectoryEntries = options.maximumDirectoryEntries ?? MAX_WALK_DIRECTORY_ENTRIES;
+  const maximumPendingEntries = options.maximumPendingEntries ?? MAX_WALK_PENDING_ENTRIES;
+  const maximumDirectories = options.maximumDirectories ?? MAX_WALK_DIRECTORIES;
+  if (!Number.isSafeInteger(maximumDirectoryEntries) || maximumDirectoryEntries < 1 || maximumDirectoryEntries > MAX_WALK_DIRECTORY_ENTRIES) {
+    throw new Error(`maximumDirectoryEntries must be an integer from 1 through ${MAX_WALK_DIRECTORY_ENTRIES}`);
+  }
+  if (!Number.isSafeInteger(maximumPendingEntries) || maximumPendingEntries < 1 || maximumPendingEntries > MAX_WALK_PENDING_ENTRIES) {
+    throw new Error(`maximumPendingEntries must be an integer from 1 through ${MAX_WALK_PENDING_ENTRIES}`);
+  }
+  if (!Number.isSafeInteger(maximumDirectories) || maximumDirectories < 1 || maximumDirectories > MAX_WALK_DIRECTORIES) {
+    throw new Error(`maximumDirectories must be an integer from 1 through ${MAX_WALK_DIRECTORIES}`);
+  }
   const rootPaths = new Set(roots.map((root) => path.resolve(root)));
-  const pending = [...rootPaths];
+  const pending = [...rootPaths].sort((left, right) => bytewiseLexical(right, left));
   const visitedDirectories = new Set<string>();
   while (pending.length > 0) {
+    if (aborted()) throw new Error("regular-file walk was paused");
     const current = pending.pop();
     if (current === undefined) break;
     let metadata: Awaited<ReturnType<typeof lstat>>;
     try {
       metadata = await lstat(current);
     } catch (error) {
-      if (rootPaths.has(current)) throw error;
+      if (aborted() || rootPaths.has(current)) throw error;
       options.onError?.(current, error);
       continue;
     }
     if (metadata.isSymbolicLink()) continue;
+    if (
+      !Number.isFinite(metadata.dev)
+      || metadata.dev < 0
+      || !Number.isFinite(metadata.ino)
+      || metadata.ino < 0
+      || !Number.isFinite(metadata.mtimeMs)
+      || !Number.isFinite(metadata.ctimeMs)
+    ) {
+      const error = new Error("filesystem entry identity or timestamps are outside valid numeric bounds");
+      if (rootPaths.has(current)) throw error;
+      options.onError?.(current, error);
+      continue;
+    }
     if (metadata.isFile()) {
+      if (!Number.isSafeInteger(metadata.size) || metadata.size < 0) {
+        const error = new Error("regular-file size exceeds safe numeric bounds");
+        if (rootPaths.has(current)) throw error;
+        options.onError?.(current, error);
+        continue;
+      }
       yield {
         path: current,
         bytes: metadata.size,
@@ -272,6 +437,12 @@ export async function* walkRegularFiles(roots: string[], options: WalkOptions = 
     if (!metadata.isDirectory()) continue;
     const directoryKey = `${metadata.dev}:${metadata.ino}`;
     if (visitedDirectories.has(directoryKey)) continue;
+    if (visitedDirectories.size >= maximumDirectories) {
+      const error = new Error(`input tree exceeds the ${maximumDirectories}-directory deterministic-walk limit; scan smaller subdirectories separately`);
+      if (rootPaths.has(current)) throw error;
+      options.onError?.(current, error);
+      continue;
+    }
     if (await options.shouldEnterDirectory?.(current) === false) {
       options.onError?.(current, new Error("refusing to cross a disallowed directory boundary"));
       continue;
@@ -280,7 +451,7 @@ export async function* walkRegularFiles(roots: string[], options: WalkOptions = 
     try {
       directory = await opendir(current);
     } catch (error) {
-      if (rootPaths.has(current)) throw error;
+      if (aborted() || rootPaths.has(current)) throw error;
       options.onError?.(current, error);
       continue;
     }
@@ -288,11 +459,22 @@ export async function* walkRegularFiles(roots: string[], options: WalkOptions = 
     // alias of the same inode. Mark it only once the directory is open.
     visitedDirectories.add(directoryKey);
     try {
+      const children: string[] = [];
       for await (const entry of directory) {
-        if (!entry.isSymbolicLink()) pending.push(path.join(current, entry.name));
+        if (aborted()) throw new Error("regular-file walk was paused");
+        if (entry.isSymbolicLink()) continue;
+        if (children.length >= maximumDirectoryEntries) {
+          throw new Error(`directory exceeds the ${maximumDirectoryEntries}-entry deterministic-walk limit; scan smaller subdirectories separately`);
+        }
+        children.push(path.join(current, entry.name));
       }
+      if (pending.length + children.length > maximumPendingEntries) {
+        throw new Error(`directory would exceed the ${maximumPendingEntries}-entry deterministic-walk frontier limit; scan smaller subdirectories separately`);
+      }
+      children.sort((left, right) => bytewiseLexical(right, left));
+      for (const child of children) pending.push(child);
     } catch (error) {
-      if (rootPaths.has(current)) throw error;
+      if (aborted() || rootPaths.has(current)) throw error;
       options.onError?.(current, error);
     }
   }

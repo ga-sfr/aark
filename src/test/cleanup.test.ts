@@ -1,0 +1,189 @@
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { access, mkdir, mkdtemp, readdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { planCleanup, runCleanup } from "../cleanup.js";
+import { scanSensitiveMaterial } from "../mining/scanner.js";
+
+async function missing(filename: string): Promise<boolean> {
+  try {
+    await access(filename);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+test("cleanup requires fresh approval and retains only reports, findings, and integrity metadata", {
+  skip: process.platform !== "linux",
+}, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-cleanup-test-"));
+  const caseRoot = path.join(root, "case");
+  const recovery = path.join(caseRoot, "recovery");
+  const evidence = path.join(caseRoot, "evidence");
+  const logs = path.join(caseRoot, "logs");
+  const runs = path.join(caseRoot, "runs");
+  const mining = path.join(root, "mining");
+  await mkdir(recovery, { recursive: true });
+  await mkdir(path.join(recovery, "nested", "empty"), { recursive: true });
+  await mkdir(evidence);
+  await mkdir(logs);
+  await mkdir(runs);
+  const tokenPrefix = ["gh", "p_"].join("");
+  const token = `${tokenPrefix}ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij`;
+  await writeFile(path.join(recovery, "recovered.txt"), `provider_token=${token}\n`);
+  await writeFile(path.join(evidence, "source.img"), randomBytes(1024));
+  await writeFile(path.join(logs, "tool-sensitive.log"), "synthetic log\n");
+  await writeFile(path.join(runs, "prior-sensitive.json"), "{}\n");
+
+  const runId = "synthetic-complete-run";
+  const startedAt = new Date(Date.now() - 1_000).toISOString();
+  const finishedAt = new Date().toISOString();
+  await writeFile(path.join(caseRoot, "case-sensitive.json"), `${JSON.stringify({
+    version: 1,
+    runId,
+    status: "complete",
+    startedAt,
+    finishedAt,
+    currentStep: null,
+    failure: null,
+    plan: { version: 1, destination: caseRoot, steps: [] },
+    results: [],
+  }, null, 2)}\n`);
+  await writeFile(path.join(caseRoot, "plan-redacted.json"), "{}\n");
+  await writeFile(path.join(caseRoot, "manifest-redacted.json"), `${JSON.stringify({
+    tool: "aark",
+    layer: "recovery",
+    runId,
+    status: "complete",
+    complete: true,
+    finishedAt,
+  }, null, 2)}\n`);
+  await writeFile(path.join(caseRoot, "final-report-sensitive.md"), "# recovery report\n");
+  await writeFile(path.join(caseRoot, "final-report-redacted.md"), "# recovery report (redacted)\n");
+  for (const [current, perRun] of [
+    ["case-sensitive.json", `${runId}-sensitive.json`],
+    ["plan-redacted.json", `${runId}-plan-redacted.json`],
+    ["manifest-redacted.json", `${runId}-manifest-redacted.json`],
+    ["final-report-sensitive.md", `${runId}-final-report-sensitive.md`],
+    ["final-report-redacted.md", `${runId}-final-report-redacted.md`],
+  ] as const) await writeFile(path.join(runs, perRun), await readFile(path.join(caseRoot, current)));
+
+  const scan = await scanSensitiveMaterial({
+    inputs: [recovery, evidence],
+    output: mining,
+    provenance: "unknown",
+    chunkBytes: 17 * 1024 * 1024,
+    overlapBytes: 17 * 1024 * 1024,
+    wholeFileBytes: 1024 * 1024,
+    workers: 1,
+    minimumFreeGiB: 0,
+    minimumFreePercent: 0,
+  });
+  assert.equal(scan.status, "complete");
+
+  const options = { caseDirectory: caseRoot, miningOutputs: [mining], includeEvidence: true };
+  const firstPlan = await planCleanup(options);
+  assert.equal(firstPlan.status, "ready");
+  assert.equal(firstPlan.pathsRedacted, true);
+  assert.equal(firstPlan.deletion.recoveredCopyIncluded, true);
+  assert.equal(firstPlan.deletion.evidenceCopyIncluded, true);
+  assert.ok(BigInt(firstPlan.deletion.filesystemEntries) > BigInt(firstPlan.deletion.regularFiles));
+  assert.equal(firstPlan.retained.exactFindingArtifacts, true);
+  assert.equal(firstPlan.markerOnlyFindingsWithoutArtifacts, "0");
+  assert.match(firstPlan.approvalToken, /^[a-f0-9]{64}$/);
+  assert.equal(JSON.stringify(firstPlan).includes(caseRoot), false);
+
+  const unfinishedQuarantine = path.join(caseRoot, ".aark-cleanup-pending-recovery-synthetic");
+  await mkdir(unfinishedQuarantine);
+  await assert.rejects(planCleanup(options), /unfinished cleanup quarantine/);
+  await rm(unfinishedQuarantine, { recursive: true });
+
+  await assert.rejects(runCleanup({
+    ...options,
+    approvalToken: firstPlan.approvalToken,
+    execute: true,
+    confirmDeleteRecoveredCopy: true,
+  }), /confirm-delete-evidence/);
+  assert.equal(await missing(recovery), false);
+
+  // An empty nested directory is not part of a mining file manifest, but it is
+  // still a filesystem entry selected for recursive deletion and must stale
+  // the cleanup authorization.
+  const unapprovedEmptyDirectory = path.join(recovery, "nested", "added-after-approval");
+  await mkdir(unapprovedEmptyDirectory);
+  await assert.rejects(runCleanup({
+    ...options,
+    approvalToken: firstPlan.approvalToken,
+    execute: true,
+    confirmDeleteRecoveredCopy: true,
+    confirmDeleteEvidence: true,
+  }), /changed after planning/);
+  assert.equal(await missing(unapprovedEmptyDirectory), false);
+  await rm(unapprovedEmptyDirectory, { recursive: true });
+
+  const rootRecoveryReport = path.join(caseRoot, "final-report-redacted.md");
+  const runRecoveryReport = path.join(runs, `${runId}-final-report-redacted.md`);
+  const originalRecoveryReport = await readFile(rootRecoveryReport);
+  await writeFile(rootRecoveryReport, "# changed retained report\n");
+  await writeFile(runRecoveryReport, "# changed retained report\n");
+  await assert.rejects(runCleanup({
+    ...options,
+    approvalToken: firstPlan.approvalToken,
+    execute: true,
+    confirmDeleteRecoveredCopy: true,
+    confirmDeleteEvidence: true,
+  }), /changed after planning/);
+  assert.equal(await missing(recovery), false);
+  await writeFile(rootRecoveryReport, originalRecoveryReport);
+  await writeFile(runRecoveryReport, originalRecoveryReport);
+
+  const recoveryLog = path.join(logs, "tool-sensitive.log");
+  await writeFile(recoveryLog, "modified  log\n");
+  await assert.rejects(runCleanup({
+    ...options,
+    approvalToken: firstPlan.approvalToken,
+    execute: true,
+    confirmDeleteRecoveredCopy: true,
+    confirmDeleteEvidence: true,
+  }), /changed after planning/);
+  assert.equal(await missing(logs), false);
+
+  const changed = path.join(recovery, "not-scanned.bin");
+  await writeFile(changed, "changed after approval");
+  await assert.rejects(runCleanup({
+    ...options,
+    approvalToken: firstPlan.approvalToken,
+    execute: true,
+    confirmDeleteRecoveredCopy: true,
+    confirmDeleteEvidence: true,
+  }), /changed after scanning|not covered|changed after planning/);
+  assert.equal(await missing(recovery), false);
+  assert.equal(await missing(path.join(caseRoot, "cleanup-final-report-sensitive.md")), true);
+  await unlink(changed);
+
+  const approved = await planCleanup(options);
+  assert.notEqual(approved.approvalToken, firstPlan.approvalToken);
+  const result = await runCleanup({
+    ...options,
+    approvalToken: approved.approvalToken,
+    execute: true,
+    confirmDeleteRecoveredCopy: true,
+    confirmDeleteEvidence: true,
+  });
+  assert.equal(result.status, "complete");
+  assert.equal(await missing(recovery), true);
+  assert.equal(await missing(evidence), true);
+  assert.equal(await missing(logs), true);
+  assert.equal(await missing(runs), true);
+  assert.equal(await missing(path.join(caseRoot, "final-report-sensitive.md")), false);
+  assert.equal(await missing(path.join(caseRoot, "cleanup-final-report-sensitive.md")), false);
+  assert.equal(await missing(path.join(mining, "final-report-sensitive.md")), false);
+  assert.equal(await missing(path.join(mining, "inventory-sensitive.json")), false);
+  assert.equal(await missing(path.join(mining, "scan-state-sensitive.json")), false);
+  assert.equal((await readdir(caseRoot)).some((entry) => entry.startsWith(".aark-cleanup-pending-")), false);
+  const inventory = JSON.parse(await readFile(path.join(mining, "inventory-sensitive.json"), "utf8")) as { findings: unknown[] };
+  assert.ok(inventory.findings.length > 0);
+});

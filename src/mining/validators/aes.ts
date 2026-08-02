@@ -83,7 +83,8 @@ function firstExpandedWordMatches(data: Buffer, offset: number, keyBytes: number
   return true;
 }
 
-export function findAesEncryptionSchedules(data: Buffer): AesScheduleHit[] {
+export function findAesEncryptionSchedules(data: Buffer, maximumHits = Number.MAX_SAFE_INTEGER, onLimit?: () => void): AesScheduleHit[] {
+  if (!Number.isSafeInteger(maximumHits) || maximumHits < 0) throw new Error("AES schedule hit limit must be a non-negative safe integer");
   const hits: AesScheduleHit[] = [];
   for (const keyBytes of [16, 24, 32] as const) {
     const bits = (keyBytes * 8) as 128 | 192 | 256;
@@ -93,7 +94,13 @@ export function findAesEncryptionSchedules(data: Buffer): AesScheduleHit[] {
       const key = Buffer.from(data.subarray(offset, offset + keyBytes));
       const expected = expandAesKey(key);
       const actual = data.subarray(offset, offset + scheduleBytes);
-      if (expected.equals(actual)) hits.push({ offset, bits, key, schedule: Buffer.from(actual) });
+      if (expected.equals(actual)) {
+        if (hits.length >= maximumHits) {
+          onLimit?.();
+          return hits;
+        }
+        hits.push({ offset, bits, key, schedule: Buffer.from(actual) });
+      }
     }
   }
   return hits;
@@ -110,7 +117,8 @@ function entropy(value: Buffer): number {
   return result;
 }
 
-export function findChaChaStates(data: Buffer): ChaChaStateHit[] {
+export function findChaChaStates(data: Buffer, maximumHits = Number.MAX_SAFE_INTEGER, onLimit?: () => void): ChaChaStateHit[] {
+  if (!Number.isSafeInteger(maximumHits) || maximumHits < 0) throw new Error("ChaCha state hit limit must be a non-negative safe integer");
   const output: ChaChaStateHit[] = [];
   for (const [markerText, bits] of [["expand 32-byte k", 256], ["expand 16-byte k", 128]] as const) {
     const marker = Buffer.from(markerText, "ascii");
@@ -123,6 +131,10 @@ export function findChaChaStates(data: Buffer): ChaChaStateHit[] {
       const key = bits === 256 ? storedKey : storedKey.subarray(0, 16);
       const duplicated128 = bits === 256 || storedKey.subarray(0, 16).equals(storedKey.subarray(16));
       if (duplicated128 && entropy(key) >= 3.5 && !key.every((byte) => byte === 0)) {
+        if (output.length >= maximumHits) {
+          onLimit?.();
+          return output;
+        }
         output.push({ offset: offset + 16, bits, key: Buffer.from(key), state: Buffer.from(state) });
       }
       cursor = offset + 1;

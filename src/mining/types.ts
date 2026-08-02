@@ -8,11 +8,17 @@ export interface MiningOptions {
   overlapBytes: number;
   wholeFileBytes: number;
   deepKeySchedules?: boolean;
+  workers?: number;
+  minimumFreeGiB?: number;
+  minimumFreePercent?: number;
+  maximumOutputGiB?: number;
   signal?: AbortSignal;
   progress?: (progress: MiningProgress) => void;
 }
 
 export interface MiningProgress {
+  phase?: "inventory" | "stream" | "whole-file" | "finalizing";
+  filesTotal?: number;
   filesVisited: number;
   filesScanned: number;
   bytesScanned: number;
@@ -21,7 +27,7 @@ export interface MiningProgress {
   scanErrors: number;
 }
 
-export type MiningRunStatus = "in-progress" | "complete" | "complete-with-errors" | "failed" | "interrupted";
+export type MiningRunStatus = "in-progress" | "paused" | "complete" | "complete-with-errors" | "failed" | "interrupted";
 
 export interface SensitiveOccurrence {
   sourcePath: string;
@@ -55,6 +61,24 @@ export interface SensitiveScanInventory {
   failureMessage?: string;
   inputRoots: string[];
   outputRoot: string;
+  resumeCheckpoint?: {
+    runId: string;
+    status: MiningRunStatus;
+    inventoryComplete: boolean;
+    semantic: {
+      inputs: string[];
+      output: string;
+      provenance: Provenance;
+      chunkBytes: number;
+      overlapBytes: number;
+      wholeFileBytes: number;
+      deepKeySchedules: boolean;
+    };
+    inputRoots: Array<{ path: string; device: number; inode: number; kind: "file" | "directory"; mount: string }>;
+    manifest: { filename: string; entries: number; bytes: number; sha256: string };
+    cursor: { fileIndex: number; phase: "stream" | "whole-file"; nextOffset: number };
+    progress: MiningProgress;
+  };
   findings: SensitiveFinding[];
   errors: Array<{ sourcePath: string; operation: string; message: string }>;
   errorsOmitted: number;

@@ -11,7 +11,9 @@ This project uses Node.js where it is a good fit and delegates mature forensic o
 | Signature carving | PhotoRec over the unallocated-only stream emitted by `blkls` | Broad signature library without exposing allocated source bytes to the carver |
 | Shadow copies and BitLocker views | libvshadow and dislocker, reviewed read-only mounting | Specialized on-disk formats and mount lifecycle |
 | Residual-memory feature extraction | bulk_extractor | Mature scanners and hibernation support |
-| Streaming candidate discovery, strict validation, deduplication, manifests, artifacts | Native Node.js | Portable binary/text handling and controlled local output |
+| Streaming candidate discovery and strict validation | Bounded native Node.js worker-thread pool | Parallel pure detectors over bounded chunks without sharing artifact state |
+| Verification, deterministic deduplication, checkpoints, manifests, capacity guards, artifacts | Native Node.js main thread | Ordered, auditable local state and a single writer for sensitive output |
+| Post-scan coverage proof and approved cleanup | Native Node.js main thread | Exact checkpoint/artifact verification, fixed deletion targets, and explicit user-bound authorization |
 | BIP-39 wordlists/checksums | `@scure/bip39` | Small audited implementation; no wallet or network dependency |
 | PEM/DER/CNG consistency and derived public keys | Node.js `crypto` | Local OpenSSL-backed parsing and round trips |
 | DPAPI structure discovery | Native Node.js | Safe offline parsing during broad scans |

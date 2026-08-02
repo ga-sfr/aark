@@ -2,7 +2,16 @@ import { createPrivateKey, createPublicKey } from "node:crypto";
 import type { Candidate, JsonValue } from "../../core/types.js";
 import { decodeChromiumDpapiWrapper, parseDpapiMasterKeyFile } from "../validators/dpapi.js";
 import { validateStructuredContainer } from "../validators/containers.js";
+import { appendCandidate, markValidationLimit, takeStructuralValidation } from "./types.js";
 import type { DetectionContext } from "./types.js";
+import { MAX_STRUCTURED_JSON_PARSE_BYTES } from "../limits.js";
+
+const MAX_STRUCTURED_COLLECTION_ENTRIES = 100_000;
+const MAX_DERIVED_CREDENTIAL_EXPORT_BYTES = 16 * 1024 * 1024;
+
+function validationLimitReached(context: DetectionContext): boolean {
+  return context.runtimeState?.validationLimitReached === true;
+}
 
 function record(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -115,28 +124,58 @@ function dockerConfig(document: Record<string, unknown>, data: Buffer, context: 
   const auths = record(document.auths);
   if (auths === null) return null;
   const decoded: Array<{ registry: string; credential: string }> = [];
-  for (const [registry, entry] of Object.entries(auths)) {
+  let derivedBytes = 0;
+  let exportComplete = true;
+  let entries = 0;
+  for (const registry in auths) {
+    if (!Object.hasOwn(auths, registry)) continue;
+    if (entries >= MAX_STRUCTURED_COLLECTION_ENTRIES || !takeStructuralValidation(context)) {
+      markValidationLimit(context);
+      exportComplete = false;
+      break;
+    }
+    entries += 1;
+    const entry = auths[registry];
     const auth = record(entry)?.auth;
     if (typeof auth !== "string" || auth.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(auth)) continue;
+    const maximumCredentialBytes = auth.length / 4 * 3;
+    const maximumSerializedBytes = (Buffer.byteLength(registry) + maximumCredentialBytes) * 6 + 64;
+    if (derivedBytes + maximumSerializedBytes > MAX_DERIVED_CREDENTIAL_EXPORT_BYTES) {
+      markValidationLimit(context);
+      exportComplete = false;
+      break;
+    }
     const credentialBytes = Buffer.from(auth, "base64");
     if (credentialBytes.toString("base64") !== auth) continue;
     const credential = credentialBytes.toString("utf8");
     if (!Buffer.from(credential, "utf8").equals(credentialBytes)) continue;
     const separator = credential.indexOf(":");
     if (separator <= 0 || separator === credential.length - 1 || credential.includes("\0")) continue;
+    // JSON escaping can expand control characters to six ASCII bytes.
+    const serializedBytes = (Buffer.byteLength(registry) + credentialBytes.length) * 6 + 64;
+    if (derivedBytes + serializedBytes > MAX_DERIVED_CREDENTIAL_EXPORT_BYTES) {
+      markValidationLimit(context);
+      exportComplete = false;
+      break;
+    }
+    derivedBytes += serializedBytes;
     decoded.push({ registry, credential });
   }
   if (decoded.length === 0) return null;
   return wholeJsonCandidate(data, context, "docker-registry-credentials", "docker-auth-base64-decode", {
     authsObjectPresent: true,
     decodableCredentialEntries: decoded.length,
-  }, [{ filename: "decoded-registry-credentials.json", data: Buffer.from(`${JSON.stringify(decoded, null, 2)}\n`, "utf8") }]);
+    derivedCredentialExportComplete: exportComplete,
+  }, exportComplete
+    ? [{ filename: "decoded-registry-credentials.json", data: Buffer.from(`${JSON.stringify(decoded, null, 2)}\n`, "utf8") }]
+    : undefined);
 }
 
 function kubernetesConfig(document: Record<string, unknown>, data: Buffer, context: DetectionContext): Candidate | null {
   if (document.kind !== "Config" || !Array.isArray(document.users)) return null;
   let sensitiveUsers = 0;
   for (const entry of document.users) {
+    if (!takeStructuralValidation(context)) break;
     const user = record(record(entry)?.user);
     if (user !== null && ["token", "password", "client-key-data", "auth-provider", "exec"].some((key) => user[key] !== undefined)) sensitiveUsers += 1;
   }
@@ -149,10 +188,12 @@ function kubernetesConfig(document: Record<string, unknown>, data: Buffer, conte
 
 function firefoxLogins(document: Record<string, unknown>, data: Buffer, context: DetectionContext): Candidate | null {
   if (!Array.isArray(document.logins)) return null;
-  const matches = document.logins.filter((entry) => {
+  let matches = 0;
+  for (const entry of document.logins) {
+    if (!takeStructuralValidation(context)) break;
     const login = record(entry);
-    return login !== null && typeof login.encryptedUsername === "string" && typeof login.encryptedPassword === "string";
-  }).length;
+    if (login !== null && typeof login.encryptedUsername === "string" && typeof login.encryptedPassword === "string") matches += 1;
+  }
   if (matches === 0) return null;
   return wholeJsonCandidate(data, context, "firefox-logins-json", "firefox-encrypted-login-structure", {
     encryptedLoginEntries: matches,
@@ -178,10 +219,12 @@ function passwordManagerJson(document: Record<string, unknown>, data: Buffer, co
     });
   }
   if (document.encrypted === false && Array.isArray(document.folders) && Array.isArray(document.items)) {
-    const loginItems = document.items.filter((entry) => {
+    let loginItems = 0;
+    for (const entry of document.items) {
+      if (!takeStructuralValidation(context)) break;
       const login = record(record(entry)?.login);
-      return login !== null && (typeof login.password === "string" || typeof login.totp === "string");
-    }).length;
+      if (login !== null && (typeof login.password === "string" || typeof login.totp === "string")) loginItems += 1;
+    }
     if (loginItems > 0) return wholeJsonCandidate(data, context, "bitwarden-json-export", "bitwarden-export-structure", { loginItems });
   }
   if (
@@ -288,12 +331,18 @@ function isCompleteDerSequence(data: Buffer): boolean {
   return payloadBytes >= 0x80 && 2 + lengthBytes + payloadBytes === data.length;
 }
 
+function looksLikeJsonDocument(data: Buffer): boolean {
+  let cursor = data.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])) ? 3 : 0;
+  while (cursor < data.length && [0x09, 0x0a, 0x0d, 0x20].includes(data[cursor] ?? -1)) cursor += 1;
+  return data[cursor] === 0x7b || data[cursor] === 0x5b;
+}
+
 export function detectStructuredArtifacts(data: Buffer, context: DetectionContext): Candidate[] {
   if (!context.wholeFile) return [];
   const output: Candidate[] = [];
-  const container = validateStructuredContainer(data);
+  const container = validateStructuredContainer(data, () => takeStructuralValidation(context));
   if (container !== null) {
-    output.push({
+    if (!appendCandidate(output, {
       category: container.category,
       offset: context.baseOffset,
       length: container.value.length,
@@ -301,13 +350,14 @@ export function detectStructuredArtifacts(data: Buffer, context: DetectionContex
       confidence: container.confidence,
       validation: { method: "complete-sensitive-container", checks: container.checks },
       extension: container.extension,
-    });
+    }, context)) return output;
   }
+  if (validationLimitReached(context)) return output;
   const der = derPrivateKey(data, context);
-  if (der !== null) output.push(der);
+  if (der !== null && !appendCandidate(output, der, context)) return output;
   const dpapiMasterKey = parseDpapiMasterKeyFile(data);
   if (dpapiMasterKey !== null) {
-    output.push({
+    if (!appendCandidate(output, {
       category: "windows-dpapi-master-key-file",
       offset: context.baseOffset,
       length: data.length,
@@ -327,12 +377,12 @@ export function detectStructuredArtifacts(data: Buffer, context: DetectionContex
       },
       extension: ".dpapi-masterkey",
       sensitiveMetadata: { masterKeyGuid: dpapiMasterKey.guid },
-    });
+    }, context)) return output;
   }
   const textPrefix = data.subarray(0, Math.min(data.length, 2 * 1024 * 1024)).toString("utf8");
   const textSuffix = data.subarray(Math.max(0, data.length - 4096)).toString("utf8");
   if (/<KeePassFile(?:\s|>)/.test(textPrefix) && /<Key>\s*Password\s*<\/Key>/.test(textPrefix) && /<Value(?:\s[^>]*)?>/.test(textPrefix) && /<\/KeePassFile>\s*$/.test(textSuffix)) {
-    output.push({
+    if (!appendCandidate(output, {
       category: "keepass-xml-export",
       offset: context.baseOffset,
       length: data.length,
@@ -340,14 +390,14 @@ export function detectStructuredArtifacts(data: Buffer, context: DetectionContex
       confidence: "high",
       validation: { method: "keepass-xml-export-structure", checks: { keepassRoot: true, passwordEntryPresent: true, xmlCryptographyVerified: false } },
       extension: ".xml",
-    });
+    }, context)) return output;
   }
   const firstLine = textPrefix.split(/\r?\n/, 1)[0]?.replace(/^\uFEFF/, "").toLowerCase();
   if (firstLine !== undefined && [
     "url,username,password,extra,name,grouping,fav",
     "url,username,password,totp,extra,name,grouping,fav",
   ].includes(firstLine)) {
-    output.push({
+    if (!appendCandidate(output, {
       category: "lastpass-csv-export",
       offset: context.baseOffset,
       length: data.length,
@@ -355,20 +405,26 @@ export function detectStructuredArtifacts(data: Buffer, context: DetectionContex
       confidence: "high",
       validation: { method: "lastpass-csv-header", checks: { completeHeader: true, rowsPresent: /\r?\n.+/.test(textPrefix) } },
       extension: ".csv",
-    });
+    }, context)) return output;
   }
 
+  if (!looksLikeJsonDocument(data)) return output;
+  if (data.length > MAX_STRUCTURED_JSON_PARSE_BYTES) {
+    markValidationLimit(context);
+    return output;
+  }
   try {
-    const parsed: unknown = JSON.parse(data.toString("utf8"));
+    const parsed: unknown = JSON.parse(data.toString("utf8").replace(/^\uFEFF/u, ""));
     const document = record(parsed);
     if (document !== null) {
       for (const validator of [ethereumV3, electrum, metamask, serviceAccount, dockerConfig, kubernetesConfig, firefoxLogins, passwordManagerJson, chromiumLocalState]) {
         const candidate = validator(document, data, context);
-        if (candidate !== null) output.push(candidate);
+        if (candidate !== null && !appendCandidate(output, candidate, context)) return output;
+        if (validationLimitReached(context)) break;
       }
     }
     const solana = solanaKeypair(parsed, data, context);
-    if (solana !== null) output.push(solana);
+    if (solana !== null && !appendCandidate(output, solana, context)) return output;
   } catch {
     // Non-JSON input is expected during broad recovery scans.
   }

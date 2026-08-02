@@ -1,5 +1,6 @@
 import { shannonEntropy } from "../../core/crypto.js";
 import type { Candidate, Confidence } from "../../core/types.js";
+import { appendCandidate, takeStructuralValidation } from "./types.js";
 import type { DetectionContext } from "./types.js";
 import { decodedText } from "../text.js";
 
@@ -83,10 +84,11 @@ export function detectProviderCredentials(data: Buffer, context: DetectionContex
     const expression = new RegExp(tokenPattern.expression.source, tokenPattern.expression.flags);
     for (const match of text.matchAll(expression)) {
       if (match.index === undefined) continue;
+      if (!takeStructuralValidation(context)) return output;
       const value = Buffer.from(match[0], "latin1");
       const entropy = shannonEntropy(value);
       if (placeholder(match[0]) || entropy < (tokenPattern.minimumEntropy ?? 0)) continue;
-      output.push(candidate(
+      if (!appendCandidate(output, candidate(
         tokenPattern.category,
         value,
         context.baseOffset + match.index,
@@ -94,37 +96,39 @@ export function detectProviderCredentials(data: Buffer, context: DetectionContex
         "provider-token-shape",
         { prefixAndLengthValid: true, entropyBitsPerByte: Number(entropy.toFixed(3)), onlineValidityChecked: false },
         tokenPattern.provider,
-      ));
+      ), context)) return output;
     }
   }
 
   for (const match of text.matchAll(new RegExp(JWT.source, JWT.flags))) {
     if (match.index === undefined || match[1] === undefined || match[2] === undefined || match[3] === undefined) continue;
+    if (!takeStructuralValidation(context)) return output;
     const header = decodeBase64UrlJson(match[1]);
     const payload = decodeBase64UrlJson(match[2]);
     const signature = Buffer.from(match[3], "base64url");
     if (header === null || payload === null || typeof header.alg !== "string" || header.alg.toLowerCase() === "none" || signature.length < 8) continue;
     const value = Buffer.from(match[0], "latin1");
-    output.push(candidate("json-web-token", value, context.baseOffset + match.index, "high", "jwt-structural-validation", {
+    if (!appendCandidate(output, candidate("json-web-token", value, context.baseOffset + match.index, "high", "jwt-structural-validation", {
       headerJsonValid: true,
       payloadJsonValid: true,
       algorithmDeclared: true,
       signatureBytes: signature.length,
       signatureCryptographicallyVerified: false,
-    }));
+    }), context)) return output;
   }
 
   for (const match of text.matchAll(new RegExp(CREDENTIAL_URL.source, CREDENTIAL_URL.flags))) {
     if (match.index === undefined) continue;
+    if (!takeStructuralValidation(context)) return output;
     try {
       const parsed = new URL(match[0]);
       if (parsed.username === "" || parsed.password === "" || placeholder(decodeURIComponent(parsed.password))) continue;
       const value = Buffer.from(match[0], "latin1");
-      output.push(candidate("credential-bearing-url", value, context.baseOffset + match.index, "high", "url-credential-validation", {
+      if (!appendCandidate(output, candidate("credential-bearing-url", value, context.baseOffset + match.index, "high", "url-credential-validation", {
         absoluteUrlParsed: true,
         usernamePresent: true,
         passwordPresent: true,
-      }));
+      }), context)) return output;
     } catch {
       // The regex intentionally over-selects; URL parsing is the validator.
     }
@@ -133,7 +137,9 @@ export function detectProviderCredentials(data: Buffer, context: DetectionContex
   for (const match of text.matchAll(new RegExp(ASSIGNMENT.source, ASSIGNMENT.flags))) {
     const key = match[2];
     const rawValue = match[3] ?? match[4] ?? match[5];
-    if (match.index === undefined || key === undefined || rawValue === undefined || placeholder(rawValue)) continue;
+    if (match.index === undefined || key === undefined || rawValue === undefined) continue;
+    if (!takeStructuralValidation(context)) return output;
+    if (placeholder(rawValue)) continue;
     const normalizedKey = key.toLowerCase().replace(/-/g, "_");
     const awsCategory = normalizedKey === "aws_secret_access_key"
       ? "aws-secret-access-key"
@@ -148,12 +154,12 @@ export function detectProviderCredentials(data: Buffer, context: DetectionContex
     const valueIndex = match[0].lastIndexOf(rawValue);
     if (valueIndex < 0) continue;
     const value = Buffer.from(rawValue, "latin1");
-    output.push(candidate(awsCategory ?? "secret-assignment", value, context.baseOffset + match.index + valueIndex, awsCategory === undefined ? "medium" : "high", "context-bound-secret-assignment", {
+    if (!appendCandidate(output, candidate(awsCategory ?? "secret-assignment", value, context.baseOffset + match.index + valueIndex, awsCategory === undefined ? "medium" : "high", "context-bound-secret-assignment", {
       sensitiveNameMatched: true,
       nonPlaceholder: true,
       entropyBitsPerByte: Number(entropy.toFixed(3)),
       onlineValidityChecked: false,
-    }, awsCategory === undefined ? undefined : "aws"));
+    }, awsCategory === undefined ? undefined : "aws"), context)) return output;
   }
   return output;
 }

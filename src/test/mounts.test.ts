@@ -16,6 +16,9 @@ test("mount classification is conservative for permissions, read-only state, and
   assert.equal(filesystemIsNetwork(mount("fuse.s3fs", "bucket")), true);
   assert.equal(filesystemIsNetwork(mount("fuse", "opaque")), true);
   assert.equal(filesystemIsNetwork(mount("fuse.unknown-provider", "opaque")), true);
+  assert.equal(filesystemIsNetwork(mount("fuse.bindfs", "/network-or-local-layer")), true);
+  assert.equal(filesystemIsNetwork(mount("fuse.mergerfs", "/possibly-mixed-layers")), true);
+  assert.equal(filesystemIsNetwork(mount("fuse.encfs", "/unknown-backing-layer")), true);
   assert.equal(filesystemIsNetwork(mount("fuse.ntfs-3g", "/dev/test")), false);
   assert.equal(filesystemIsNetwork(mount("fuse.dislocker", "/case/dislocker-file")), false);
   assert.equal(filesystemIsNetwork(mount("cifs", "//server/share")), true);

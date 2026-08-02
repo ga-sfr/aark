@@ -1,5 +1,7 @@
 const DPAPI_MAGIC = Buffer.from("01000000d08c9ddf0115d1118c7a00c04fc297eb", "hex");
 export const MAX_DPAPI_BLOB_BYTES = 16 * 1024 * 1024;
+const MAX_DPAPI_BASE64_BYTES = Math.ceil(MAX_DPAPI_BLOB_BYTES / 3) * 4;
+const MAX_CHROMIUM_DPAPI_BASE64_BYTES = Math.ceil((MAX_DPAPI_BLOB_BYTES + 5) / 3) * 4;
 
 export interface DpapiMasterKeyFileValidation {
   value: Buffer;
@@ -52,11 +54,13 @@ export function parseDpapiBlob(data: Buffer, offset = 0): Buffer | null {
 
 export function decodeChromiumDpapiWrapper(value: string): Buffer | null {
   try {
-    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value) || value.length % 4 !== 0) return null;
+    if (value.length > MAX_CHROMIUM_DPAPI_BASE64_BYTES || !/^[A-Za-z0-9+/]+={0,2}$/.test(value) || value.length % 4 !== 0) return null;
     const decoded = Buffer.from(value, "base64");
     if (decoded.toString("base64") !== value) return null;
     if (!decoded.subarray(0, 5).equals(Buffer.from("DPAPI", "ascii"))) return null;
-    return parseDpapiBlob(decoded.subarray(5));
+    const payload = decoded.subarray(5);
+    const parsed = parseDpapiBlob(payload);
+    return parsed?.length === payload.length ? parsed : null;
   } catch {
     return null;
   }
@@ -64,11 +68,12 @@ export function decodeChromiumDpapiWrapper(value: string): Buffer | null {
 
 export function decodeBase64Dpapi(value: string): Buffer | null {
   try {
-    if (!/^[A-Za-z0-9_-]+={0,2}$/.test(value)) return null;
+    if (value.length > MAX_DPAPI_BASE64_BYTES || !/^[A-Za-z0-9_-]+={0,2}$/.test(value)) return null;
     const normalized = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
     const decoded = Buffer.from(normalized, "base64");
     if (decoded.toString("base64").replace(/=+$/g, "") !== normalized.replace(/=+$/g, "")) return null;
-    return parseDpapiBlob(decoded);
+    const parsed = parseDpapiBlob(decoded);
+    return parsed?.length === decoded.length ? parsed : null;
   } catch {
     return null;
   }

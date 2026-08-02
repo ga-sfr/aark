@@ -1,6 +1,12 @@
 import type { Provenance } from "../core/types.js";
 
-export type RecoveryRunStatus = "complete" | "complete-with-warnings" | "failed" | "interrupted";
+export type RecoveryRunStatus = "paused" | "complete" | "complete-with-warnings" | "failed" | "interrupted";
+
+export interface RecoveryStorageConfig {
+  minFreeGiB: number;
+  minFreePercent: number;
+  maxOutputGiB?: number;
+}
 
 export interface RecoveryStages {
   deletedMetadata: boolean;
@@ -30,6 +36,7 @@ export interface RecoveryConfig {
   execute: boolean;
   sectorOffset: number;
   photoRecCommand: string;
+  storage?: RecoveryStorageConfig;
   image: RecoveryImageConfig;
   stages: RecoveryStages;
 }
@@ -57,6 +64,8 @@ export interface RecoveryPlan {
   source: string;
   analysisSource: string;
   destination: string;
+  requireReadOnlySource: boolean;
+  storage: RecoveryStorageConfig;
   steps: RecoveryStep[];
   warnings: string[];
 }

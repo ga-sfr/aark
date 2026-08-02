@@ -16,7 +16,7 @@ const forbiddenNames = [
   /(?:^|\/)[^/]*sensitive[^/]*\.(?:bin|csv|json|log|md|txt)$/i,
   /(?:^|\/)inventory-sensitive\.json$/i,
   /(?:^|\/)case-sensitive\.json$/i,
-  /(?:^|\/)\.agetnic-(?:recovery|mining)\.lock$/i,
+  /(?:^|\/)\.(?:aark|agetnic)-(?:recovery|mining)\.lock$/i,
   /(?:^|\/)(?:final-report-(?:sensitive|redacted)\.md|manifest-redacted\.json|plan-redacted\.json)$/i,
   /(?:^|\/)[^/]*final-report-(?:sensitive|redacted)\.md$/i,
   /(?:^|\/)[^/]*manifest-redacted\.json$/i,

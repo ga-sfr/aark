@@ -6,8 +6,9 @@ import { machineInventory } from "./recovery/inventory.js";
 import { loadRecoveryConfig } from "./recovery/config.js";
 import { buildRecoveryPlan } from "./recovery/plan.js";
 import { redactedPlan, runRecoveryPlan } from "./recovery/runner.js";
-import { scanSensitiveMaterial } from "./mining/scanner.js";
+import { resumeSensitiveMaterial, scanSensitiveMaterial } from "./mining/scanner.js";
 import { readValidatedRevealArtifact } from "./mining/reveal.js";
+import { planCleanup, runCleanup } from "./cleanup.js";
 import type { Provenance } from "./core/types.js";
 
 const VERSION = "0.1.0";
@@ -29,6 +30,19 @@ function mib(value: string): number {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error("size options must be positive whole MiB values");
   return parsed * 1024 * 1024;
+}
+
+function quantity(value: string, label: string): number {
+  if (value.trim() === "") throw new Error(`${label} must be a non-negative number`);
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`${label} must be a non-negative number`);
+  return parsed;
+}
+
+function workers(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 4) throw new Error("workers must be an integer from 1 through 4");
+  return parsed;
 }
 
 function redactedError(error: unknown): string {
@@ -105,6 +119,7 @@ recover.command("run")
     try {
       const result = await runRecoveryPlan(config, buildRecoveryPlan(config), options.execute, controller.signal);
       json(result);
+      if (result.status === "paused") process.exitCode = 75;
     } finally {
       process.removeListener("SIGINT", interrupt);
       process.removeListener("SIGTERM", interrupt);
@@ -122,6 +137,10 @@ mine.command("scan")
   .option("--overlap-mib <number>", "window overlap in MiB", "17")
   .option("--whole-file-mib <number>", "maximum file size for whole-file container validation", "64")
   .option("--deep-key-schedules", "scan every byte for AES schedules and initialized ChaCha states", false)
+  .option("--workers <number>", "detector worker threads (1-4; defaults to available CPUs minus one, capped at 4)")
+  .option("--min-free-gib <number>", "minimum free-space reserve in GiB", "5")
+  .option("--min-free-percent <number>", "minimum free-space reserve as a filesystem percentage", "5")
+  .option("--max-output-gib <number>", "optional logical output-size cap in GiB")
   .option("--quiet", "suppress aggregate progress messages", false)
   .action(async (inputs: string[], options: {
     output: string;
@@ -130,10 +149,15 @@ mine.command("scan")
     overlapMib: string;
     wholeFileMib: string;
     deepKeySchedules: boolean;
+    workers?: string;
+    minFreeGib: string;
+    minFreePercent: string;
+    maxOutputGib?: string;
     quiet: boolean;
   }) => {
     let lastFiles = 0;
     let lastBytes = 0;
+    let lastDiscovered = 0;
     const controller = new AbortController();
     const interrupt = (): void => controller.abort();
     process.on("SIGINT", interrupt);
@@ -147,9 +171,17 @@ mine.command("scan")
         overlapBytes: mib(options.overlapMib),
         wholeFileBytes: mib(options.wholeFileMib),
         deepKeySchedules: options.deepKeySchedules,
+        ...(options.workers === undefined ? {} : { workers: workers(options.workers) }),
+        minimumFreeGiB: quantity(options.minFreeGib, "minimum free GiB"),
+        minimumFreePercent: quantity(options.minFreePercent, "minimum free percent"),
+        ...(options.maxOutputGib === undefined ? {} : { maximumOutputGiB: quantity(options.maxOutputGib, "maximum output GiB") }),
         signal: controller.signal,
         ...(options.quiet ? {} : {
           progress: (progress) => {
+            if (progress.phase === "inventory" && (progress.filesTotal ?? 0) - lastDiscovered >= 1_000) {
+              process.stderr.write(`inventoryFiles=${progress.filesTotal ?? 0} errors=${progress.scanErrors}\n`);
+              lastDiscovered = progress.filesTotal ?? lastDiscovered;
+            }
             if (progress.filesScanned - lastFiles >= 100 || progress.bytesScanned - lastBytes >= 1024 ** 3) {
               process.stderr.write(`scanned=${progress.filesScanned} bytes=${progress.bytesScanned} findings=${progress.uniqueFindings}\n`);
               lastFiles = progress.filesScanned;
@@ -159,6 +191,60 @@ mine.command("scan")
         }),
       });
       json(result);
+      if (result.status === "paused") process.exitCode = 75;
+    } finally {
+      process.removeListener("SIGINT", interrupt);
+      process.removeListener("SIGTERM", interrupt);
+    }
+  });
+
+mine.command("resume")
+  .description("Resume a cleanly paused mining scan from its verified checkpoint")
+  .requiredOption("-o, --output <directory>", "paused mining output directory")
+  .option("--workers <number>", "detector worker threads (1-4)")
+  .option("--min-free-gib <number>", "override the saved minimum free-space reserve in GiB")
+  .option("--min-free-percent <number>", "override the saved minimum free-space percentage")
+  .option("--max-output-gib <number>", "override the saved logical output-size cap in GiB")
+  .option("--quiet", "suppress aggregate progress messages", false)
+  .action(async (options: {
+    output: string;
+    workers?: string;
+    minFreeGib?: string;
+    minFreePercent?: string;
+    maxOutputGib?: string;
+    quiet: boolean;
+  }) => {
+    let lastFiles = 0;
+    let lastBytes = 0;
+    let lastDiscovered = 0;
+    const controller = new AbortController();
+    const interrupt = (): void => controller.abort();
+    process.on("SIGINT", interrupt);
+    process.on("SIGTERM", interrupt);
+    try {
+      const result = await resumeSensitiveMaterial({
+        output: options.output,
+        ...(options.workers === undefined ? {} : { workers: workers(options.workers) }),
+        ...(options.minFreeGib === undefined ? {} : { minimumFreeGiB: quantity(options.minFreeGib, "minimum free GiB") }),
+        ...(options.minFreePercent === undefined ? {} : { minimumFreePercent: quantity(options.minFreePercent, "minimum free percent") }),
+        ...(options.maxOutputGib === undefined ? {} : { maximumOutputGiB: quantity(options.maxOutputGib, "maximum output GiB") }),
+        signal: controller.signal,
+        ...(options.quiet ? {} : {
+          progress: (progress) => {
+            if (progress.phase === "inventory" && (progress.filesTotal ?? 0) - lastDiscovered >= 1_000) {
+              process.stderr.write(`inventoryFiles=${progress.filesTotal ?? 0} errors=${progress.scanErrors}\n`);
+              lastDiscovered = progress.filesTotal ?? lastDiscovered;
+            }
+            if (progress.filesScanned - lastFiles >= 100 || progress.bytesScanned - lastBytes >= 1024 ** 3) {
+              process.stderr.write(`scanned=${progress.filesScanned} bytes=${progress.bytesScanned} findings=${progress.uniqueFindings}\n`);
+              lastFiles = progress.filesScanned;
+              lastBytes = progress.bytesScanned;
+            }
+          },
+        }),
+      });
+      json(result);
+      if (result.status === "paused") process.exitCode = 75;
     } finally {
       process.removeListener("SIGINT", interrupt);
       process.removeListener("SIGTERM", interrupt);
@@ -173,6 +259,69 @@ mine.command("reveal")
     await new Promise<void>((resolve, reject) => {
       process.stdout.write(value, (error) => error === null || error === undefined ? resolve() : reject(error));
     });
+  });
+
+const cleanup = program.command("cleanup").description("Verify and remove scanned recovery copies while retaining reports and exact findings");
+
+cleanup.command("plan")
+  .description("Build a path-redacted, read-only cleanup plan and approval token")
+  .argument("<mining-outputs...>", "completed error-free mining output directories covering the selected recovered data")
+  .requiredOption("-c, --case <directory>", "completed AARK recovery case directory")
+  .option("--include-evidence", "also plan deletion of the case evidence copy", false)
+  .action(async (miningOutputs: string[], options: { case: string; includeEvidence: boolean }) => {
+    const controller = new AbortController();
+    const interrupt = (): void => controller.abort();
+    process.on("SIGINT", interrupt);
+    process.on("SIGTERM", interrupt);
+    try {
+      json(await planCleanup({
+        caseDirectory: options.case,
+        miningOutputs,
+        includeEvidence: options.includeEvidence,
+        signal: controller.signal,
+      }));
+    } finally {
+      process.removeListener("SIGINT", interrupt);
+      process.removeListener("SIGTERM", interrupt);
+    }
+  });
+
+cleanup.command("run")
+  .description("Execute an unchanged approved cleanup plan; deletion requires explicit confirmations")
+  .argument("<mining-outputs...>", "the same mining output directories supplied to cleanup plan")
+  .requiredOption("-c, --case <directory>", "the same completed AARK recovery case directory")
+  .requiredOption("--approval-token <sha256>", "exact token returned by cleanup plan")
+  .option("--execute", "execution confirmation", false)
+  .option("--confirm-delete-recovered-copy", "confirm irreversible deletion of selected recovered data", false)
+  .option("--include-evidence", "also delete the case evidence copy", false)
+  .option("--confirm-delete-evidence", "separately confirm irreversible evidence-copy deletion", false)
+  .action(async (miningOutputs: string[], options: {
+    case: string;
+    approvalToken: string;
+    execute: boolean;
+    confirmDeleteRecoveredCopy: boolean;
+    includeEvidence: boolean;
+    confirmDeleteEvidence: boolean;
+  }) => {
+    const controller = new AbortController();
+    const interrupt = (): void => controller.abort();
+    process.on("SIGINT", interrupt);
+    process.on("SIGTERM", interrupt);
+    try {
+      json(await runCleanup({
+        caseDirectory: options.case,
+        miningOutputs,
+        approvalToken: options.approvalToken,
+        execute: options.execute,
+        confirmDeleteRecoveredCopy: options.confirmDeleteRecoveredCopy,
+        includeEvidence: options.includeEvidence,
+        confirmDeleteEvidence: options.confirmDeleteEvidence,
+        signal: controller.signal,
+      }));
+    } finally {
+      process.removeListener("SIGINT", interrupt);
+      process.removeListener("SIGTERM", interrupt);
+    }
   });
 
 program.parseAsync(process.argv).catch((error: unknown) => {

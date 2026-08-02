@@ -11,6 +11,8 @@ export interface CommandResult {
   signal: NodeJS.Signals | null;
   stdout: Buffer;
   stderr: Buffer;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
   durationMs: number;
   terminationReason: "abort" | "timeout" | "safety-check" | null;
 }
@@ -36,6 +38,30 @@ const SAFE_TEMPORARY_DIRECTORY = "/tmp";
 interface CommandOutputIdentity {
   device: number;
   inode: number;
+}
+
+function missingProcess(error: unknown): boolean {
+  return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ESRCH";
+}
+
+async function killDetachedProcessGroupAndWait(processGroup: number, timeoutMs: number): Promise<void> {
+  try {
+    process.kill(-processGroup, "SIGKILL");
+  } catch (error) {
+    if (missingProcess(error)) return;
+    throw error;
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 10));
+    try {
+      process.kill(-processGroup, 0);
+    } catch (error) {
+      if (missingProcess(error)) return;
+      throw error;
+    }
+    if (Date.now() >= deadline) throw new Error("detached command descendants did not terminate after SIGKILL");
+  }
 }
 
 async function assertCommandOutputLink(filename: string, identity: CommandOutputIdentity): Promise<void> {
@@ -135,7 +161,7 @@ export async function captureCommand(
     }
     if (options.stdoutFile !== undefined) {
       await ensurePrivateDirectory(dirname(options.stdoutFile));
-      outputHandle = await open(options.stdoutFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+      outputHandle = await open(options.stdoutFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
       outputCreated = true;
       const metadata = await outputHandle.stat();
       outputIdentity = { device: metadata.dev, inode: metadata.ino };
@@ -143,7 +169,7 @@ export async function captureCommand(
     }
     if (options.stderrFile !== undefined) {
       await ensurePrivateDirectory(dirname(options.stderrFile));
-      errorHandle = await open(options.stderrFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+      errorHandle = await open(options.stderrFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
       errorCreated = true;
       const metadata = await errorHandle.stat();
       errorIdentity = { device: metadata.dev, inode: metadata.ino };
@@ -187,10 +213,13 @@ export async function captureCommand(
     const stderr: Buffer[] = [];
     let stdoutBytes = 0;
     let stderrBytes = 0;
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     let timer: NodeJS.Timeout | undefined;
     let killTimer: NodeJS.Timeout | undefined;
     let safetyTimer: NodeJS.Timeout | undefined;
     let safetyCheckPromise: Promise<void> | undefined;
+    let descendantCleanupPromise: Promise<void> | undefined;
     let settled = false;
     let runtimeError: unknown;
     let terminationReason: CommandResult["terminationReason"] = null;
@@ -231,9 +260,10 @@ export async function captureCommand(
         safetyCheckPromise = Promise.resolve()
           .then(async () => options.safetyCheck?.())
           .catch((error: unknown) => {
-            if (settled || terminationReason !== null || runtimeError !== undefined) return;
+            if (runtimeError !== undefined) return;
             runtimeError = new Error("command safety check failed", { cause: error });
-            terminate("safety-check");
+            if (!settled && terminationReason === null) terminate("safety-check");
+            else if (settled && terminationReason === null) terminationReason = "safety-check";
           })
           .finally(() => {
             safetyCheckPromise = undefined;
@@ -247,17 +277,25 @@ export async function captureCommand(
       child.stdin?.on("error", () => undefined);
       child.stdin?.end(options.stdin);
     }
+    const beginDescendantCleanup = (): void => {
+      if (!detached || child.pid === undefined || descendantCleanupPromise !== undefined) return;
+      descendantCleanupPromise = killDetachedProcessGroupAndWait(child.pid, killGraceMs);
+      // The close handler awaits the same promise. Attach a handler immediately
+      // so a fast rejection between exit and close is never unhandled.
+      void descendantCleanupPromise.catch(() => undefined);
+    };
+    child.once("exit", beginDescendantCleanup);
     child.stdout?.on("data", (chunk: Buffer) => {
-      if (stdoutBytes < maxCapture) {
-        stdout.push(chunk.subarray(0, maxCapture - stdoutBytes));
-        stdoutBytes += chunk.length;
-      }
+      const captured = Math.min(chunk.length, Math.max(0, maxCapture - stdoutBytes));
+      if (captured > 0) stdout.push(chunk.subarray(0, captured));
+      stdoutBytes += captured;
+      if (captured < chunk.length) stdoutTruncated = true;
     });
     child.stderr?.on("data", (chunk: Buffer) => {
-      if (stderrBytes < maxCapture) {
-        stderr.push(chunk.subarray(0, maxCapture - stderrBytes));
-        stderrBytes += chunk.length;
-      }
+      const captured = Math.min(chunk.length, Math.max(0, maxCapture - stderrBytes));
+      if (captured > 0) stderr.push(chunk.subarray(0, captured));
+      stderrBytes += captured;
+      if (captured < chunk.length) stderrTruncated = true;
     });
     child.on("error", async (error) => {
       if (settled) return;
@@ -282,10 +320,20 @@ export async function captureCommand(
       if (timer !== undefined) clearTimeout(timer);
       if (killTimer !== undefined) clearTimeout(killTimer);
       if (safetyTimer !== undefined) clearTimeout(safetyTimer);
-      if (terminationReason !== null && detached) signalProcessTree("SIGKILL");
       options.signal?.removeEventListener("abort", abort);
-      await safetyCheckPromise?.catch(() => undefined);
       let persistenceError: unknown;
+      // Recovery commands have no persistent-helper contract. Even after a
+      // normal parent exit, kill and await detached descendants before outputs
+      // are synchronized and accepted so they cannot keep writing behind AARK.
+      if (detached && child.pid !== undefined) {
+        try {
+          beginDescendantCleanup();
+          await descendantCleanupPromise;
+        } catch (error) {
+          persistenceError = error;
+        }
+      }
+      await safetyCheckPromise?.catch(() => undefined);
       const protectedOutputs = [
         ...(outputHandle !== undefined && options.stdoutFile !== undefined && outputIdentity !== undefined
           ? [{ handle: outputHandle, filename: options.stdoutFile, identity: outputIdentity }]
@@ -348,6 +396,8 @@ export async function captureCommand(
         signal,
         stdout: Buffer.concat(stdout),
         stderr: Buffer.concat(stderr),
+        stdoutTruncated,
+        stderrTruncated,
         durationMs: Date.now() - started,
         terminationReason,
       });

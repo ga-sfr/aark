@@ -14,6 +14,7 @@
     "optional",
     "docs",
     "examples",
+    "AGENTS.md",
     "README.md",
     "SECURITY.md",
     "THIRD_PARTY.md"

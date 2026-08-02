@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { lstat, readdir, realpath } from "node:fs/promises";
+import { lstat, opendir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { captureCommand, commandExists } from "../core/command.js";
-import { acquireExclusiveLock, assertNoSymlinkComponents, atomicWriteFile, atomicWriteJson, ensurePrivateDirectory, readJson, safeJoin } from "../core/fs-safe.js";
+import { acquireExclusiveLock, assertNoSymlinkComponents, atomicWriteFile, atomicWriteJson, ensurePrivateDirectory, nearestExistingParent, readDirectoryNamesBounded, readJson, safeJoin } from "../core/fs-safe.js";
+import type { ExclusiveLock } from "../core/fs-safe.js";
 import { filesystemEnforcesUnixModes, mountForPath, mountForPathFrom, mountIsNetworkBacked, mountIsReadOnly, mounts } from "../core/mounts.js";
 import type { MountRecord } from "../core/mounts.js";
 import type { JsonValue } from "../core/types.js";
+import { assertStorageCapacity, directoryLogicalBytes, StorageQuotaError, storagePolicyFromGiB } from "../core/storage.js";
 import type { RecoveryConfig, RecoveryPlan, RecoveryRunStatus, RecoveryStep } from "./types.js";
 import { buildRecoveryPlan } from "./plan.js";
 import { inspectSourceSafety } from "./source-safety.js";
@@ -13,6 +15,56 @@ import type { SourceSafety } from "./source-safety.js";
 import { renderRecoveryRedactedReport, renderRecoverySensitiveReport } from "./report.js";
 
 const PHOTOREC_SWITCHES = new Set(["/log", "/logname", "/d", "/cmd"]);
+const MAX_RECOVERY_OUTPUT_TREE_DEPTH = 256;
+const RECOVERY_LOCK_FILENAME = ".aark-recovery.lock";
+const LEGACY_RECOVERY_LOCK_FILENAME = ".agetnic-recovery.lock";
+const RECOVERY_LOCK_FILENAMES = [RECOVERY_LOCK_FILENAME, LEGACY_RECOVERY_LOCK_FILENAME] as const;
+
+class RecoveryQuotaStop extends Error {
+  public override readonly name = "RecoveryQuotaStop";
+
+  public constructor(public readonly resumable: boolean, cause: unknown) {
+    super(resumable
+      ? "recovery paused at the configured storage boundary; the ddrescue mapfile permits a safe retry"
+      : "recovery stopped at the configured storage boundary; the interrupted engine is not guaranteed resumable", { cause });
+  }
+}
+
+async function acquireRecoveryLocks(directory: string): Promise<ExclusiveLock[]> {
+  const locks: ExclusiveLock[] = [];
+  try {
+    for (const filename of [...RECOVERY_LOCK_FILENAMES].sort()) {
+      locks.push(await acquireExclusiveLock(directory, filename));
+    }
+    return locks;
+  } catch (error) {
+    const releaseErrors: unknown[] = [];
+    for (const lock of [...locks].reverse()) {
+      try { await lock.release(); } catch (releaseError) { releaseErrors.push(releaseError); }
+    }
+    if (releaseErrors.length > 0) {
+      throw new AggregateError([error, ...releaseErrors], "recovery lock acquisition failed and acquired locks could not all be released");
+    }
+    throw error;
+  }
+}
+
+async function releaseRecoveryLocks(locks: ExclusiveLock[]): Promise<void> {
+  const errors: unknown[] = [];
+  for (const lock of [...locks].reverse()) {
+    try { await lock.release(); } catch (error) { errors.push(error); }
+  }
+  if (errors.length > 0) throw new AggregateError(errors, "recovery operation locks could not all be released");
+}
+
+function storageQuota(error: unknown): StorageQuotaError | undefined {
+  let current: unknown = error;
+  for (let depth = 0; depth < 8 && current !== undefined; depth += 1) {
+    if (current instanceof StorageQuotaError) return current;
+    current = current instanceof Error && "cause" in current ? current.cause : undefined;
+  }
+  return undefined;
+}
 
 function redactArg(arg: string, plan: RecoveryPlan): string {
   if (arg === plan.source) return "<SOURCE>";
@@ -47,6 +99,12 @@ export function redactedPlan(plan: RecoveryPlan): Record<string, JsonValue> {
     source: "<SOURCE>",
     analysisSource: "<ANALYSIS_SOURCE>",
     destination: "<CASE_ROOT>",
+    requireReadOnlySource: plan.requireReadOnlySource,
+    storage: {
+      minFreeGiB: plan.storage.minFreeGiB,
+      minFreePercent: plan.storage.minFreePercent,
+      maxOutputGiB: plan.storage.maxOutputGiB ?? null,
+    },
     steps: plan.steps.map((step) => redactedStep(step, plan)),
     warnings: plan.warnings,
   };
@@ -54,7 +112,7 @@ export function redactedPlan(plan: RecoveryPlan): Record<string, JsonValue> {
 
 function inside(root: string, candidate: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 function sameStrings(left: string[], right: string[]): boolean {
@@ -87,6 +145,7 @@ async function assertSourceSafetyCurrent(
   expected: Awaited<ReturnType<typeof inspectSourceSafety>>,
   requireReadOnly: boolean,
   label: string,
+  allowDestinationResident = false,
 ): Promise<void> {
   const current = await inspectSourceSafety(requested, destination);
   if (
@@ -95,13 +154,15 @@ async function assertSourceSafetyCurrent(
     || current.bytes !== expected.bytes
     || !sameStrings(current.sourceTopDevices, expected.sourceTopDevices)
     || !sameStrings(current.destinationDevices, expected.destinationDevices)
+    || current.destinationFilesystemDevice !== expected.destinationFilesystemDevice
     || current.destinationMountSource !== expected.destinationMountSource
     || current.destinationBackingKind !== expected.destinationBackingKind
     || current.destinationBackingKind === "network"
-    || current.destinationOnSourceDevice
+    || (current.destinationOnSourceDevice && !allowDestinationResident)
     || (current.kind === "block-device" && !current.deviceComparisonCertain)
     || (requireReadOnly && current.kind === "block-device" && (!current.kernelReadOnly || current.writableMounts.length > 0))
     || JSON.stringify(current.regularFileIdentity) !== JSON.stringify(expected.regularFileIdentity)
+    || JSON.stringify(current.blockDeviceIdentity) !== JSON.stringify(expected.blockDeviceIdentity)
   ) throw new Error(`${label} or destination safety state changed after preflight`);
 }
 
@@ -118,19 +179,80 @@ function expectedOutputKind(step: RecoveryStep, output: string): "file" | "direc
   return (step.stdoutFile !== undefined && output === path.resolve(step.stdoutFile)) || step.id.startsWith("image-") ? "file" : "directory";
 }
 
+async function directoryIsEmpty(directory: string): Promise<boolean> {
+  const handle = await opendir(directory);
+  try {
+    return await handle.read() === null;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+function matchesPlanWithDefaultStorage(stored: unknown, current: RecoveryPlan | Record<string, JsonValue>): boolean {
+  if (JSON.stringify(stored) === JSON.stringify(current)) return true;
+  const storage = "storage" in current ? current.storage : undefined;
+  if (
+    typeof storage !== "object"
+    || storage === null
+    || Array.isArray(storage)
+    || (storage as Record<string, unknown>).minFreeGiB !== 5
+    || (storage as Record<string, unknown>).minFreePercent !== 5
+    || ((storage as Record<string, unknown>).maxOutputGiB !== undefined && (storage as Record<string, unknown>).maxOutputGiB !== null)
+  ) return false;
+  const legacy = { ...current } as Record<string, unknown>;
+  delete legacy.storage;
+  return JSON.stringify(stored) === JSON.stringify(legacy);
+}
+
+function matchesPlanIgnoringStorage(stored: unknown, current: RecoveryPlan | Record<string, JsonValue>): boolean {
+  if (typeof stored !== "object" || stored === null || Array.isArray(stored)) return false;
+  const storedWithoutStorage = { ...(stored as Record<string, unknown>) };
+  const currentWithoutStorage = { ...current } as Record<string, unknown>;
+  delete storedWithoutStorage.storage;
+  delete currentWithoutStorage.storage;
+  return JSON.stringify(storedWithoutStorage) === JSON.stringify(currentWithoutStorage);
+}
+
 type RecoveryOutputSnapshot =
   | { kind: "missing" }
-  | { kind: "file"; device: number; inode: number; size: number; modifiedMs: number }
-  | { kind: "directory"; entries: Set<string> }
+  | { kind: "file"; device: number; inode: number; size: number; modifiedMs: number; changedMs: number }
+  | { kind: "directory"; hasRegularFile: boolean }
   | { kind: "other" };
 
-async function recoveryOutputSnapshot(output: string): Promise<RecoveryOutputSnapshot> {
+async function containsRegularFile(
+  root: string,
+  signal?: AbortSignal,
+  ancestors = new Set<string>(),
+  depth = 0,
+): Promise<boolean> {
+  if (signal?.aborted === true) throw new Error("recovery output verification was interrupted");
+  if (depth > MAX_RECOVERY_OUTPUT_TREE_DEPTH) throw new Error("recovery output exceeds the bounded directory-depth limit");
+  const currentMetadata = await lstat(root);
+  if (currentMetadata.isSymbolicLink()) return false;
+  if (currentMetadata.isFile()) return true;
+  if (!currentMetadata.isDirectory()) return false;
+  const key = `${currentMetadata.dev}:${currentMetadata.ino}`;
+  if (ancestors.has(key)) throw new Error("recovery output contains a recursive directory identity");
+  ancestors.add(key);
+  try {
+    const directory = await opendir(root);
+    for await (const entry of directory) {
+      if (Boolean(signal?.aborted)) throw new Error("recovery output verification was interrupted");
+      if (await containsRegularFile(path.join(root, entry.name), signal, ancestors, depth + 1)) return true;
+    }
+    return false;
+  } finally {
+    ancestors.delete(key);
+  }
+}
+
+async function recoveryOutputSnapshot(output: string, signal?: AbortSignal): Promise<RecoveryOutputSnapshot> {
   try {
     const metadata = await lstat(output);
     if (metadata.isFile()) {
-      return { kind: "file", device: metadata.dev, inode: metadata.ino, size: metadata.size, modifiedMs: metadata.mtimeMs };
+      return { kind: "file", device: metadata.dev, inode: metadata.ino, size: metadata.size, modifiedMs: metadata.mtimeMs, changedMs: metadata.ctimeMs };
     }
-    if (metadata.isDirectory()) return { kind: "directory", entries: new Set(await readdir(output)) };
+    if (metadata.isDirectory()) return { kind: "directory", hasRegularFile: await containsRegularFile(output, signal) };
     return { kind: "other" };
   } catch (error) {
     const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
@@ -139,18 +261,18 @@ async function recoveryOutputSnapshot(output: string): Promise<RecoveryOutputSna
   }
 }
 
-async function snapshotRecoveryOutputs(step: RecoveryStep): Promise<Map<string, RecoveryOutputSnapshot>> {
+async function snapshotRecoveryOutputs(step: RecoveryStep, signal?: AbortSignal): Promise<Map<string, RecoveryOutputSnapshot>> {
   const snapshots = new Map<string, RecoveryOutputSnapshot>();
   for (const output of new Set(step.outputs.map((value) => path.resolve(value)))) {
-    snapshots.set(output, await recoveryOutputSnapshot(output));
+    snapshots.set(output, await recoveryOutputSnapshot(output, signal));
   }
   return snapshots;
 }
 
-async function stepProducedNewOutput(step: RecoveryStep, before: Map<string, RecoveryOutputSnapshot>): Promise<boolean> {
+async function stepProducedNewOutput(step: RecoveryStep, before: Map<string, RecoveryOutputSnapshot>, signal?: AbortSignal): Promise<boolean> {
   for (const output of new Set(step.outputs.map((value) => path.resolve(value)))) {
     const prior = before.get(output) ?? { kind: "missing" };
-    const current = await recoveryOutputSnapshot(output);
+    const current = await recoveryOutputSnapshot(output, signal);
     if (current.kind === "file") {
       if (
         prior.kind !== "file"
@@ -158,15 +280,11 @@ async function stepProducedNewOutput(step: RecoveryStep, before: Map<string, Rec
         || prior.inode !== current.inode
         || prior.size !== current.size
         || prior.modifiedMs !== current.modifiedMs
+        || prior.changedMs !== current.changedMs
       ) return true;
     }
     if (current.kind === "directory") {
-      const priorEntries = prior.kind === "directory" ? prior.entries : new Set<string>();
-      for (const entry of current.entries) {
-        if (priorEntries.has(entry)) continue;
-        const metadata = await lstat(path.join(output, entry));
-        if (!metadata.isSymbolicLink() && metadata.isFile()) return true;
-      }
+      if (current.hasRegularFile && (prior.kind !== "directory" || !prior.hasRegularFile)) return true;
     }
   }
   return false;
@@ -187,6 +305,7 @@ async function assertStepOutputsSafe(
   sourceSafety: SourceSafety,
   analysisSafety: SourceSafety | undefined,
   requireExists: boolean,
+  requireEmptyDirectories = false,
 ): Promise<void> {
   const seenFiles = new Map<string, string>();
   const protectedFiles = [sourceSafety.regularFileIdentity, analysisSafety?.regularFileIdentity]
@@ -205,6 +324,9 @@ async function assertStepOutputsSafe(
     const kind = expectedOutputKind(step, output);
     if (kind === "file" && !metadata.isFile()) throw new Error(`recovery stage ${step.id} requires a regular-file output`);
     if (kind === "directory" && !metadata.isDirectory()) throw new Error(`recovery stage ${step.id} requires a directory output`);
+    if (kind === "directory" && requireEmptyDirectories && !(await directoryIsEmpty(output))) {
+      throw new Error(`recovery stage ${step.id} directory output must be empty before execution`);
+    }
     if (!metadata.isFile()) continue;
     if (metadata.nlink !== 1) throw new Error(`recovery stage ${step.id} file output must not have hard-link aliases`);
     if (protectedFiles.some((identity) => identity.device === metadata.dev && identity.inode === metadata.ino)) {
@@ -261,32 +383,46 @@ async function validateCaseDestination(destination: string, plan: RecoveryPlan, 
   if (mounted !== undefined && path.resolve(mounted.target) === path.resolve(resolved)) {
     throw new Error("destination must be a case subdirectory, not a filesystem mount root");
   }
-  const entries = await readdir(destination);
-  const hasLock = entries.includes(".agetnic-recovery.lock");
-  if (lockHeld && !hasLock) throw new Error("the held recovery lock disappeared during destination validation");
-  if (!lockHeld && hasLock) {
+  const entries = await readDirectoryNamesBounded(destination, 64);
+  const lockEntries = entries.filter((entry) => RECOVERY_LOCK_FILENAMES.includes(entry as typeof RECOVERY_LOCK_FILENAMES[number]));
+  if (lockHeld && (
+    lockEntries.length !== RECOVERY_LOCK_FILENAMES.length
+    || RECOVERY_LOCK_FILENAMES.some((filename) => !lockEntries.includes(filename))
+  )) throw new Error("a held recovery compatibility lock disappeared or conflicted during destination validation");
+  if (!lockHeld && lockEntries.length > 0) {
     throw new Error("the recovery case has an exclusive lock; another process may be active or a prior process may have stopped abruptly");
   }
-  const caseEntries = entries.filter((entry) => entry !== ".agetnic-recovery.lock");
+  const caseEntries = entries.filter((entry) => entry !== RECOVERY_LOCK_FILENAME && entry !== LEGACY_RECOVERY_LOCK_FILENAME);
   if (caseEntries.length > 0) {
     if (!entries.includes("case-sensitive.json") || !entries.includes("plan-redacted.json")) {
       throw new Error("existing non-empty destination is not a fully initialized AARK recovery case");
     }
     for (const filename of ["case-sensitive.json", "plan-redacted.json"]) {
       const marker = await lstat(safeJoin(destination, filename));
-      if (marker.isSymbolicLink() || !marker.isFile()) throw new Error("existing recovery case markers must be regular, non-symbolic-link files");
+      if (marker.isSymbolicLink() || !marker.isFile() || marker.nlink !== 1) throw new Error("existing recovery case markers must be single-link regular, non-symbolic-link files");
     }
-    const state = await readJson<{ status?: unknown; plan?: unknown }>(safeJoin(destination, "case-sensitive.json"));
+    const state = await readJson<{ status?: unknown; plan?: unknown; results?: unknown }>(safeJoin(destination, "case-sensitive.json"));
     if (state.status === "running") throw new Error("existing recovery state is still marked running; inspect the case before attempting another run");
-    if (!["complete", "complete-with-warnings", "failed", "interrupted"].includes(String(state.status))) {
+    if (!["paused", "complete", "complete-with-warnings", "failed", "interrupted"].includes(String(state.status))) {
       throw new Error("existing recovery state does not contain a recognized terminal status");
     }
-    if (JSON.stringify(state.plan) !== JSON.stringify(plan)) {
+    const lastResult = Array.isArray(state.results) ? state.results.at(-1) : undefined;
+    const quotaResume = state.status === "paused"
+      && typeof lastResult === "object"
+      && lastResult !== null
+      && !Array.isArray(lastResult)
+      && (lastResult as Record<string, unknown>).status === "paused-disk-quota-resumable"
+      && (lastResult as Record<string, unknown>).executable === "ddrescue";
+    if (!matchesPlanWithDefaultStorage(state.plan, plan) && !(quotaResume && matchesPlanIgnoringStorage(state.plan, plan))) {
       throw new Error("existing recovery case belongs to a different source, destination, case ID, or plan");
     }
     const storedRedactedPlan = await readJson<unknown>(safeJoin(destination, "plan-redacted.json"));
-    if (JSON.stringify(storedRedactedPlan) !== JSON.stringify(redactedPlan(plan))) {
+    const currentRedactedPlan = redactedPlan(plan);
+    if (!matchesPlanWithDefaultStorage(storedRedactedPlan, currentRedactedPlan) && !(quotaResume && matchesPlanIgnoringStorage(storedRedactedPlan, currentRedactedPlan))) {
       throw new Error("existing recovery case has a mismatched or corrupted redacted plan marker");
+    }
+    if (!quotaResume) {
+      throw new Error("an existing recovery case can only be reused for its explicitly resumable ddrescue quota pause; choose a new destination for another run");
     }
   }
 }
@@ -302,6 +438,8 @@ export async function runRecoveryPlan(
   if (JSON.stringify(plan) !== JSON.stringify(canonicalPlan)) {
     throw new Error("refusing to execute a recovery plan that does not exactly match the supplied configuration");
   }
+  const storagePolicy = storagePolicyFromGiB(plan.storage.minFreeGiB, plan.storage.minFreePercent, plan.storage.maxOutputGiB);
+  await assertStorageCapacity(await nearestExistingParent(plan.destination), storagePolicy);
   const safety = await inspectSourceSafety(config.source, plan.destination);
   if (inside(plan.destination, safety.resolvedSource)) {
     throw new Error("the canonical recovery source must not be stored inside its case destination");
@@ -317,6 +455,8 @@ export async function runRecoveryPlan(
   }
   const analysisGeneratedByPlan = config.image.enabled
     && path.resolve(plan.analysisSource) === path.resolve(config.image.path);
+  const evidenceRoot = path.join(plan.destination, "evidence");
+  let analysisDestinationResident = analysisGeneratedByPlan;
   let analysisSafety: Awaited<ReturnType<typeof inspectSourceSafety>> | undefined;
   if (
     config.analysisSource !== undefined
@@ -324,13 +464,13 @@ export async function runRecoveryPlan(
     && !analysisGeneratedByPlan
   ) {
     analysisSafety = await inspectSourceSafety(config.analysisSource, plan.destination);
-    const evidenceRoot = path.join(plan.destination, "evidence");
-    if (inside(plan.destination, analysisSafety.resolvedSource) && !inside(evidenceRoot, analysisSafety.resolvedSource)) {
+    analysisDestinationResident = inside(evidenceRoot, analysisSafety.resolvedSource);
+    if (inside(plan.destination, analysisSafety.resolvedSource) && !analysisDestinationResident) {
       throw new Error("the canonical case-local analysisSource escaped its reserved evidence directory");
     }
     if (analysisSafety.destinationMountSource === null) throw new Error("could not determine the mount backing the recovery destination");
     if (analysisSafety.destinationBackingKind === "network") throw new Error("network-mounted recovery destinations are not allowed");
-    if (analysisSafety.destinationOnSourceDevice) throw new Error("destination is on the analysis-source device");
+    if (analysisSafety.destinationOnSourceDevice && !analysisDestinationResident) throw new Error("destination is on the analysis-source device");
     if (analysisSafety.kind === "block-device" && !analysisSafety.deviceComparisonCertain) {
       throw new Error("could not prove that the destination is independent of the analysis-source device");
     }
@@ -358,7 +498,7 @@ export async function runRecoveryPlan(
       await assertNoSymlinkComponents(plan.destination, output);
     }
   }
-  const lock = await acquireExclusiveLock(plan.destination, ".agetnic-recovery.lock");
+  const locks = await acquireRecoveryLocks(plan.destination);
   let runFailure: unknown;
   try {
   await validateCaseDestination(plan.destination, plan, true);
@@ -373,7 +513,7 @@ export async function runRecoveryPlan(
   }
   const destinationMountIdentity = mountIdentity(targetMount);
   const assertDestinationControlCurrent = async (): Promise<void> => {
-    await lock.assertHeld();
+    for (const lock of locks) await lock.assertHeld();
     const currentMetadata = await lstat(plan.destination);
     const currentCanonical = await realpath(plan.destination);
     const currentMounts = await mounts();
@@ -392,6 +532,16 @@ export async function runRecoveryPlan(
       || mountIdentity(currentMount) !== destinationMountIdentity
       || nestedMount
     ) throw new Error("recovery destination, mount, or exclusive lock changed during execution");
+  };
+  const assertRecoveryCapacity = async (): Promise<void> => {
+    // Check free space before and after the potentially long logical-size walk,
+    // so a very large recovery tree cannot delay reserve enforcement until the
+    // walk has finished.
+    await assertStorageCapacity(plan.destination, storagePolicy);
+    if (storagePolicy.maximumOutputBytes !== undefined) {
+      const outputBytes = await directoryLogicalBytes(plan.destination, signal);
+      await assertStorageCapacity(plan.destination, storagePolicy, outputBytes);
+    }
   };
   const permissionsEnforced = filesystemEnforcesUnixModes(targetMount);
   const startedAt = new Date().toISOString();
@@ -426,6 +576,7 @@ export async function runRecoveryPlan(
     await writeCaseJson(runStatePath, sensitiveRun);
     await writeCaseJson(safeJoin(plan.destination, "case-sensitive.json"), sensitiveRun);
   };
+  await assertRecoveryCapacity();
   const renderedPlan = redactedPlan(plan);
   await writeCaseJson(safeJoin(plan.destination, "runs", `${runId}-plan-redacted.json`), renderedPlan, 0o644);
   await writeCaseJson(safeJoin(plan.destination, "plan-redacted.json"), renderedPlan, 0o644);
@@ -496,7 +647,7 @@ export async function runRecoveryPlan(
       }
       if (!recoveryStep.id.startsWith("image-") && path.resolve(plan.analysisSource) !== path.resolve(plan.source)) {
         analysisSafety ??= await inspectSourceSafety(plan.analysisSource, plan.destination);
-        await assertSourceSafetyCurrent(plan.analysisSource, plan.destination, analysisSafety, config.requireReadOnlySource, "analysisSource");
+        await assertSourceSafetyCurrent(plan.analysisSource, plan.destination, analysisSafety, config.requireReadOnlySource, "analysisSource", analysisDestinationResident);
       }
       const stderrLog = safeJoin(plan.destination, "logs", runId, `${recoveryStep.id}.stderr-sensitive.log`);
       const stdoutLog = recoveryStep.stdoutFile === undefined
@@ -506,7 +657,8 @@ export async function runRecoveryPlan(
       sensitiveRun.currentStep = recoveryStep.id;
       await persistState();
       try {
-        await assertStepOutputsSafe(recoveryStep, safety, analysisSafety, false);
+        await assertRecoveryCapacity();
+        await assertStepOutputsSafe(recoveryStep, safety, analysisSafety, false, true);
         for (const directory of recoveryStep.createsDirectories) await ensurePrivateDirectory(directory);
         if (!(await commandExists(recoveryStep.executable))) {
           const status = recoveryStep.optional ? "skipped-missing-optional-tool" : "failed-missing-required-tool";
@@ -520,7 +672,7 @@ export async function runRecoveryPlan(
         }
         const outputSnapshot = recoveryStep.partialSuccessExitCodes === undefined
           ? undefined
-          : await snapshotRecoveryOutputs(recoveryStep);
+          : await snapshotRecoveryOutputs(recoveryStep, signal);
         const commandStdout = recoveryStep.stdoutFile ?? stdoutLog;
         if (commandStdout === undefined) throw new Error("recovery step has no safe stdout destination");
         await assertNoSymlinkComponents(plan.destination, stderrLog);
@@ -549,20 +701,41 @@ export async function runRecoveryPlan(
             executionArgs.push(argument);
           }
         }
+        let lastExtendedSafetyCheck = Date.now();
         const completed = await captureCommand(recoveryStep.executable, executionArgs, {
           stdoutFile: commandStdout,
           cwd: recoveryStep.workingDirectory ?? path.dirname(stderrLog),
           stderrFile: stderrLog,
           temporaryDirectory,
           ...(signal === undefined ? {} : { signal }),
-          safetyCheck: assertDestinationControlCurrent,
-          safetyCheckIntervalMs: 5_000,
+          safetyCheck: async () => {
+            await assertDestinationControlCurrent();
+            await assertRecoveryCapacity();
+            const now = Date.now();
+            if (now - lastExtendedSafetyCheck >= 5_000) {
+              lastExtendedSafetyCheck = now;
+              await assertSourceSafetyCurrent(config.source, plan.destination, safety, config.requireReadOnlySource, "source");
+              if (analysisSafety !== undefined) {
+                await assertSourceSafetyCurrent(plan.analysisSource, plan.destination, analysisSafety, config.requireReadOnlySource, "analysisSource", analysisDestinationResident);
+              }
+              if (config.mountedReadOnlyRoot !== undefined && mountedReadOnlyRoot !== undefined) {
+                if (await validateMountedReadOnlyRoot(config.mountedReadOnlyRoot) !== mountedReadOnlyRoot) {
+                  throw new Error("mountedReadOnlyRoot canonical path changed during a recovery stage");
+                }
+                if (
+                  mountedExecutionInput !== undefined
+                  && await validateMountedReadOnlyInput(mountedReadOnlyRoot, mountedExecutionInput) !== mountedExecutionInput
+                ) throw new Error("mounted recovery input changed during a recovery stage");
+              }
+            }
+          },
+          safetyCheckIntervalMs: 1_000,
           maxCaptureBytes: 64 * 1024,
         });
         await assertDestinationControlCurrent();
         await assertSourceSafetyCurrent(config.source, plan.destination, safety, config.requireReadOnlySource, "source");
         if (analysisSafety !== undefined) {
-          await assertSourceSafetyCurrent(plan.analysisSource, plan.destination, analysisSafety, config.requireReadOnlySource, "analysisSource");
+          await assertSourceSafetyCurrent(plan.analysisSource, plan.destination, analysisSafety, config.requireReadOnlySource, "analysisSource", analysisDestinationResident);
         }
         if (config.mountedReadOnlyRoot !== undefined && mountedReadOnlyRoot !== undefined) {
           if (await validateMountedReadOnlyRoot(config.mountedReadOnlyRoot) !== mountedReadOnlyRoot) {
@@ -573,17 +746,22 @@ export async function runRecoveryPlan(
             && await validateMountedReadOnlyInput(mountedReadOnlyRoot, mountedExecutionInput) !== mountedExecutionInput
           ) throw new Error("mounted recovery input changed during a recovery stage");
         }
-        const producedNewOutput = completed.exitCode !== 0 && outputSnapshot !== undefined
-          ? await stepProducedNewOutput(recoveryStep, outputSnapshot)
+        await assertRecoveryCapacity();
+        const effectiveTermination = completed.terminationReason ?? (Boolean(signal?.aborted) ? "abort" : null);
+        const producedNewOutput = effectiveTermination === null && completed.exitCode !== 0 && outputSnapshot !== undefined
+          ? await stepProducedNewOutput(recoveryStep, outputSnapshot, signal)
           : false;
-        const stepStatus = recoveryStepStatus(recoveryStep, completed.exitCode, producedNewOutput);
-        if (stepStatus !== "failed") await assertStepOutputsSafe(recoveryStep, safety, analysisSafety, true);
+        const stepStatus = effectiveTermination === null
+          ? recoveryStepStatus(recoveryStep, completed.exitCode, producedNewOutput)
+          : effectiveTermination === "abort" ? "interrupted-before-completion" : "failed-before-completion";
+        const completedOutput = stepStatus === "completed" || stepStatus === "completed-with-warnings";
+        await assertStepOutputsSafe(recoveryStep, safety, analysisSafety, completedOutput);
         sensitiveRun.results.push({
           id: recoveryStep.id,
           status: stepStatus,
           exitCode: completed.exitCode,
           signal: completed.signal,
-          terminationReason: completed.terminationReason,
+          terminationReason: effectiveTermination,
           durationMs: completed.durationMs,
           executable: recoveryStep.executable,
           args: executionArgs,
@@ -595,13 +773,34 @@ export async function runRecoveryPlan(
           status: stepStatus,
           exitCode: completed.exitCode,
           signal: completed.signal,
-          terminationReason: completed.terminationReason,
+          terminationReason: effectiveTermination,
           durationMs: completed.durationMs,
         });
         sensitiveRun.currentStep = null;
         await persistState();
+        if (effectiveTermination !== null) {
+          throw new Error(effectiveTermination === "abort" ? "recovery interrupted" : `recovery step terminated before completion: ${recoveryStep.id}`);
+        }
         if (stepStatus === "failed" && !recoveryStep.optional) throw new Error(`recovery step failed: ${recoveryStep.id}`);
       } catch (error) {
+        const quota = storageQuota(error);
+        if (quota !== undefined && !sensitiveRun.results.some((result) => result.id === recoveryStep.id)) {
+          const resumable = recoveryStep.executable === "ddrescue";
+          const status = resumable ? "paused-disk-quota-resumable" : "failed-disk-quota";
+          sensitiveRun.results.push({
+            id: recoveryStep.id,
+            status,
+            error: sensitiveErrorDetail(error),
+            executable: recoveryStep.executable,
+            args: recoveryStep.args,
+            ...(stdoutLog === undefined ? {} : { stdoutLog }),
+            stderrLog,
+          });
+          redactedResults.push({ id: recoveryStep.id, status });
+          sensitiveRun.currentStep = null;
+          await persistState();
+          throw new RecoveryQuotaStop(resumable, quota);
+        }
         if (!sensitiveRun.results.some((result) => result.id === recoveryStep.id)) {
           sensitiveRun.results.push({
             id: recoveryStep.id,
@@ -622,9 +821,12 @@ export async function runRecoveryPlan(
     if (signal?.aborted === true) throw new Error("recovery interrupted");
     await assertSourceSafetyCurrent(config.source, plan.destination, safety, config.requireReadOnlySource, "source");
     if (analysisSafety !== undefined) {
-      await assertSourceSafetyCurrent(plan.analysisSource, plan.destination, analysisSafety, config.requireReadOnlySource, "analysisSource");
+      await assertSourceSafetyCurrent(plan.analysisSource, plan.destination, analysisSafety, config.requireReadOnlySource, "analysisSource", analysisDestinationResident);
     }
   } catch (error) {
+    if (error instanceof RecoveryQuotaStop && error.resumable) {
+      return await finalize("paused", error);
+    }
     const status: RecoveryRunStatus = signal?.aborted === true ? "interrupted" : "failed";
     try {
       await finalize(status, error);
@@ -649,9 +851,9 @@ export async function runRecoveryPlan(
     throw error;
   } finally {
     try {
-      await lock.release();
+      await releaseRecoveryLocks(locks);
     } catch (releaseError) {
-      if (runFailure !== undefined) throw new AggregateError([runFailure, releaseError], "recovery failed and its exclusive case lock could not be released");
+      if (runFailure !== undefined) throw new AggregateError([runFailure, releaseError], "recovery failed and its exclusive case locks could not be released");
       throw releaseError;
     }
   }
