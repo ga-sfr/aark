@@ -53,9 +53,8 @@ Checkpoints are written every 25 visited files or 60 seconds and again for every
 completed recovery case + one or more completed mining outputs
   -> recovery state/final-manifest and per-run retained-copy cross-check
   -> mining state/inventory checkpoint and artifact-hash verification
-  -> exact live re-walk of every frozen mining input
-  -> union coverage proof for every selected recovery/evidence file
-  -> finding source-file retention set
+  -> finding source-file index + exact selected-target snapshot and union coverage proof
+  -> final exact live re-walk of every frozen mining input
   -> path-redacted aggregate deletion/retention plan + state/control/report-bound approval token
   -> fresh end-user decision
   -> explicit token + recovered-copy confirmation (+ separate evidence confirmation)
@@ -66,7 +65,7 @@ completed recovery case + one or more completed mining outputs
   -> complete or partial-failure cleanup reports
 ```
 
-Planning is read-only. It rejects any mining result other than exact error-free `complete`, any changed input or artifact, incomplete recovery-stage accounting, incomplete coverage, retained-output overlap, active lock, network backing, mount root, nested mount, or unfinished cleanup quarantine. Execution recomputes the same token while holding both current and legacy recovery/mining locks and refuses a stale authorization before deletion. Each fixed target is atomically moved to an unpredictable case-local quarantine and re-enumerated; source retention and recursive removal start only when its inode, bounded digest of every nested directory/file/link/special entry, aggregate entry count, regular-file count, logical size, and finding-source set still match the approved plan. Every complete finding-containing source file is moved into `retained-sensitive-source-files/<APPROVAL_TOKEN>/`; only then is the remainder removed. `recovery/`, `logs/`, and `runs/` are selected by default; `evidence/` requires a separate opt-in and confirmation. Root final reports and manifests plus full mining outputs also remain. The cleanup reports make interrupted or failed partial retention/deletion explicit, but filesystem deletion is irreversible and is not secure erasure.
+Planning is read-only. It rejects any mining result other than exact error-free `complete`, any changed input or artifact, incomplete recovery-stage accounting, incomplete coverage, retained-output overlap with a deletion target or the reserved retained-source namespace, active lock, network backing, mount root, nested mount, or unfinished cleanup quarantine. Execution recomputes the same token while holding both current and legacy recovery/mining locks and refuses a stale authorization before deletion; the token also binds the existing retained-source directory identity or its absence. Each fixed target is atomically moved to an unpredictable case-local quarantine and re-enumerated; source retention and recursive removal start only when its inode, bounded digest of every nested directory/file/link/special entry, aggregate entry count, regular-file count, logical size, and finding-source set still match the approved plan. Every complete finding-containing source file is moved into `retained-sensitive-source-files/<APPROVAL_TOKEN>/`; only then is the remainder removed. `recovery/`, `logs/`, and `runs/` are selected by default; `evidence/` requires a separate opt-in and confirmation. Root final reports and manifests plus full mining outputs also remain. The cleanup reports make interrupted or failed partial retention/deletion explicit, but filesystem deletion is irreversible and is not secure erasure.
 
 ## Important edge cases
 

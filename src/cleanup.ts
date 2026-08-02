@@ -108,6 +108,12 @@ interface RootSnapshot {
   mount: string;
 }
 
+interface DirectoryIdentity {
+  path: string;
+  device: number;
+  inode: number;
+}
+
 interface TargetSnapshot {
   name: "recovery" | "evidence" | "logs" | "runs";
   path: string;
@@ -151,6 +157,11 @@ interface CoverageIndex {
   directories: Set<string>;
 }
 
+interface FindingSourceIndex {
+  paths: Set<string>;
+  entryIdentities: Set<string>;
+}
+
 interface VerifiedRecoveryCase {
   status: "complete" | "complete-with-warnings";
   runId: string;
@@ -172,10 +183,11 @@ interface RecoveryCaseState {
 interface InternalCleanupPlan {
   public: CleanupPlanResult;
   caseRoot: RootSnapshot;
+  retainedSourceBase: RootSnapshot | undefined;
   recovery: VerifiedRecoveryCase;
   mining: VerifiedMiningOutput[];
   coverage: CoverageIndex;
-  findingSourceFiles: Set<string>;
+  findingSources: FindingSourceIndex;
   targets: TargetSnapshot[];
   introducedLocks: Set<string>;
 }
@@ -400,17 +412,65 @@ function retainedSourceRunRoot(caseRoot: string, approvalToken: string): string 
   return safeJoin(caseRoot, RETAINED_SOURCE_DIRECTORY, approvalToken);
 }
 
-async function assertRetainedSourceDestinationAvailable(caseRoot: RootSnapshot, approvalToken: string): Promise<void> {
+function sameRootSnapshot(left: RootSnapshot, right: RootSnapshot): boolean {
+  return left.path === right.path
+    && left.device === right.device
+    && left.inode === right.inode
+    && left.mount === right.mount;
+}
+
+async function directoryContainsIdentity(ancestor: DirectoryIdentity, candidate: DirectoryIdentity): Promise<boolean> {
+  let cursor = path.resolve(candidate.path);
+  while (true) {
+    const metadata = await lstat(cursor);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new Error("a protected cleanup directory ancestry changed during overlap verification");
+    }
+    if (metadata.dev === ancestor.device && metadata.ino === ancestor.inode) return true;
+    const parent = path.dirname(cursor);
+    if (parent === cursor) return false;
+    cursor = parent;
+  }
+}
+
+async function directoryTreesOverlap(left: DirectoryIdentity, right: DirectoryIdentity): Promise<boolean> {
+  return await directoryContainsIdentity(left, right) || await directoryContainsIdentity(right, left);
+}
+
+async function retainedSourceBaseSnapshot(caseRoot: RootSnapshot): Promise<RootSnapshot | undefined> {
   const base = safeJoin(caseRoot.path, RETAINED_SOURCE_DIRECTORY);
   await assertNoSymlinkComponents(caseRoot.path, base);
-  if (await pathExists(base)) {
-    const records = await mounts();
-    const existing = await rootSnapshot(base, records, new Map<string, Promise<boolean>>(), "retained source-file directory");
-    if (existing.mount !== caseRoot.mount) throw new Error("retained source-file directory must remain on the recovery case filesystem");
+  if (!await pathExists(base)) return undefined;
+  const records = await mounts();
+  const existing = await rootSnapshot(base, records, new Map<string, Promise<boolean>>(), "retained source-file directory");
+  if (existing.mount !== caseRoot.mount) {
+    throw new Error("retained source-file directory must remain on the recovery case filesystem");
   }
+  return existing;
+}
+
+async function assertRetainedSourceDestinationAvailable(
+  caseRoot: RootSnapshot,
+  expectedBase: RootSnapshot | undefined,
+  approvalToken: string,
+): Promise<void> {
+  await assertRootCurrent(caseRoot);
+  const currentBase = await retainedSourceBaseSnapshot(caseRoot);
+  if (
+    (expectedBase === undefined) !== (currentBase === undefined)
+    || (expectedBase !== undefined && currentBase !== undefined && !sameRootSnapshot(expectedBase, currentBase))
+  ) throw new Error("the retained source-file directory changed after cleanup approval");
   const runRoot = retainedSourceRunRoot(caseRoot.path, approvalToken);
   await assertNoSymlinkComponents(caseRoot.path, runRoot);
   if (await pathExists(runRoot)) throw new Error("the approved retained source-file destination already exists");
+  await assertRootCurrent(caseRoot);
+  if (expectedBase === undefined) {
+    if (await retainedSourceBaseSnapshot(caseRoot) !== undefined) {
+      throw new Error("the retained source-file directory changed after cleanup approval");
+    }
+  } else {
+    await assertRootCurrent(expectedBase);
+  }
 }
 
 function recoveryPlanRecord(value: unknown): Record<string, unknown> {
@@ -528,6 +588,36 @@ function buildCoverageIndex(roots: ScanState["inputRoots"]): CoverageIndex {
   const directories = new Set<string>();
   for (const root of roots) (root.kind === "file" ? files : directories).add(root.path);
   return { files, directories };
+}
+
+function entryIdentity(
+  parentDevice: number,
+  parentInode: number,
+  device: number,
+  inode: number,
+): string {
+  return JSON.stringify([parentDevice, parentInode, device, inode]);
+}
+
+async function buildFindingSourceIndex(sourceFiles: string[], signal?: AbortSignal): Promise<FindingSourceIndex> {
+  const paths = new Set(sourceFiles);
+  const entryIdentities = new Set<string>();
+  for (const source of paths) {
+    interrupted(signal);
+    const metadata = await lstat(source);
+    const parent = await lstat(path.dirname(source));
+    assertBoundedEntryMetadata(metadata);
+    assertBoundedEntryMetadata(parent);
+    if (
+      metadata.isSymbolicLink()
+      || !metadata.isFile()
+      || parent.isSymbolicLink()
+      || !parent.isDirectory()
+      || await realpath(source) !== source
+    ) throw new Error("a finding source is no longer a canonical regular file");
+    entryIdentities.add(entryIdentity(parent.dev, parent.ino, metadata.dev, metadata.ino));
+  }
+  return { paths, entryIdentities };
 }
 
 function indexedFileIsAuthorized(filename: string, coverage: CoverageIndex): boolean {
@@ -671,7 +761,6 @@ async function verifyLiveManifest(state: ScanState, output: string, ignoredPaths
 
 async function verifyMiningOutput(
   root: RootSnapshot,
-  introducedLocks: Set<string>,
   signal?: AbortSignal,
 ): Promise<VerifiedMiningOutput> {
   interrupted(signal);
@@ -687,7 +776,6 @@ async function verifyMiningOutput(
   const inventory = await loadCompletedInventory(root.path, state.inventory, signal);
   assertCompletedInventoryMatchesState(inventory, state);
   await verifyResumeArtifacts(root.path, inventory, signal);
-  await verifyLiveManifest(state, root.path, introducedLocks, signal);
   await assertRootCurrent(root);
   const controlFingerprints: ControlFingerprint[] = [];
   for (const filename of [
@@ -714,7 +802,7 @@ async function targetSnapshot(
   name: TargetSnapshot["name"],
   requiresScanCoverage: boolean,
   coverage: CoverageIndex,
-  findingSourceFiles: Set<string>,
+  findingSources: FindingSourceIndex,
   signal?: AbortSignal,
   explicitTarget?: string,
   coveragePathRoot?: string,
@@ -735,6 +823,7 @@ async function targetSnapshot(
   let regularFiles = 0n;
   let logicalBytes = 0n;
   const retainedSourceFiles: RetainedSourceFile[] = [];
+  const directoryIdentities = new Map<string, { device: number; inode: number }>();
   const contentHash = createHash("sha256");
   type Work = { phase: "enter"; filename: string } | { phase: "exit"; filename: string; relative: string; before: Stats };
   const pending: Work[] = [{ phase: "enter", filename: target }];
@@ -777,6 +866,7 @@ async function targetSnapshot(
     if (work.filename !== target) filesystemEntries += 1n;
 
     if (kind === "directory") {
+      directoryIdentities.set(work.filename, { device: metadata.dev, inode: metadata.ino });
       directories += 1;
       if (directories > MAX_WALK_DIRECTORIES) {
         throw new Error(`cleanup target exceeds the ${MAX_WALK_DIRECTORIES}-directory verification limit`);
@@ -826,7 +916,19 @@ async function targetSnapshot(
       if (requiresScanCoverage && !indexedFileIsAuthorized(coveragePath, coverage)) {
         throw new Error("at least one recovered-data file is not covered by an error-free completed mining scan");
       }
-      if (findingSourceFiles.has(coveragePath)) {
+      const parentIdentity = directoryIdentities.get(path.dirname(work.filename));
+      if (parentIdentity === undefined) {
+        throw new Error("cleanup target traversal lost a parent-directory identity");
+      }
+      if (
+        findingSources.paths.has(coveragePath)
+        || findingSources.entryIdentities.has(entryIdentity(
+          parentIdentity.device,
+          parentIdentity.inode,
+          metadata.dev,
+          metadata.ino,
+        ))
+      ) {
         retainedSourceFiles.push({
           originalPath: coveragePath,
           relativePath: relative,
@@ -901,6 +1003,7 @@ function targetIdentity(target: TargetSnapshot): Record<string, unknown> {
 
 function approvalToken(
   caseRoot: RootSnapshot,
+  retainedSourceBase: RootSnapshot | undefined,
   recovery: VerifiedRecoveryCase,
   mining: VerifiedMiningOutput[],
   targets: TargetSnapshot[],
@@ -909,6 +1012,7 @@ function approvalToken(
   const material = {
     version: 1,
     case: { ...caseRoot, recovery },
+    retainedSourceBase: retainedSourceBase ?? null,
     includeEvidence,
     mining: mining.map((item) => ({
       root: item.root,
@@ -955,11 +1059,15 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
   const networkCache = new Map<string, Promise<boolean>>();
   const caseRoot = await rootSnapshot(normalized.caseDirectory, records, networkCache, "recovery case root");
   await assertNoCleanupQuarantine(caseRoot.path);
+  const retainedSourceBasePath = safeJoin(caseRoot.path, RETAINED_SOURCE_DIRECTORY);
   const miningRoots: RootSnapshot[] = [];
   for (const output of normalized.miningOutputs) {
     miningRoots.push(await rootSnapshot(output, records, networkCache, "mining output"));
   }
   for (const root of miningRoots) {
+    if (inside(retainedSourceBasePath, root.path) || inside(root.path, retainedSourceBasePath)) {
+      throw new Error("a retained mining output overlaps the reserved retained source-file directory");
+    }
     for (const name of ["recovery", "evidence", "logs", "runs"] as const) {
       const target = safeJoin(caseRoot.path, name);
       if (inside(target, root.path) || inside(root.path, target)) {
@@ -981,30 +1089,47 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
 
   const recoveryCase = await verifyRecoveryCase(caseRoot.path, normalized.signal);
   const mining: VerifiedMiningOutput[] = [];
-  for (const root of miningRoots) mining.push(await verifyMiningOutput(root, introducedLocks, normalized.signal));
+  for (const root of miningRoots) mining.push(await verifyMiningOutput(root, normalized.signal));
   const coverage = buildCoverageIndex(mining.flatMap((item) => item.state.inputRoots));
-  const findingSourceFiles = new Set(mining.flatMap((item) => item.sourceFiles));
+  const findingSources = await buildFindingSourceIndex(
+    mining.flatMap((item) => item.sourceFiles),
+    normalized.signal,
+  );
 
   const targets: TargetSnapshot[] = [];
-  const recovery = await targetSnapshot(caseRoot, "recovery", true, coverage, findingSourceFiles, normalized.signal);
+  const recovery = await targetSnapshot(caseRoot, "recovery", true, coverage, findingSources, normalized.signal);
   if (recovery !== undefined) targets.push(recovery);
   const evidencePresent = await pathExists(safeJoin(caseRoot.path, "evidence"));
   if (normalized.includeEvidence) {
-    const evidence = await targetSnapshot(caseRoot, "evidence", true, coverage, findingSourceFiles, normalized.signal);
+    const evidence = await targetSnapshot(caseRoot, "evidence", true, coverage, findingSources, normalized.signal);
     if (evidence !== undefined) targets.push(evidence);
   }
   for (const name of ["logs", "runs"] as const) {
-    const target = await targetSnapshot(caseRoot, name, false, coverage, findingSourceFiles, normalized.signal);
+    const target = await targetSnapshot(caseRoot, name, false, coverage, findingSources, normalized.signal);
     if (target !== undefined) targets.push(target);
   }
   if (recovery === undefined && !targets.some((target) => target.name === "evidence")) {
     throw new Error("the completed case has no selected recovered-data copy to clean up");
   }
   const retainedPaths = new Set(targets.flatMap((target) => target.retainedSourceFiles.map((source) => source.originalPath)));
-  for (const source of findingSourceFiles) {
+  for (const source of findingSources.paths) {
     if (targets.some((target) => source !== target.path && inside(target.path, source)) && !retainedPaths.has(source)) {
       throw new Error("a finding-containing source file selected for cleanup could not be retained intact");
     }
+  }
+  for (const root of miningRoots) {
+    for (const target of targets) {
+      if (await directoryTreesOverlap(root, target)) {
+        throw new Error("a retained mining output aliases an AARK-managed cleanup deletion target");
+      }
+    }
+  }
+  // Make the exact live-manifest comparison the final input-data pass. This
+  // catches a selected file that changes while its cleanup snapshot is being
+  // built without doubling the full input walk for multi-terabyte scans.
+  for (const item of mining) {
+    await verifyLiveManifest(item.state, item.root.path, introducedLocks, normalized.signal);
+    await assertRootCurrent(item.root);
   }
   await assertRootCurrent(caseRoot);
   for (const root of miningRoots) await assertRootCurrent(root);
@@ -1036,8 +1161,17 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
   const intermediateBytes = targets
     .filter((target) => target.name === "logs" || target.name === "runs")
     .reduce((sum, target) => sum + deletableTargetBytes(target), 0n);
-  const token = approvalToken(caseRoot, recoveryCase, mining, targets, normalized.includeEvidence);
-  if (retainedSourceFiles > 0n) await assertRetainedSourceDestinationAvailable(caseRoot, token);
+  const retainedSourceBase = await retainedSourceBaseSnapshot(caseRoot);
+  for (const root of miningRoots) {
+    if (
+      await directoryContainsIdentity(root, caseRoot)
+      || (retainedSourceBase !== undefined && await directoryTreesOverlap(root, retainedSourceBase))
+    ) throw new Error("a retained mining output aliases the reserved retained source-file directory");
+  }
+  const token = approvalToken(caseRoot, retainedSourceBase, recoveryCase, mining, targets, normalized.includeEvidence);
+  if (retainedSourceFiles > 0n) {
+    await assertRetainedSourceDestinationAvailable(caseRoot, retainedSourceBase, token);
+  }
   const publicPlan: CleanupPlanResult = {
     version: 1,
     tool: "aark",
@@ -1086,7 +1220,17 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
       ...(normalized.includeEvidence ? ["Deleting the evidence copy additionally requires --confirm-delete-evidence."] : []),
     ],
   };
-  return { public: publicPlan, caseRoot, recovery: recoveryCase, mining, coverage, findingSourceFiles, targets, introducedLocks };
+  return {
+    public: publicPlan,
+    caseRoot,
+    retainedSourceBase,
+    recovery: recoveryCase,
+    mining,
+    coverage,
+    findingSources,
+    targets,
+    introducedLocks,
+  };
 }
 
 export async function planCleanup(options: CleanupOptions): Promise<CleanupPlanResult> {
@@ -1195,15 +1339,38 @@ async function createRetainedSourceRunDirectory(
   if (retainedCount === 0) return undefined;
   for (const lock of locks) await lock.assertHeld();
   await assertRootCurrent(plan.caseRoot);
-  await assertRetainedSourceDestinationAvailable(plan.caseRoot, plan.public.approvalToken);
+  await assertRetainedSourceDestinationAvailable(
+    plan.caseRoot,
+    plan.retainedSourceBase,
+    plan.public.approvalToken,
+  );
   const base = safeJoin(plan.caseRoot.path, RETAINED_SOURCE_DIRECTORY);
+  if (plan.retainedSourceBase === undefined) {
+    try {
+      await mkdir(base, { mode: 0o700 });
+    } catch (error) {
+      if (errorCode(error) === "EEXIST") {
+        throw new Error("the retained source-file directory changed after cleanup approval", { cause: error });
+      }
+      throw error;
+    }
+  } else {
+    await assertRootCurrent(plan.retainedSourceBase);
+  }
   await ensurePrivateDirectory(base);
+  const records = await mounts();
+  const currentBase = await rootSnapshot(base, records, new Map<string, Promise<boolean>>(), "retained source-file directory");
+  if (currentBase.mount !== plan.caseRoot.mount) {
+    throw new Error("retained source-file directory crossed the recovery case filesystem");
+  }
+  if (plan.retainedSourceBase !== undefined && !sameRootSnapshot(currentBase, plan.retainedSourceBase)) {
+    throw new Error("the retained source-file directory changed after cleanup approval");
+  }
   const runRoot = retainedSourceRunRoot(plan.caseRoot.path, plan.public.approvalToken);
   await mkdir(runRoot, { mode: 0o700 });
   await ensurePrivateDirectory(runRoot);
   await syncDirectory(base);
   await syncDirectory(plan.caseRoot.path);
-  const records = await mounts();
   const created = await rootSnapshot(runRoot, records, new Map<string, Promise<boolean>>(), "retained source-file run directory");
   if (created.mount !== plan.caseRoot.mount) throw new Error("retained source-file run directory crossed the recovery case filesystem");
   for (const lock of locks) await lock.assertHeld();
@@ -1254,6 +1421,7 @@ async function moveRetainedSourceFile(
     retained.isSymbolicLink()
     || !retained.isFile()
     || retained.dev !== source.device
+    || retained.ino !== source.inode
     || retained.mode !== source.mode
     || retained.nlink !== source.links
     || retained.size !== source.bytes
@@ -1329,7 +1497,7 @@ async function removeApprovedTarget(
     target.name,
     target.requiresScanCoverage,
     plan.coverage,
-    plan.findingSourceFiles,
+    plan.findingSources,
     signal,
     quarantine,
     target.path,

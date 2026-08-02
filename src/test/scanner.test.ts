@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync, randomBytes } from "node:crypto";
-import { unlinkSync } from "node:fs";
+import { renameSync, unlinkSync } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, readdir, realpath, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -350,6 +350,37 @@ test("a changing input produces complete-with-errors reports instead of a false 
   assert.equal(result.filesScanned, 0);
   assert.match(await readFile(path.join(output, "final-report-sensitive.md"), "utf8"), /Status: complete-with-errors/);
   assert.match(await readFile(path.join(output, "final-report-redacted.md"), "utf8"), /absence cannot be concluded/);
+});
+
+test("a changed directory input remains a fatal scan-control error", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "agetnic-changing-directory-test-"));
+  const input = path.join(root, "recovered");
+  const moved = path.join(root, "recovered-moved");
+  const output = path.join(root, "mined");
+  await mkdir(input);
+  await writeFile(path.join(input, "file.bin"), Buffer.alloc(64, 0x41));
+  let renamed = false;
+  await assert.rejects(scanSensitiveMaterial({
+    inputs: [input],
+    output,
+    provenance: "unknown",
+    chunkBytes: 17 * 1024 * 1024,
+    overlapBytes: 17 * 1024 * 1024,
+    wholeFileBytes: 1024 * 1024,
+    minimumFreeGiB: 0,
+    minimumFreePercent: 0,
+    progress: () => {
+      if (!renamed) {
+        renamed = true;
+        renameSync(input, moved);
+      }
+    },
+  }), /directory input root or its mount changed/);
+  assert.equal(renamed, true);
+  assert.match(await readFile(path.join(output, "final-report-sensitive.md"), "utf8"), /Status: failed/);
+  assert.match(await readFile(path.join(output, "final-report-redacted.md"), "utf8"), /Status: failed/);
+  await assert.rejects(access(path.join(output, ".aark-mining.lock")));
+  await assert.rejects(access(path.join(output, ".agetnic-mining.lock")));
 });
 
 test("fatal scan-control errors still produce failed reports and release the output lock", async () => {
