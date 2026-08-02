@@ -95,13 +95,31 @@ test("command runner strips unrelated credential environment variables", async (
 });
 
 test("command runner escalates cancellation when a child ignores SIGTERM", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-command-ignore-term-"));
+  const ready = path.join(root, "ready");
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 200);
-  const result = await captureCommand(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], {
+  const command = captureCommand(process.execPath, ["-e", [
+    "const fs=require('node:fs');",
+    "process.on('SIGTERM',()=>{});",
+    `fs.writeFileSync(${JSON.stringify(ready)},'ready');`,
+    "setInterval(()=>{},1000);",
+  ].join("")], {
     signal: controller.signal,
     killGraceMs: 40,
   });
-  clearTimeout(timer);
+  let childReady = false;
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      await access(ready);
+      childReady = true;
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  controller.abort();
+  const result = await command;
+  assert.equal(childReady, true);
   assert.equal(result.signal, "SIGKILL");
   assert.equal(result.terminationReason, "abort");
   assert.ok(result.durationMs < 2_000);
@@ -183,7 +201,7 @@ test("normal command completion also terminates leftover descendants", { skip: p
   ].join("");
   const parent = [
     "const {spawn}=require('node:child_process');",
-    `spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:'ignore'});`,
+    `spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:'ignore'}).unref();`,
   ].join("");
   const result = await captureCommand(process.execPath, ["-e", parent], { killGraceMs: 40 });
   assert.equal(result.exitCode, 0);

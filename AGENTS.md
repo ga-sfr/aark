@@ -27,7 +27,7 @@ Deletion is intentionally outside that standing authorization. Even if the origi
 7. On mining exit code `75`, preserve the output unchanged and run the returned `resumeCommand`, normally `aark mine resume --output <directory>`.
 8. Use aggregate JSON, `manifest-redacted.json`, and `final-report-redacted.md` for automation. Review redacted material before sharing it.
 9. When recovery and all intended scans are complete, run `aark cleanup plan <MINING_OUTPUTS...> --case <CASE_DIRECTORY>`. The command is read-only and succeeds only when the recovery case is terminal-successful, every supplied scan is exactly `complete` with zero errors, its frozen inputs are unchanged, every artifact hash verifies, and the scans collectively cover every selected recovery file.
-10. Show the path-redacted plan, filesystem-entry/regular-file deletion counts and byte totals, retained-artifact count, marker-only count, evidence disposition, and approval token to the end user. Marker-only locations have no exported exact artifact, so require local review of those locations before proposing deletion. Ask explicitly whether AARK should delete the recovered copy while keeping the root final reports, complete mining outputs, exact sensitive artifacts, and minimal integrity metadata. Do not continue until the user says yes.
+10. Show the path-redacted plan, filesystem-entry/regular-file deletion counts and byte totals, retained-artifact count, retained whole-source file count and bytes, marker-only count, evidence disposition, and approval token to the end user. Ask explicitly whether AARK should delete the bulk recovered copy while keeping the root final reports, complete mining outputs, exact sensitive artifacts, every complete finding-containing source file, and minimal integrity metadata. Do not continue until the user says yes.
 11. After approval, run the unchanged command with `--approval-token <TOKEN> --execute --confirm-delete-recovered-copy`. Evidence images remain by default. If the user separately approves evidence deletion, use `--include-evidence` in both commands and `--confirm-delete-evidence` during execution.
 
 ## Sensitive-data boundary
@@ -37,7 +37,7 @@ Routine agent operation must not open, quote, summarize, attach, upload, or plac
 - `inventory-sensitive.json`, `scan-state-sensitive.json`, or `scan-files-sensitive.ndjson`;
 - `case-sensitive.json`, sensitive run state, or sensitive tool logs;
 - `final-report-sensitive.md` or `cleanup-final-report-sensitive.md`; or
-- anything under `artifacts/`, `evidence/`, or raw recovery output directories.
+- anything under `artifacts/`, `evidence/`, `retained-sensitive-source-files/`, or raw recovery output directories.
 
 Do not invoke `aark mine reveal` unless the case authorization explicitly requires disclosure of that exact artifact to the local operator. Never use an online login, provider API, search service, hosted OCR system, hosted model, or other network service to validate recovered material. A future OCR layer must remain offline and apply the same artifact, provenance, checkpoint, and redaction rules.
 
@@ -49,7 +49,7 @@ Do not invoke `aark mine reveal` unless the case authorization explicitly requir
 - A ddrescue quota stop is resumable because its mapfile is authoritative. Quota stops for other recovery engines are failures; retain their outputs and reports, but do not assume an in-place retry is safe.
 - A hard kill, host crash, failed scan, changed input, missing lock, or modified checkpoint is not a clean pause. Inspect locally and start a new output rather than bypassing validation.
 - Cleanup never accepts a paused, failed, interrupted, or `complete-with-errors` scan. A changed plan token, file, artifact, mount, directory identity, or operation lock stops deletion and requires a new plan and a new end-user decision.
-- Cleanup is irreversible. It removes only fixed AARK-managed case directories, writes an `authorized-in-progress` report before deletion, and records `failed-partial` or `interrupted-partial` if it cannot finish. A `.aark-cleanup-pending-*` tree means protected deletion stopped partway; inspect it locally and do not bypass the retry refusal, coverage, or confirmation gates.
+- Cleanup is irreversible. It moves finding-containing source files into the dedicated retained tree, removes only fixed AARK-managed case directories, writes an `authorized-in-progress` report before deletion, and records `failed-partial` or `interrupted-partial` if it cannot finish. A `.aark-cleanup-pending-*` tree means protected retention or deletion stopped partway; inspect it locally and do not bypass the retry refusal, coverage, or confirmation gates.
 
 ## Repository changes
 

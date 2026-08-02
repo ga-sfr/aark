@@ -76,7 +76,7 @@ aark mine scan /case/recovery/residual-memory \
 
 ## Post-scan cleanup
 
-Only an error-free result whose exact status is `complete` can authorize AARK cleanup. `complete-with-errors`, paused, interrupted, failed, edited, or changed-input scans are never accepted. Multiple complete mining outputs may collectively cover recovery directories scanned under different provenance labels. Cleanup retains each full mining output—especially exact artifacts, the sensitive inventory, and frozen integrity metadata—while it can remove the bulky recovered copy after a fresh end-user decision. See [Cleanup workflow](cleanup.md).
+Only an error-free result whose exact status is `complete` can authorize AARK cleanup. `complete-with-errors`, paused, interrupted, failed, edited, or changed-input scans are never accepted. Multiple complete mining outputs may collectively cover recovery directories scanned under different provenance labels. Cleanup retains each full mining output—especially exact artifacts, the sensitive inventory, and frozen integrity metadata—and moves every complete source file referenced by a finding into a dedicated retained tree before removing bulk recovered data after a fresh end-user decision. See [Cleanup workflow](cleanup.md).
 
 ## Validation levels
 

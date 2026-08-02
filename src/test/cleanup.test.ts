@@ -16,7 +16,7 @@ async function missing(filename: string): Promise<boolean> {
   }
 }
 
-test("cleanup requires fresh approval and retains only reports, findings, and integrity metadata", {
+test("cleanup requires fresh approval and retains reports, findings, and whole finding-containing source files", {
   skip: process.platform !== "linux",
 }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "aark-cleanup-test-"));
@@ -33,8 +33,12 @@ test("cleanup requires fresh approval and retains only reports, findings, and in
   await mkdir(runs);
   const tokenPrefix = ["gh", "p_"].join("");
   const token = `${tokenPrefix}ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij`;
-  await writeFile(path.join(recovery, "recovered.txt"), `provider_token=${token}\n`);
-  await writeFile(path.join(evidence, "source.img"), randomBytes(1024));
+  const sensitiveSourceContents = `provider_token=${token}\n`;
+  const sensitiveEvidenceContents = `synthetic evidence context\nprovider_token=${token}\n`;
+  await writeFile(path.join(recovery, "recovered.txt"), sensitiveSourceContents);
+  await writeFile(path.join(recovery, "ordinary.txt"), "ordinary recovered data\n");
+  await writeFile(path.join(evidence, "source.img"), sensitiveEvidenceContents);
+  await writeFile(path.join(evidence, "ordinary.img"), randomBytes(1024));
   await writeFile(path.join(logs, "tool-sensitive.log"), "synthetic log\n");
   await writeFile(path.join(runs, "prior-sensitive.json"), "{}\n");
 
@@ -92,6 +96,11 @@ test("cleanup requires fresh approval and retains only reports, findings, and in
   assert.equal(firstPlan.deletion.evidenceCopyIncluded, true);
   assert.ok(BigInt(firstPlan.deletion.filesystemEntries) > BigInt(firstPlan.deletion.regularFiles));
   assert.equal(firstPlan.retained.exactFindingArtifacts, true);
+  assert.equal(firstPlan.retained.wholeFindingSourceFiles, true);
+  assert.equal(firstPlan.sourceFilesRetained, "2");
+  assert.equal(firstPlan.sourceFileLogicalBytesRetained, (
+    Buffer.byteLength(sensitiveSourceContents) + Buffer.byteLength(sensitiveEvidenceContents)
+  ).toString());
   assert.equal(firstPlan.markerOnlyFindingsWithoutArtifacts, "0");
   assert.match(firstPlan.approvalToken, /^[a-f0-9]{64}$/);
   assert.equal(JSON.stringify(firstPlan).includes(caseRoot), false);
@@ -174,6 +183,7 @@ test("cleanup requires fresh approval and retains only reports, findings, and in
     confirmDeleteEvidence: true,
   });
   assert.equal(result.status, "complete");
+  assert.equal(result.sourceFilesRetained, "2");
   assert.equal(await missing(recovery), true);
   assert.equal(await missing(evidence), true);
   assert.equal(await missing(logs), true);
@@ -183,6 +193,24 @@ test("cleanup requires fresh approval and retains only reports, findings, and in
   assert.equal(await missing(path.join(mining, "final-report-sensitive.md")), false);
   assert.equal(await missing(path.join(mining, "inventory-sensitive.json")), false);
   assert.equal(await missing(path.join(mining, "scan-state-sensitive.json")), false);
+  const retainedSource = path.join(
+    caseRoot,
+    "retained-sensitive-source-files",
+    approved.approvalToken,
+    "recovery",
+    "recovered.txt",
+  );
+  assert.equal(await readFile(retainedSource, "utf8"), sensitiveSourceContents);
+  assert.equal(await missing(path.join(path.dirname(retainedSource), "ordinary.txt")), true);
+  const retainedEvidence = path.join(
+    caseRoot,
+    "retained-sensitive-source-files",
+    approved.approvalToken,
+    "evidence",
+    "source.img",
+  );
+  assert.equal(await readFile(retainedEvidence, "utf8"), sensitiveEvidenceContents);
+  assert.equal(await missing(path.join(path.dirname(retainedEvidence), "ordinary.img")), true);
   assert.equal((await readdir(caseRoot)).some((entry) => entry.startsWith(".aark-cleanup-pending-")), false);
   const inventory = JSON.parse(await readFile(path.join(mining, "inventory-sensitive.json"), "utf8")) as { findings: unknown[] };
   assert.ok(inventory.findings.length > 0);

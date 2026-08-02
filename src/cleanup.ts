@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import type { Stats } from "node:fs";
-import { lstat, open, opendir, readlink, realpath, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, open, opendir, readlink, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -9,6 +9,7 @@ import {
   assertNoSymlinkComponents,
   atomicWriteFile,
   atomicWriteJson,
+  ensurePrivateDirectory,
   MAX_WALK_DIRECTORIES,
   MAX_WALK_DIRECTORY_ENTRIES,
   MAX_WALK_PENDING_ENTRIES,
@@ -35,6 +36,7 @@ const MINING_LOCK_FILENAMES = [".aark-mining.lock", ".agetnic-mining.lock"] as c
 const CLEANUP_SENSITIVE_REPORT = "cleanup-final-report-sensitive.md";
 const CLEANUP_REDACTED_REPORT = "cleanup-final-report-redacted.md";
 const CLEANUP_REDACTED_MANIFEST = "cleanup-manifest-redacted.json";
+const RETAINED_SOURCE_DIRECTORY = "retained-sensitive-source-files";
 const MAX_CASE_STATE_BYTES = 16 * 1024 * 1024;
 const MAX_CLEANUP_FAILURE_BYTES = 8 * 1024;
 const MAX_RETAINED_CONTROL_BYTES = 256 * 1024 * 1024;
@@ -70,6 +72,8 @@ export interface CleanupPlanResult {
   findingsRetained: string;
   markerOnlyFindingsWithoutArtifacts: string;
   artifactFilesRetained: string;
+  sourceFilesRetained: string;
+  sourceFileLogicalBytesRetained: string;
   deletion: {
     directories: number;
     filesystemEntries: string;
@@ -88,6 +92,7 @@ export interface CleanupPlanResult {
     cleanupFinalReports: true;
     miningFinalReports: true;
     exactFindingArtifacts: true;
+    wholeFindingSourceFiles: true;
     minimalIntegrityMetadata: true;
     evidenceCopy: boolean;
   };
@@ -115,6 +120,19 @@ interface TargetSnapshot {
   logicalBytes: bigint;
   contentDigest: string;
   requiresScanCoverage: boolean;
+  retainedSourceFiles: RetainedSourceFile[];
+}
+
+interface RetainedSourceFile {
+  originalPath: string;
+  relativePath: string;
+  device: number;
+  inode: number;
+  mode: number;
+  links: number;
+  bytes: number;
+  modifiedMs: number;
+  changedMs: number;
 }
 
 interface VerifiedMiningOutput {
@@ -124,6 +142,7 @@ interface VerifiedMiningOutput {
   findings: number;
   markerOnlyFindings: number;
   artifactFiles: number;
+  sourceFiles: string[];
   controlDigest: string;
 }
 
@@ -156,6 +175,7 @@ interface InternalCleanupPlan {
   recovery: VerifiedRecoveryCase;
   mining: VerifiedMiningOutput[];
   coverage: CoverageIndex;
+  findingSourceFiles: Set<string>;
   targets: TargetSnapshot[];
   introducedLocks: Set<string>;
 }
@@ -374,6 +394,23 @@ async function assertNoCleanupQuarantine(caseRoot: string): Promise<void> {
   if (entries.some((entry) => entry.startsWith(CLEANUP_QUARANTINE_PREFIX))) {
     throw new Error("the case contains an unfinished cleanup quarantine; inspect it locally before another cleanup attempt");
   }
+}
+
+function retainedSourceRunRoot(caseRoot: string, approvalToken: string): string {
+  return safeJoin(caseRoot, RETAINED_SOURCE_DIRECTORY, approvalToken);
+}
+
+async function assertRetainedSourceDestinationAvailable(caseRoot: RootSnapshot, approvalToken: string): Promise<void> {
+  const base = safeJoin(caseRoot.path, RETAINED_SOURCE_DIRECTORY);
+  await assertNoSymlinkComponents(caseRoot.path, base);
+  if (await pathExists(base)) {
+    const records = await mounts();
+    const existing = await rootSnapshot(base, records, new Map<string, Promise<boolean>>(), "retained source-file directory");
+    if (existing.mount !== caseRoot.mount) throw new Error("retained source-file directory must remain on the recovery case filesystem");
+  }
+  const runRoot = retainedSourceRunRoot(caseRoot.path, approvalToken);
+  await assertNoSymlinkComponents(caseRoot.path, runRoot);
+  if (await pathExists(runRoot)) throw new Error("the approved retained source-file destination already exists");
 }
 
 function recoveryPlanRecord(value: unknown): Record<string, unknown> {
@@ -667,6 +704,7 @@ async function verifyMiningOutput(
     findings: inventory.findings.length,
     markerOnlyFindings: inventory.findings.filter((finding) => finding.confidence === "marker-only").length,
     artifactFiles: inventory.findings.reduce((sum, finding) => sum + finding.artifactFiles.length, 0),
+    sourceFiles: [...new Set(inventory.findings.flatMap((finding) => finding.occurrences.map((occurrence) => occurrence.sourcePath)))].sort(bytewiseLexical),
     controlDigest: digestControlFingerprints(controlFingerprints),
   };
 }
@@ -676,6 +714,7 @@ async function targetSnapshot(
   name: TargetSnapshot["name"],
   requiresScanCoverage: boolean,
   coverage: CoverageIndex,
+  findingSourceFiles: Set<string>,
   signal?: AbortSignal,
   explicitTarget?: string,
   coveragePathRoot?: string,
@@ -695,6 +734,7 @@ async function targetSnapshot(
   let filesystemEntries = 0n;
   let regularFiles = 0n;
   let logicalBytes = 0n;
+  const retainedSourceFiles: RetainedSourceFile[] = [];
   const contentHash = createHash("sha256");
   type Work = { phase: "enter"; filename: string } | { phase: "exit"; filename: string; relative: string; before: Stats };
   const pending: Work[] = [{ phase: "enter", filename: target }];
@@ -786,6 +826,19 @@ async function targetSnapshot(
       if (requiresScanCoverage && !indexedFileIsAuthorized(coveragePath, coverage)) {
         throw new Error("at least one recovered-data file is not covered by an error-free completed mining scan");
       }
+      if (findingSourceFiles.has(coveragePath)) {
+        retainedSourceFiles.push({
+          originalPath: coveragePath,
+          relativePath: relative,
+          device: metadata.dev,
+          inode: metadata.ino,
+          mode: metadata.mode,
+          links: metadata.nlink,
+          bytes: metadata.size,
+          modifiedMs: metadata.mtimeMs,
+          changedMs: metadata.ctimeMs,
+        });
+      }
     }
     contentHash.update(`${JSON.stringify({
       path: relative,
@@ -825,6 +878,7 @@ async function targetSnapshot(
     logicalBytes,
     contentDigest: contentHash.digest("hex"),
     requiresScanCoverage,
+    retainedSourceFiles,
   };
 }
 
@@ -841,6 +895,7 @@ function targetIdentity(target: TargetSnapshot): Record<string, unknown> {
     logicalBytes: target.logicalBytes.toString(),
     contentDigest: target.contentDigest,
     requiresScanCoverage: target.requiresScanCoverage,
+    retainedSourceFiles: target.retainedSourceFiles.map((source) => ({ ...source })),
   };
 }
 
@@ -928,21 +983,28 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
   const mining: VerifiedMiningOutput[] = [];
   for (const root of miningRoots) mining.push(await verifyMiningOutput(root, introducedLocks, normalized.signal));
   const coverage = buildCoverageIndex(mining.flatMap((item) => item.state.inputRoots));
+  const findingSourceFiles = new Set(mining.flatMap((item) => item.sourceFiles));
 
   const targets: TargetSnapshot[] = [];
-  const recovery = await targetSnapshot(caseRoot, "recovery", true, coverage, normalized.signal);
+  const recovery = await targetSnapshot(caseRoot, "recovery", true, coverage, findingSourceFiles, normalized.signal);
   if (recovery !== undefined) targets.push(recovery);
   const evidencePresent = await pathExists(safeJoin(caseRoot.path, "evidence"));
   if (normalized.includeEvidence) {
-    const evidence = await targetSnapshot(caseRoot, "evidence", true, coverage, normalized.signal);
+    const evidence = await targetSnapshot(caseRoot, "evidence", true, coverage, findingSourceFiles, normalized.signal);
     if (evidence !== undefined) targets.push(evidence);
   }
   for (const name of ["logs", "runs"] as const) {
-    const target = await targetSnapshot(caseRoot, name, false, coverage, normalized.signal);
+    const target = await targetSnapshot(caseRoot, name, false, coverage, findingSourceFiles, normalized.signal);
     if (target !== undefined) targets.push(target);
   }
   if (recovery === undefined && !targets.some((target) => target.name === "evidence")) {
     throw new Error("the completed case has no selected recovered-data copy to clean up");
+  }
+  const retainedPaths = new Set(targets.flatMap((target) => target.retainedSourceFiles.map((source) => source.originalPath)));
+  for (const source of findingSourceFiles) {
+    if (targets.some((target) => source !== target.path && inside(target.path, source)) && !retainedPaths.has(source)) {
+      throw new Error("a finding-containing source file selected for cleanup could not be retained intact");
+    }
   }
   await assertRootCurrent(caseRoot);
   for (const root of miningRoots) await assertRootCurrent(root);
@@ -957,15 +1019,25 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
   const findings = mining.reduce((sum, item) => sum + BigInt(item.findings), 0n);
   const markerOnlyFindings = mining.reduce((sum, item) => sum + BigInt(item.markerOnlyFindings), 0n);
   const artifacts = mining.reduce((sum, item) => sum + BigInt(item.artifactFiles), 0n);
-  const deletedEntries = targets.reduce((sum, target) => sum + target.filesystemEntries, 0n);
-  const deletedFiles = targets.reduce((sum, target) => sum + target.regularFiles, 0n);
-  const deletedBytes = targets.reduce((sum, target) => sum + target.logicalBytes, 0n);
-  const recoveredBytes = targets.find((target) => target.name === "recovery")?.logicalBytes ?? 0n;
-  const evidenceBytes = targets.find((target) => target.name === "evidence")?.logicalBytes ?? 0n;
+  const retainedSources = targets.flatMap((target) => target.retainedSourceFiles);
+  const retainedSourceFiles = BigInt(retainedSources.length);
+  const retainedSourceBytes = retainedSources.reduce((sum, source) => sum + BigInt(source.bytes), 0n);
+  const deletedEntries = targets.reduce((sum, target) => sum + target.filesystemEntries - BigInt(target.retainedSourceFiles.length), 0n);
+  const deletedFiles = targets.reduce((sum, target) => sum + target.regularFiles - BigInt(target.retainedSourceFiles.length), 0n);
+  const deletedBytes = targets.reduce(
+    (sum, target) => sum + target.logicalBytes - target.retainedSourceFiles.reduce((retained, source) => retained + BigInt(source.bytes), 0n),
+    0n,
+  );
+  const deletableTargetBytes = (target: TargetSnapshot | undefined): bigint => target === undefined
+    ? 0n
+    : target.logicalBytes - target.retainedSourceFiles.reduce((sum, source) => sum + BigInt(source.bytes), 0n);
+  const recoveredBytes = deletableTargetBytes(targets.find((target) => target.name === "recovery"));
+  const evidenceBytes = deletableTargetBytes(targets.find((target) => target.name === "evidence"));
   const intermediateBytes = targets
     .filter((target) => target.name === "logs" || target.name === "runs")
-    .reduce((sum, target) => sum + target.logicalBytes, 0n);
+    .reduce((sum, target) => sum + deletableTargetBytes(target), 0n);
   const token = approvalToken(caseRoot, recoveryCase, mining, targets, normalized.includeEvidence);
+  if (retainedSourceFiles > 0n) await assertRetainedSourceDestinationAvailable(caseRoot, token);
   const publicPlan: CleanupPlanResult = {
     version: 1,
     tool: "aark",
@@ -980,6 +1052,8 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
     findingsRetained: findings.toString(),
     markerOnlyFindingsWithoutArtifacts: markerOnlyFindings.toString(),
     artifactFilesRetained: artifacts.toString(),
+    sourceFilesRetained: retainedSourceFiles.toString(),
+    sourceFileLogicalBytesRetained: retainedSourceBytes.toString(),
     deletion: {
       directories: targets.length,
       filesystemEntries: deletedEntries.toString(),
@@ -998,6 +1072,7 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
       cleanupFinalReports: true,
       miningFinalReports: true,
       exactFindingArtifacts: true,
+      wholeFindingSourceFiles: true,
       minimalIntegrityMetadata: true,
       evidenceCopy: evidencePresent && !targets.some((target) => target.name === "evidence"),
     },
@@ -1006,11 +1081,12 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
     requirements: [
       "Show this aggregate, path-redacted plan to the end user and obtain explicit approval before cleanup run.",
       "Pass the exact approval token plus --execute and --confirm-delete-recovered-copy.",
-      ...(markerOnlyFindings > 0n ? ["Review every marker-only finding before cleanup; marker-only locations have no exact exported artifact and their recovered source context will be removed."] : []),
+      "Keep every complete source file associated with a mining finding in the dedicated retained source-file tree.",
+      ...(markerOnlyFindings > 0n ? ["Marker-only findings have no exact exported artifact; their complete containing files are retained, but review them before cleanup if neighboring directory context is needed."] : []),
       ...(normalized.includeEvidence ? ["Deleting the evidence copy additionally requires --confirm-delete-evidence."] : []),
     ],
   };
-  return { public: publicPlan, caseRoot, recovery: recoveryCase, mining, coverage, targets, introducedLocks };
+  return { public: publicPlan, caseRoot, recovery: recoveryCase, mining, coverage, findingSourceFiles, targets, introducedLocks };
 }
 
 export async function planCleanup(options: CleanupOptions): Promise<CleanupPlanResult> {
@@ -1035,6 +1111,8 @@ function reportText(
     `- Planned logical bytes: ${plan.public.deletion.logicalBytes}`,
     `- Mining scans verified: ${plan.public.miningScansVerified}`,
     `- Exact finding artifacts retained: ${plan.public.artifactFilesRetained}`,
+    `- Whole finding-containing source files retained: ${plan.public.sourceFilesRetained}`,
+    `- Whole source-file logical bytes retained: ${plan.public.sourceFileLogicalBytesRetained}`,
     `- Marker-only findings without artifacts: ${plan.public.markerOnlyFindingsWithoutArtifacts}`,
   ];
   const sensitive = [
@@ -1045,11 +1123,14 @@ function reportText(
     ...common,
     `- Recovery case: \`${JSON.stringify(plan.caseRoot.path).replace(/`/g, "\\u0060")}\``,
     `- Retained mining outputs: ${plan.mining.map((item) => `\`${JSON.stringify(item.root.path).replace(/`/g, "\\u0060")}\``).join(", ")}`,
+    ...(plan.public.sourceFilesRetained === "0" ? [] : [
+      `- Retained whole-source root: \`${JSON.stringify(retainedSourceRunRoot(plan.caseRoot.path, plan.public.approvalToken)).replace(/`/g, "\\u0060")}\``,
+    ]),
     `- Selected directories: ${plan.targets.map((target) => `\`${JSON.stringify(target.path).replace(/`/g, "\\u0060")}\``).join(", ")}`,
     `- Completely removed directories: ${completedTargets.length === 0 ? "none" : completedTargets.map((target) => `\`${JSON.stringify(target).replace(/`/g, "\\u0060")}\``).join(", ")}`,
     ...(failureMessage === undefined ? [] : [`- Failure detail: \`${JSON.stringify(failureMessage).replace(/`/g, "\\u0060")}\``]),
     "",
-    "The retained mining outputs contain final reports, exact finding artifacts, and the bounded integrity metadata required to map and verify those artifacts. Root recovery reports and redacted manifests remain in the case. Removed recovery reports describe historical paths that no longer exist after successful cleanup.",
+    "The retained mining outputs contain final reports, exact finding artifacts, and the bounded integrity metadata required to map and verify those artifacts. Complete source files associated with findings were moved intact into the dedicated retained whole-source tree before bulk recovery data was removed. Root recovery reports and redacted manifests remain in the case.",
     "",
   ].join("\n");
   const redacted = [
@@ -1059,7 +1140,7 @@ function reportText(
     "",
     ...common,
     "",
-    "Exact finding artifacts, final reports, and their minimal integrity metadata were retained locally. No recovered value was printed or uploaded.",
+    "Exact finding artifacts, complete finding-containing source files, final reports, and their minimal integrity metadata were retained locally. No recovered value was printed or uploaded.",
     "",
   ].join("\n");
   return {
@@ -1081,6 +1162,8 @@ function reportText(
       plannedLogicalBytes: plan.public.deletion.logicalBytes,
       miningScansVerified: plan.public.miningScansVerified,
       artifactFilesRetained: plan.public.artifactFilesRetained,
+      sourceFilesRetained: plan.public.sourceFilesRetained,
+      sourceFileLogicalBytesRetained: plan.public.sourceFileLogicalBytesRetained,
       markerOnlyFindingsWithoutArtifacts: plan.public.markerOnlyFindingsWithoutArtifacts,
       reports: { sensitive: CLEANUP_SENSITIVE_REPORT, redacted: CLEANUP_REDACTED_REPORT },
     },
@@ -1102,6 +1185,83 @@ async function writeCleanupReports(
   await atomicWriteJson(safeJoin(plan.caseRoot.path, CLEANUP_REDACTED_MANIFEST), reports.manifest, 0o644);
   for (const lock of locks) await lock.assertHeld();
   await assertRootCurrent(plan.caseRoot);
+}
+
+async function createRetainedSourceRunDirectory(
+  plan: InternalCleanupPlan,
+  locks: ExclusiveLock[],
+): Promise<RootSnapshot | undefined> {
+  const retainedCount = plan.targets.reduce((sum, target) => sum + target.retainedSourceFiles.length, 0);
+  if (retainedCount === 0) return undefined;
+  for (const lock of locks) await lock.assertHeld();
+  await assertRootCurrent(plan.caseRoot);
+  await assertRetainedSourceDestinationAvailable(plan.caseRoot, plan.public.approvalToken);
+  const base = safeJoin(plan.caseRoot.path, RETAINED_SOURCE_DIRECTORY);
+  await ensurePrivateDirectory(base);
+  const runRoot = retainedSourceRunRoot(plan.caseRoot.path, plan.public.approvalToken);
+  await mkdir(runRoot, { mode: 0o700 });
+  await ensurePrivateDirectory(runRoot);
+  await syncDirectory(base);
+  await syncDirectory(plan.caseRoot.path);
+  const records = await mounts();
+  const created = await rootSnapshot(runRoot, records, new Map<string, Promise<boolean>>(), "retained source-file run directory");
+  if (created.mount !== plan.caseRoot.mount) throw new Error("retained source-file run directory crossed the recovery case filesystem");
+  for (const lock of locks) await lock.assertHeld();
+  await assertRootCurrent(plan.caseRoot);
+  return created;
+}
+
+async function moveRetainedSourceFile(
+  plan: InternalCleanupPlan,
+  target: TargetSnapshot,
+  source: RetainedSourceFile,
+  quarantine: string,
+  retainedRunRoot: RootSnapshot,
+  locks: ExclusiveLock[],
+): Promise<void> {
+  if (safeJoin(target.path, source.relativePath) !== source.originalPath) {
+    throw new Error("retained source-file mapping escaped its approved cleanup target");
+  }
+  const quarantinedSource = safeJoin(quarantine, source.relativePath);
+  await assertNoSymlinkComponents(quarantine, quarantinedSource);
+  const before = await lstat(quarantinedSource);
+  if (
+    before.isSymbolicLink()
+    || !before.isFile()
+    || before.dev !== source.device
+    || before.ino !== source.inode
+    || before.mode !== source.mode
+    || before.nlink !== source.links
+    || before.size !== source.bytes
+    || before.mtimeMs !== source.modifiedMs
+    || before.ctimeMs !== source.changedMs
+    || await realpath(quarantinedSource) !== quarantinedSource
+  ) throw new Error("a finding-containing source file changed before it could be retained");
+
+  await assertRootCurrent(retainedRunRoot);
+  const destination = safeJoin(retainedRunRoot.path, target.name, source.relativePath);
+  await ensurePrivateDirectory(path.dirname(destination));
+  await assertNoSymlinkComponents(retainedRunRoot.path, destination);
+  if (await pathExists(destination)) throw new Error("a retained source-file destination unexpectedly already exists");
+  for (const lock of locks) await lock.assertHeld();
+  await assertRootCurrent(plan.caseRoot);
+  await assertRootCurrent(retainedRunRoot);
+  await rename(quarantinedSource, destination);
+  await syncDirectory(path.dirname(quarantinedSource));
+  await syncDirectory(path.dirname(destination));
+  const retained = await lstat(destination);
+  if (
+    retained.isSymbolicLink()
+    || !retained.isFile()
+    || retained.dev !== source.device
+    || retained.mode !== source.mode
+    || retained.nlink !== source.links
+    || retained.size !== source.bytes
+    || retained.mtimeMs !== source.modifiedMs
+    || await realpath(destination) !== destination
+  ) throw new Error("a finding-containing source file was not retained intact after its protected move");
+  if (await pathExists(quarantinedSource)) throw new Error("a retained source file remained in the cleanup quarantine after its protected move");
+  await assertRootCurrent(retainedRunRoot);
 }
 
 async function assertTargetCurrent(
@@ -1141,6 +1301,7 @@ async function removeApprovedTarget(
   plan: InternalCleanupPlan,
   target: TargetSnapshot,
   locks: ExclusiveLock[],
+  retainedRunRoot: RootSnapshot | undefined,
   signal?: AbortSignal,
 ): Promise<void> {
   await assertTargetCurrent(plan, target, locks, signal);
@@ -1168,6 +1329,7 @@ async function removeApprovedTarget(
     target.name,
     target.requiresScanCoverage,
     plan.coverage,
+    plan.findingSourceFiles,
     signal,
     quarantine,
     target.path,
@@ -1181,11 +1343,19 @@ async function removeApprovedTarget(
     || quarantined.logicalBytes !== target.logicalBytes
     || quarantined.contentDigest !== target.contentDigest
     || quarantined.requiresScanCoverage !== target.requiresScanCoverage
+    || !isDeepStrictEqual(quarantined.retainedSourceFiles, target.retainedSourceFiles)
   ) {
     throw new Error("cleanup target contents changed after approval; the quarantined tree was not deleted");
   }
   for (const lock of locks) await lock.assertHeld();
   await assertRootCurrent(plan.caseRoot);
+  if (target.retainedSourceFiles.length > 0 && retainedRunRoot === undefined) {
+    throw new Error("cleanup did not initialize the approved retained source-file directory");
+  }
+  for (const source of [...target.retainedSourceFiles].sort((left, right) => bytewiseLexical(left.originalPath, right.originalPath))) {
+    interrupted(signal);
+    await moveRetainedSourceFile(plan, target, source, quarantine, retainedRunRoot as RootSnapshot, locks);
+  }
   await rm(quarantine, { recursive: true, force: false, maxRetries: 0 });
   await syncDirectory(plan.caseRoot.path);
   if (await pathExists(quarantine)) throw new Error("cleanup quarantine still exists after recursive deletion");
@@ -1243,9 +1413,10 @@ export async function runCleanup(options: CleanupRunOptions): Promise<Record<str
     const completedTargets: string[] = [];
     try {
       await writeCleanupReports(plan, locks, "authorized-in-progress", completedTargets);
+      const retainedRunRoot = await createRetainedSourceRunDirectory(plan, locks);
       for (const target of plan.targets) {
         interrupted(normalized.signal);
-        await removeApprovedTarget(plan, target, locks, normalized.signal);
+        await removeApprovedTarget(plan, target, locks, retainedRunRoot, normalized.signal);
         completedTargets.push(target.path);
       }
       await writeCleanupReports(plan, locks, "complete", completedTargets);
@@ -1269,6 +1440,8 @@ export async function runCleanup(options: CleanupRunOptions): Promise<Record<str
       deletedLogicalBytes: plan.public.deletion.logicalBytes,
       miningScansVerified: plan.public.miningScansVerified,
       artifactFilesRetained: plan.public.artifactFilesRetained,
+      sourceFilesRetained: plan.public.sourceFilesRetained,
+      sourceFileLogicalBytesRetained: plan.public.sourceFileLogicalBytesRetained,
       evidenceCopyDeleted: plan.public.deletion.evidenceCopyIncluded,
       valuesPrinted: false,
       reports: { sensitive: CLEANUP_SENSITIVE_REPORT, redacted: CLEANUP_REDACTED_REPORT },

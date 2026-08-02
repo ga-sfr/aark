@@ -163,18 +163,30 @@ async function pathSafetySnapshot(input: string, records: MountRecord[]): Promis
   };
 }
 
-async function assertInputRootsCurrent(expected: PathSafetySnapshot[]): Promise<MountRecord[]> {
+async function inspectRuntimeInputRoots(
+  expected: PathSafetySnapshot[],
+  recordChangedFileRoot: (snapshot: PathSafetySnapshot, error: unknown) => void,
+): Promise<{ records: MountRecord[]; changedFileRoots: Set<string> }> {
   const records = await mounts();
+  const changedFileRoots = new Set<string>();
   for (const snapshot of expected) {
-    const current = await pathSafetySnapshot(snapshot.path, records);
-    if (
-      current.device !== snapshot.device
-      || current.inode !== snapshot.inode
-      || current.kind !== snapshot.kind
-      || current.mount !== snapshot.mount
-    ) throw new Error("a mining input root or its mount changed after preflight");
+    try {
+      const current = await pathSafetySnapshot(snapshot.path, records);
+      if (
+        current.device !== snapshot.device
+        || current.inode !== snapshot.inode
+        || current.kind !== snapshot.kind
+        || current.mount !== snapshot.mount
+      ) throw new Error("a mining input root or its mount changed after preflight");
+    } catch (error) {
+      if (snapshot.kind !== "file") {
+        throw new ScanControlError("a directory input root or its mount changed after preflight", { cause: error });
+      }
+      changedFileRoots.add(snapshot.path);
+      recordChangedFileRoot(snapshot, error);
+    }
   }
-  return records;
+  return { records, changedFileRoots };
 }
 
 async function outputSafetySnapshot(output: string, lockPath: string): Promise<OutputSafetySnapshot> {
@@ -941,6 +953,15 @@ function quotaReason(error: unknown): ScanState["pauseReason"] | undefined {
 async function runManifest(runtime: ScanRuntime): Promise<Record<string, unknown>> {
   let lastCheckpoint = Date.now();
   let filesAtCheckpoint = runtime.progress.filesVisited;
+  const recordedChangedFileRoots = new Set<string>();
+  const inspectInputs = async (): Promise<{ records: MountRecord[]; changedFileRoots: Set<string> }> => await inspectRuntimeInputRoots(
+    runtime.inputSafety,
+    (snapshot, error) => {
+      if (recordedChangedFileRoots.has(snapshot.path)) return;
+      recordedChangedFileRoots.add(snapshot.path);
+      runtime.store.recordError(snapshot.path, "input-root", error);
+    },
+  );
   const maybeCheckpoint = async (force = false): Promise<void> => {
     if (force || Date.now() - lastCheckpoint >= 60_000 || runtime.progress.filesVisited - filesAtCheckpoint >= 25) {
       await persistCheckpoint(runtime);
@@ -964,7 +985,15 @@ async function runManifest(runtime: ScanRuntime): Promise<Record<string, unknown
       const continuing = file.index === runtime.state.cursor.fileIndex
         && runtime.progress.filesVisited > file.index;
       if (!continuing) runtime.progress.filesVisited += 1;
-      const currentMounts = await assertInputRootsCurrent(runtime.inputSafety);
+      const inputInspection = await inspectInputs();
+      if (inputInspection.changedFileRoots.has(file.path)) {
+        runtime.state.cursor = { fileIndex: file.index + 1, phase: "stream", nextOffset: 0 };
+        runtime.progress.phase = "stream";
+        await publishProgress(runtime);
+        await maybeCheckpoint();
+        continue;
+      }
+      const currentMounts = inputInspection.records;
       const fileMount = mountForPathFrom(currentMounts, file.path);
       if (fileMount === undefined || await runtime.isNetworkMount(fileMount)) {
         runtime.store.recordError(file.path, "walk-entry", new Error("refusing to scan a network-mounted file"));
@@ -990,7 +1019,7 @@ async function runManifest(runtime: ScanRuntime): Promise<Record<string, unknown
       if (interrupted(runtime.options.signal)) throw new Error("scan paused");
     }
     if (interrupted(runtime.options.signal)) throw new Error("scan paused");
-    await assertInputRootsCurrent(runtime.inputSafety);
+    await inspectInputs();
     await assertRuntimeOutputCurrent(runtime);
     await assertStorageCapacity(runtime.options.output, runtime.policy, runtime.budget.outputBytes());
     await runtime.pool.close();
@@ -1114,7 +1143,10 @@ export async function scanSensitiveMaterial(input: MiningOptions): Promise<Recor
       for (const held of locks) await held.assertHeld();
       await assertOutputSafetyCurrent(outputSafety, lock.path);
     };
-    const budget = new StorageBudget(options.output, policy, await directoryLogicalBytes(options.output, options.signal));
+    // A fresh output contains only the operation locks at this point. Do not
+    // let an already-aborted signal prevent creation of the clean, resumable
+    // inventory-phase pause that the caller requested.
+    const budget = new StorageBudget(options.output, policy, await directoryLogicalBytes(options.output));
     const store = new ArtifactStore(options.output, options.inputs, options.deepKeySchedules === true, assertSafeOutput, budget);
     await store.initialize();
     const progress: MiningProgress = {

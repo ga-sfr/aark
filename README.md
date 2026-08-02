@@ -8,7 +8,7 @@ The project is deliberately split into three layers:
 
 1. `recover` orchestrates mature Linux forensic tools against a read-only source and records provenance.
 2. `mine` scans recovered files or unallocated-space streams, strictly validates candidate structures, and stores sensitive values without printing them.
-3. `cleanup` proves that selected recovery copies were completely scanned, then can remove those copies while retaining final reports, exact findings, and their integrity metadata.
+3. `cleanup` proves that selected recovery copies were completely scanned, then can remove bulk data while retaining final reports, exact findings, every complete source file associated with a finding, and their integrity metadata.
 
 > [!CAUTION]
 > Use this only on media and data you own or are authorized to examine. Never recover back onto the source disk. SSD TRIM, overwrite, fragmentation, encryption, and filesystem reuse make “recover everything” impossible to guarantee.
@@ -95,7 +95,7 @@ aark cleanup plan /mnt/recovery/case-001/sensitive-mining \
   --case /mnt/recovery/case-001
 ```
 
-The path-redacted JSON gives aggregate filesystem-entry, regular-file, and byte counts, the number of marker-only locations without exported artifacts, and an approval token. Marker-only locations must be reviewed locally before cleanup. An agent must show that plan to the end user and ask whether to perform the irreversible cleanup; case-wide recovery authorization is not deletion approval. Only after the user agrees, run the unchanged plan with all three gates:
+The path-redacted JSON gives aggregate deletion counts and bytes, retained whole-source counts and bytes, the number of marker-only locations without exported artifacts, and an approval token. An agent must show that plan to the end user and ask whether to perform the irreversible cleanup; case-wide recovery authorization is not deletion approval. Only after the user agrees, run the unchanged plan with all three gates:
 
 ```bash
 aark cleanup run /mnt/recovery/case-001/sensitive-mining \
@@ -105,7 +105,7 @@ aark cleanup run /mnt/recovery/case-001/sensitive-mining \
   --confirm-delete-recovered-copy
 ```
 
-This removes the AARK-managed `recovery/`, `logs/`, and `runs/` directories. It retains the root final reports and manifests plus each complete mining output, including exact artifacts, final reports, `inventory-sensitive.json`, and the frozen integrity/checkpoint files. The `evidence/` image is retained by default. Planning evidence deletion requires `--include-evidence`; execution then additionally requires `--confirm-delete-evidence`. See [Cleanup workflow](docs/cleanup.md).
+This removes the AARK-managed `recovery/`, `logs/`, and `runs/` directories after moving every finding-containing source file intact into `retained-sensitive-source-files/<APPROVAL_TOKEN>/`, preserving its path relative to the selected case directory. It also retains the root final reports and manifests plus each complete mining output, including exact artifacts, final reports, `inventory-sensitive.json`, and the frozen integrity/checkpoint files. The `evidence/` image is retained by default. Planning evidence deletion requires `--include-evidence`; execution then additionally requires `--confirm-delete-evidence`. See [Cleanup workflow](docs/cleanup.md).
 
 The output contains:
 

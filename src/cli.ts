@@ -261,7 +261,7 @@ mine.command("reveal")
     });
   });
 
-const cleanup = program.command("cleanup").description("Verify and remove scanned recovery copies while retaining reports and exact findings");
+const cleanup = program.command("cleanup").description("Verify and remove scanned recovery copies while retaining reports, exact findings, and their complete source files");
 
 cleanup.command("plan")
   .description("Build a path-redacted, read-only cleanup plan and approval token")
