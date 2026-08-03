@@ -1,6 +1,7 @@
 import { Worker } from "node:worker_threads";
 import type { DetectionContext } from "./detectors/types.js";
 import { isSafeDetectorIdentifier, MAX_CANDIDATES_PER_DETECTOR_JOB } from "./limits.js";
+import { expectedDetectorNames } from "./worker-protocol.js";
 import type { DetectorBatchResult, DetectorJobKind, DetectorJobRequest, DetectorJobResponse } from "./worker-protocol.js";
 
 const MAX_ACTIVE_DETECTOR_BYTES = 256 * 1024 * 1024;
@@ -27,6 +28,12 @@ export class DetectorWorkerPool {
   private failure?: Error;
   private closed = false;
   private closing?: Promise<void>;
+  private jobsSubmitted = 0;
+  private payloadCopies = 0;
+  private payloadBytesCopied = 0;
+  private maximumQueueDepth = 0;
+  private maximumActiveJobs = 0;
+  private maximumActiveBytes = 0;
 
   public constructor(public readonly size: number) {
     if (!Number.isSafeInteger(size) || size < 1 || size > 4) throw new Error("worker count must be an integer from 1 through 4");
@@ -54,16 +61,18 @@ export class DetectorWorkerPool {
         return;
       }
       const response = value as Partial<DetectorJobResponse>;
+      const expectedNames = active === undefined ? [] : expectedDetectorNames(active.kind);
       if (
         active === undefined
         || response.id !== active.id
         || !Array.isArray(response.results)
-        || (response.fatalError === undefined ? response.results.length !== 1 : response.results.length !== 0)
+        || (response.fatalError === undefined ? response.results.length !== expectedNames.length : response.results.length !== 0)
         || (response.fatalError !== undefined && typeof response.fatalError !== "string")
         || (typeof response.fatalError === "string" && response.fatalError.length > 4_096)
-        || response.results.some((batch) => (
+        || response.results.some((batch, index) => (
           typeof batch !== "object"
           || batch === null
+          || batch.detector !== expectedNames[index]
           || !isSafeDetectorIdentifier(batch.detector)
           || !Array.isArray(batch.candidates)
           || batch.candidates.length > MAX_CANDIDATES_PER_DETECTOR_JOB
@@ -114,6 +123,10 @@ export class DetectorWorkerPool {
       try {
         const payload = new Uint8Array(job.data.byteLength);
         payload.set(job.data);
+        this.payloadCopies += 1;
+        this.payloadBytesCopied += payload.byteLength;
+        this.maximumActiveJobs = Math.max(this.maximumActiveJobs, this.slots.filter((candidate) => candidate.active !== undefined).length);
+        this.maximumActiveBytes = Math.max(this.maximumActiveBytes, activeBytes);
         const request: DetectorJobRequest = {
           id: job.id,
           kind: job.kind,
@@ -139,8 +152,28 @@ export class DetectorWorkerPool {
     }
     return new Promise<DetectorBatchResult[]>((resolve, reject) => {
       this.queue.push({ id: this.nextId++, kind, data, context: { ...context }, resolve, reject });
+      this.jobsSubmitted += 1;
+      this.maximumQueueDepth = Math.max(this.maximumQueueDepth, this.queue.length);
       this.dispatch();
     });
+  }
+
+  public metrics(): {
+    jobsSubmitted: number;
+    payloadCopies: number;
+    payloadBytesCopied: number;
+    maximumQueueDepth: number;
+    maximumActiveJobs: number;
+    maximumActiveBytes: number;
+  } {
+    return {
+      jobsSubmitted: this.jobsSubmitted,
+      payloadCopies: this.payloadCopies,
+      payloadBytesCopied: this.payloadBytesCopied,
+      maximumQueueDepth: this.maximumQueueDepth,
+      maximumActiveJobs: this.maximumActiveJobs,
+      maximumActiveBytes: this.maximumActiveBytes,
+    };
   }
 
   public close(terminate = false): Promise<void> {

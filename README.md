@@ -156,6 +156,8 @@ The Node mining layer currently recognizes or validates:
 
 Shape validation does not prove that an online credential is active. The tool intentionally does not test recovered credentials against providers.
 
+Small complete files are scanned through a bounded multi-file worker pipeline: up to four files and 64 MiB of main-thread source buffers are in flight, detector families share one transferable copy, and findings are still verified and committed in frozen-manifest order. Raw-byte mining does not claim that visible text inside an image has been examined; the separately bounded, fully offline future interface is described in the [OCR layer plan](docs/ocr-plan.md).
+
 ## Safety and interpretation
 
 - Block-device sources must report read-only unless the case explicitly opts out. Opting out is strongly discouraged.

@@ -27,6 +27,37 @@ export interface MiningProgress {
   scanErrors: number;
 }
 
+/** Aggregate-only, invocation-local scanner measurements. No paths or values are recorded. */
+export interface MiningPerformance {
+  elapsedMs: number;
+  inventoryTraversalMs: number;
+  rootValidationCalls: number;
+  rootValidationMs: number;
+  fileValidationCalls: number;
+  fileValidationMs: number;
+  readCalls: number;
+  bytesRead: number;
+  readMs: number;
+  workerJobs: number;
+  workerPayloadCopies: number;
+  workerPayloadBytes: number;
+  maximumWorkerQueueDepth: number;
+  maximumActiveWorkerJobs: number;
+  maximumActiveWorkerBytes: number;
+  deterministicCommitMs: number;
+  artifactPublications: number;
+  artifactLogicalBytes: number;
+  artifactPublicationMs: number;
+  checkpoints: number;
+  checkpointBytes: number;
+  checkpointMs: number;
+  periodicSafetyChecks: number;
+  periodicSafetyCheckMs: number;
+  maximumOutstandingFiles: number;
+  maximumOutstandingFileBytes: number;
+  completeFileBuffersReused: number;
+}
+
 export type MiningRunStatus = "in-progress" | "paused" | "complete" | "complete-with-errors" | "failed" | "interrupted";
 
 export interface SensitiveOccurrence {

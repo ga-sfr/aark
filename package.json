@@ -25,6 +25,7 @@
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build:test && node --test dist/test/*.test.js",
+    "benchmark:small-files": "npm run build:test && node scripts/benchmark-small-files.mjs",
     "check:python": "python3 -c \"import ast,pathlib; ast.parse(pathlib.Path('optional/impacket/dpapi_bridge.py').read_text(encoding='utf-8'))\"",
     "audit:repo": "node scripts/audit-repository.mjs",
     "audit:dependencies": "npm audit --audit-level=moderate",

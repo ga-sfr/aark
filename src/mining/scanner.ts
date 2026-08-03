@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import { availableParallelism } from "node:os";
 import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import type { Candidate } from "../core/types.js";
 import { acquireExclusiveLock, nearestExistingParent, readDirectoryNamesBounded, walkRegularFiles } from "../core/fs-safe.js";
 import type { ExclusiveLock, WalkedFile } from "../core/fs-safe.js";
@@ -35,9 +36,10 @@ import type {
   ScanSemanticOptions,
   ScanState,
 } from "./resume.js";
-import type { MiningOptions, MiningProgress, MiningRunStatus, SensitiveScanInventory } from "./types.js";
+import type { MiningOptions, MiningPerformance, MiningProgress, MiningRunStatus, SensitiveScanInventory } from "./types.js";
 import { isBoundedJsonValue, isSafeDetectorIdentifier, MAX_CANDIDATE_BYTES_PER_DETECTOR_JOB, MAX_DERIVED_ARTIFACT_BYTES_PER_CANDIDATE, MAX_INPUT_ROOTS, MAX_STREAMING_CANDIDATE_BYTES_PER_DETECTOR_JOB } from "./limits.js";
 import { MAX_DPAPI_BLOB_BYTES } from "./validators/dpapi.js";
+import { STREAMING_DETECTOR_NAMES } from "./worker-protocol.js";
 import type { DetectorBatchResult, DetectorJobKind } from "./worker-protocol.js";
 import { DetectorWorkerPool } from "./worker-pool.js";
 
@@ -45,12 +47,10 @@ const MINIMUM_SAFE_OVERLAP = MAX_DPAPI_BLOB_BYTES + 1024 * 1024;
 const DEEP_SCAN_SLICE_BYTES = 1024 * 1024;
 const DEEP_SCAN_OVERLAP_BYTES = 256;
 const MAX_BUFFERED_SCAN_WINDOWS_BYTES = 256 * 1024 * 1024;
-const STREAMING_DETECTOR_KINDS = [
-  "cryptographic-keys",
-  "configuration-secrets",
-  "wallet-secrets",
-  "provider-credentials",
-] as const satisfies readonly DetectorJobKind[];
+const MAX_BUFFERED_SMALL_FILES_BYTES = 64 * 1024 * 1024;
+const PERIODIC_SAFETY_INTERVAL_MS = 30_000;
+const PERIODIC_SAFETY_BYTES = 1024 * 1024 * 1024;
+const CHECKPOINT_INTERVAL_MS = 60_000;
 const MINING_LOCK_FILENAME = ".aark-mining.lock";
 const LEGACY_MINING_LOCK_FILENAME = ".agetnic-mining.lock";
 const MINING_LOCK_FILENAMES = [MINING_LOCK_FILENAME, LEGACY_MINING_LOCK_FILENAME] as const;
@@ -104,6 +104,78 @@ interface DetectorWorkResult extends DetectorWork {
   batches: DetectorBatchResult[];
 }
 
+interface WorkerMetricsSnapshot {
+  jobsSubmitted: number;
+  payloadCopies: number;
+  payloadBytesCopied: number;
+  maximumQueueDepth: number;
+  maximumActiveJobs: number;
+  maximumActiveBytes: number;
+}
+
+class MiningMetrics {
+  public inventoryTraversalMs = 0;
+  public rootValidationCalls = 0;
+  public rootValidationMs = 0;
+  public fileValidationCalls = 0;
+  public fileValidationMs = 0;
+  public readCalls = 0;
+  public bytesRead = 0;
+  public readMs = 0;
+  public deterministicCommitMs = 0;
+  public artifactPublications = 0;
+  public artifactLogicalBytes = 0;
+  public artifactPublicationMs = 0;
+  public checkpoints = 0;
+  public checkpointBytes = 0;
+  public checkpointMs = 0;
+  public periodicSafetyChecks = 0;
+  public periodicSafetyCheckMs = 0;
+  public maximumOutstandingFiles = 0;
+  public maximumOutstandingFileBytes = 0;
+  public completeFileBuffersReused = 0;
+  private readonly started = performance.now();
+
+  public artifactPublished(logicalBytes: number, elapsedMs: number): void {
+    this.artifactPublications += 1;
+    this.artifactLogicalBytes += logicalBytes;
+    this.artifactPublicationMs += elapsedMs;
+  }
+
+  public snapshot(worker?: WorkerMetricsSnapshot): MiningPerformance {
+    const rounded = (value: number): number => Math.round(value * 1_000) / 1_000;
+    return {
+      elapsedMs: rounded(performance.now() - this.started),
+      inventoryTraversalMs: rounded(this.inventoryTraversalMs),
+      rootValidationCalls: this.rootValidationCalls,
+      rootValidationMs: rounded(this.rootValidationMs),
+      fileValidationCalls: this.fileValidationCalls,
+      fileValidationMs: rounded(this.fileValidationMs),
+      readCalls: this.readCalls,
+      bytesRead: this.bytesRead,
+      readMs: rounded(this.readMs),
+      workerJobs: worker?.jobsSubmitted ?? 0,
+      workerPayloadCopies: worker?.payloadCopies ?? 0,
+      workerPayloadBytes: worker?.payloadBytesCopied ?? 0,
+      maximumWorkerQueueDepth: worker?.maximumQueueDepth ?? 0,
+      maximumActiveWorkerJobs: worker?.maximumActiveJobs ?? 0,
+      maximumActiveWorkerBytes: worker?.maximumActiveBytes ?? 0,
+      deterministicCommitMs: rounded(this.deterministicCommitMs),
+      artifactPublications: this.artifactPublications,
+      artifactLogicalBytes: this.artifactLogicalBytes,
+      artifactPublicationMs: rounded(this.artifactPublicationMs),
+      checkpoints: this.checkpoints,
+      checkpointBytes: this.checkpointBytes,
+      checkpointMs: rounded(this.checkpointMs),
+      periodicSafetyChecks: this.periodicSafetyChecks,
+      periodicSafetyCheckMs: rounded(this.periodicSafetyCheckMs),
+      maximumOutstandingFiles: this.maximumOutstandingFiles,
+      maximumOutstandingFileBytes: this.maximumOutstandingFileBytes,
+      completeFileBuffersReused: this.completeFileBuffersReused,
+    };
+  }
+}
+
 interface ScanRuntime {
   options: NormalizedMiningOptions;
   policy: StoragePolicy;
@@ -117,6 +189,7 @@ interface ScanRuntime {
   state: ScanState;
   progress: MiningProgress;
   isNetworkMount: (record: MountRecord) => Promise<boolean>;
+  metrics: MiningMetrics;
 }
 
 class ArtifactWriteError extends Error {
@@ -127,6 +200,10 @@ class ScanControlError extends Error {
   public override readonly name = "ScanControlError";
 }
 
+class ScanPauseError extends Error {
+  public override readonly name = "ScanPauseError";
+}
+
 function inside(parent: string, child: string): boolean {
   const relative = path.relative(path.resolve(parent), path.resolve(child));
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
@@ -134,6 +211,18 @@ function inside(parent: string, child: string): boolean {
 
 function interrupted(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
+}
+
+function detectorWorkCancelled(error: unknown, signal: AbortSignal | undefined): boolean {
+  return interrupted(signal)
+    && error instanceof Error
+    && (error.message === "detector work was cancelled" || error.message === "detector worker pool is closed");
+}
+
+function manifestVerificationInterrupted(error: unknown, signal: AbortSignal | undefined): boolean {
+  return interrupted(signal)
+    && error instanceof Error
+    && error.message === "scan manifest verification was interrupted";
 }
 
 function mountIdentity(record: MountRecord): string {
@@ -187,6 +276,13 @@ async function inspectRuntimeInputRoots(
     }
   }
   return { records, changedFileRoots };
+}
+
+async function assertPauseInputRootsCurrent(expected: PathSafetySnapshot[]): Promise<void> {
+  const inspection = await inspectRuntimeInputRoots(expected, () => undefined);
+  if (inspection.changedFileRoots.size > 0) {
+    throw new ScanControlError("an explicit file input root changed, so the scan cannot publish a resumable pause");
+  }
 }
 
 async function outputSafetySnapshot(output: string, lockPath: string): Promise<OutputSafetySnapshot> {
@@ -419,18 +515,18 @@ async function commitDetectorResults(
   signal?: AbortSignal,
 ): Promise<boolean> {
   let clean = true;
-  let returnedCandidateBytes = 0;
-  const returnedCandidateByteLimit = result.kind === "structured"
-    ? MAX_CANDIDATE_BYTES_PER_DETECTOR_JOB
-    : MAX_STREAMING_CANDIDATE_BYTES_PER_DETECTOR_JOB;
   for (const batch of result.batches) {
-    if (interrupted(signal)) throw new Error("scan paused");
+    let returnedCandidateBytes = 0;
+    const returnedCandidateByteLimit = batch.detector === "structured-artifacts"
+      ? MAX_CANDIDATE_BYTES_PER_DETECTOR_JOB
+      : MAX_STREAMING_CANDIDATE_BYTES_PER_DETECTOR_JOB;
+    if (interrupted(signal)) throw new ScanPauseError("scan paused");
     if (batch.error !== undefined) {
       store.recordError(sourcePath, `detector:${batch.detector}`, new Error(batch.error));
       clean = false;
     }
     for (const rawCandidate of batch.candidates) {
-      if (interrupted(signal)) throw new Error("scan paused");
+      if (interrupted(signal)) throw new ScanPauseError("scan paused");
       try {
         if (
           typeof rawCandidate !== "object"
@@ -492,7 +588,6 @@ async function runDetectorWork(pool: DetectorWorkerPool, work: DetectorWork[], s
   let next = 0;
   const consumers = Array.from({ length: Math.min(pool.size, work.length) }, async () => {
     while (true) {
-      if (signal?.aborted === true) throw new Error("scan paused");
       const index = next++;
       const item = work[index];
       if (item === undefined) return;
@@ -500,7 +595,7 @@ async function runDetectorWork(pool: DetectorWorkerPool, work: DetectorWork[], s
       try {
         batches = await pool.run(item.kind, item.data, item.context);
       } catch (error) {
-        if (interrupted(signal)) throw new Error("scan paused", { cause: error });
+        if (detectorWorkCancelled(error, signal)) throw new ScanPauseError("scan paused", { cause: error });
         throw new ScanControlError("detector worker execution failed", { cause: error });
       }
       results[index] = { ...item, batches };
@@ -529,7 +624,7 @@ async function* runDetectorWorkOrdered(
       const pending = pool.run(item.kind, item.data, item.context)
         .then((batches) => ({ ...item, batches }))
         .catch((error: unknown) => {
-          if (interrupted(signal)) throw new Error("scan paused", { cause: error });
+          if (detectorWorkCancelled(error, signal)) throw new ScanPauseError("scan paused", { cause: error });
           throw new ScanControlError("detector worker execution failed", { cause: error });
         });
       // The generator awaits each promise in order. Attach a rejection handler
@@ -540,7 +635,6 @@ async function* runDetectorWorkOrdered(
   };
   fill();
   for (let index = 0; index < work.length; index += 1) {
-    if (interrupted(signal)) throw new Error("scan paused");
     const pending = outstanding.get(index);
     if (pending === undefined) throw new Error("detector work ordering became inconsistent");
     const result = await pending;
@@ -558,7 +652,10 @@ async function commitDetectorWorkInBatches(
 ): Promise<boolean> {
   let clean = true;
   for (let start = 0; start < work.length; start += runtime.pool.size) {
-    if (interrupted(runtime.options.signal)) throw new Error("scan paused");
+    if (interrupted(runtime.options.signal)) {
+      await assertSourceCurrent();
+      throw new ScanPauseError("scan paused");
+    }
     const results = await runDetectorWork(
       runtime.pool,
       work.slice(start, start + runtime.pool.size),
@@ -566,20 +663,25 @@ async function commitDetectorWorkInBatches(
     );
     await assertSourceCurrent();
     for (const result of results) {
-      clean = await commitDetectorResults(
-        result,
-        sourcePath,
-        runtime.options.provenance,
-        runtime.store,
-        runtime.options.signal,
-      ) && clean;
+      const commitStarted = performance.now();
+      try {
+        clean = await commitDetectorResults(
+          result,
+          sourcePath,
+          runtime.options.provenance,
+          runtime.store,
+          runtime.options.signal,
+        ) && clean;
+      } finally {
+        runtime.metrics.deterministicCommitMs += performance.now() - commitStarted;
+      }
     }
   }
   return clean;
 }
 
 function workForWindow(data: Buffer, context: DetectionContext, deep: boolean, deepPrimaryStart = 0): DetectorWork[] {
-  const work: DetectorWork[] = STREAMING_DETECTOR_KINDS.map((kind) => ({ kind, data, context }));
+  const work: DetectorWork[] = [{ kind: "streaming", data, context }];
   if (!deep) return work;
   const scanStart = deepPrimaryStart === 0 ? 0 : Math.max(0, deepPrimaryStart - DEEP_SCAN_OVERLAP_BYTES);
   let primaryStart = scanStart;
@@ -634,16 +736,215 @@ function assertFileSnapshot(file: FrozenScanFile, metadata: Awaited<ReturnType<A
   ) throw new Error("scan input changed from its frozen file manifest snapshot");
 }
 
-async function readExact(handle: Awaited<ReturnType<typeof open>>, start: number, bytes: number): Promise<Buffer> {
+async function readExact(
+  handle: Awaited<ReturnType<typeof open>>,
+  start: number,
+  bytes: number,
+  metrics: MiningMetrics,
+): Promise<Buffer> {
+  const started = performance.now();
   const data = Buffer.allocUnsafe(bytes);
   let consumed = 0;
-  while (consumed < bytes) {
-    const result = await handle.read(data, consumed, bytes - consumed, start + consumed);
-    if (result.bytesRead === 0) break;
-    consumed += result.bytesRead;
+  try {
+    while (consumed < bytes) {
+      const result = await handle.read(data, consumed, bytes - consumed, start + consumed);
+      if (result.bytesRead === 0) break;
+      consumed += result.bytesRead;
+    }
+    if (consumed !== bytes) throw new Error("scan input ended before its frozen file size");
+    return data;
+  } finally {
+    metrics.readCalls += 1;
+    metrics.bytesRead += consumed;
+    metrics.readMs += performance.now() - started;
   }
-  if (consumed !== bytes) throw new Error("scan input ended before its frozen file size");
-  return data;
+}
+
+type OpenFileHandle = Awaited<ReturnType<typeof open>>;
+type OpenFileStat = Awaited<ReturnType<OpenFileHandle["stat"]>>;
+
+interface PreparedSmallFile {
+  file: FrozenScanFile;
+  data: Buffer;
+  handle: OpenFileHandle;
+  opened: OpenFileStat;
+  batches: DetectorBatchResult[];
+}
+
+type SmallFileOutcome =
+  | { prepared: PreparedSmallFile }
+  | { file: FrozenScanFile; error: unknown };
+
+async function assertPreparedFileCurrent(runtime: ScanRuntime, prepared: Pick<PreparedSmallFile, "file" | "handle" | "opened">): Promise<void> {
+  const started = performance.now();
+  try {
+    const current = await prepared.handle.stat();
+    assertFileSnapshot(prepared.file, current);
+    await assertOpenedFilePathCurrent(prepared.file.path, prepared.handle, prepared.opened);
+  } finally {
+    runtime.metrics.fileValidationCalls += 1;
+    runtime.metrics.fileValidationMs += performance.now() - started;
+  }
+}
+
+async function assertPreparedFileSnapshotCurrent(runtime: ScanRuntime, prepared: Pick<PreparedSmallFile, "file" | "handle">): Promise<void> {
+  const started = performance.now();
+  try {
+    assertFileSnapshot(prepared.file, await prepared.handle.stat());
+  } finally {
+    runtime.metrics.fileValidationCalls += 1;
+    runtime.metrics.fileValidationMs += performance.now() - started;
+  }
+}
+
+async function prepareSmallFile(runtime: ScanRuntime, file: FrozenScanFile): Promise<SmallFileOutcome> {
+  let handle: OpenFileHandle | undefined;
+  try {
+    handle = await open(file.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const opened = await handle.stat();
+    const preparedIdentity = { file, handle, opened };
+    await assertPreparedFileCurrent(runtime, preparedIdentity);
+    const data = await readExact(handle, 0, file.bytes, runtime.metrics);
+    // Catch mutation during the read before spending worker time. The full
+    // descriptor/canonical-path check is repeated immediately before commit.
+    await assertPreparedFileSnapshotCurrent(runtime, preparedIdentity);
+    const context: DetectionContext = {
+      sourcePath: file.path,
+      baseOffset: 0,
+      wholeFile: false,
+      deepKeySchedules: false,
+    };
+    let batches: DetectorBatchResult[];
+    try {
+      batches = await runtime.pool.run("small-file", data, context);
+    } catch (error) {
+      if (detectorWorkCancelled(error, runtime.options.signal)) throw new ScanPauseError("scan paused", { cause: error });
+      throw new ScanControlError("detector worker execution failed", { cause: error });
+    }
+    return { prepared: { file, data, handle, opened, batches } };
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    return { file, error };
+  }
+}
+
+function beginManifestFile(runtime: ScanRuntime, file: FrozenScanFile): void {
+  const continuing = file.index === runtime.state.cursor.fileIndex
+    && runtime.progress.filesVisited > file.index;
+  if (!continuing) runtime.progress.filesVisited += 1;
+}
+
+async function completeManifestFile(runtime: ScanRuntime, file: FrozenScanFile, completelyScanned: boolean): Promise<void> {
+  if (completelyScanned) runtime.progress.filesScanned += 1;
+  runtime.state.cursor = { fileIndex: file.index + 1, phase: "stream", nextOffset: 0 };
+  runtime.progress.phase = "stream";
+  await publishProgress(runtime);
+}
+
+async function processSmallFileBatch(
+  runtime: ScanRuntime,
+  files: FrozenScanFile[],
+  maybeCheckpoint: (force?: boolean) => Promise<void>,
+): Promise<void> {
+  const bytes = files.reduce((sum, file) => sum + file.bytes, 0);
+  runtime.metrics.maximumOutstandingFiles = Math.max(runtime.metrics.maximumOutstandingFiles, files.length);
+  runtime.metrics.maximumOutstandingFileBytes = Math.max(runtime.metrics.maximumOutstandingFileBytes, bytes);
+  const pendingOutcomes = files.map(async (file) => await prepareSmallFile(runtime, file));
+  const closedHandles = new Set<OpenFileHandle>();
+  try {
+    for (const pending of pendingOutcomes) {
+      const outcome = await pending;
+      // Observe a worker/control failure before honoring a concurrent signal;
+      // otherwise a crash already present in this ordered slot could be
+      // mislabeled as a resumable cancellation.
+      if (!("prepared" in outcome) && outcome.error instanceof ScanControlError) {
+        await runtime.pool.close(true).catch(() => undefined);
+        throw outcome.error;
+      }
+      if (interrupted(runtime.options.signal)) throw new ScanPauseError("scan paused");
+      const file = "prepared" in outcome ? outcome.prepared.file : outcome.file;
+      beginManifestFile(runtime, file);
+      let completelyScanned = false;
+      if ("prepared" in outcome) {
+        try {
+          await assertPreparedFileCurrent(runtime, outcome.prepared);
+          const result: DetectorWorkResult = {
+            kind: "small-file",
+            data: outcome.prepared.data,
+            context: {
+              sourcePath: file.path,
+              baseOffset: 0,
+              wholeFile: false,
+              deepKeySchedules: false,
+            },
+            batches: outcome.prepared.batches.slice(0, STREAMING_DETECTOR_NAMES.length),
+          };
+          const commitStarted = performance.now();
+          try {
+            completelyScanned = await commitDetectorResults(
+              result,
+              file.path,
+              runtime.options.provenance,
+              runtime.store,
+              runtime.options.signal,
+            );
+          } finally {
+            runtime.metrics.deterministicCommitMs += performance.now() - commitStarted;
+          }
+          await assertPreparedFileCurrent(runtime, outcome.prepared);
+          runtime.state.cursor = { fileIndex: file.index, phase: "stream", nextOffset: file.bytes };
+          runtime.progress.bytesScanned += file.bytes;
+          await publishProgress(runtime);
+          await maybeCheckpoint();
+          await assertPreparedFileCurrent(runtime, outcome.prepared);
+          runtime.state.cursor = { fileIndex: file.index, phase: "whole-file", nextOffset: 0 };
+          if (interrupted(runtime.options.signal)) throw new ScanPauseError("scan paused");
+          const structuredBatch = outcome.prepared.batches[STREAMING_DETECTOR_NAMES.length];
+          if (structuredBatch === undefined) {
+            throw new ScanControlError("small-file worker omitted its structured detector result");
+          }
+          const structuredStarted = performance.now();
+          try {
+            completelyScanned = await commitDetectorResults({
+              kind: "structured",
+              data: outcome.prepared.data,
+              context: {
+                sourcePath: file.path,
+                baseOffset: 0,
+                wholeFile: true,
+                deepKeySchedules: false,
+              },
+              batches: [structuredBatch],
+            }, file.path, runtime.options.provenance, runtime.store, runtime.options.signal) && completelyScanned;
+          } finally {
+            runtime.metrics.deterministicCommitMs += performance.now() - structuredStarted;
+          }
+          runtime.metrics.completeFileBuffersReused += 1;
+          await assertPreparedFileCurrent(runtime, outcome.prepared);
+          await outcome.prepared.handle.close();
+          closedHandles.add(outcome.prepared.handle);
+        } catch (error) {
+          if (error instanceof ArtifactWriteError || error instanceof ScanControlError || quotaReason(error) !== undefined || interrupted(runtime.options.signal)) {
+            await runtime.pool.close(true).catch(() => undefined);
+            throw error;
+          }
+          runtime.store.recordError(file.path, "read-or-scan", error);
+          completelyScanned = false;
+        }
+      } else {
+        runtime.store.recordError(file.path, "read-or-scan", outcome.error);
+      }
+      await completeManifestFile(runtime, file, completelyScanned);
+      await maybeCheckpoint();
+    }
+  } finally {
+    const settled = await Promise.all(pendingOutcomes);
+    await Promise.all(settled.flatMap((outcome) => (
+      "prepared" in outcome && !closedHandles.has(outcome.prepared.handle)
+        ? [outcome.prepared.handle.close().catch(() => undefined)]
+        : []
+    )));
+  }
 }
 
 function sameRootSnapshots(left: PathSafetySnapshot[], right: ScanState["inputRoots"]): boolean {
@@ -708,21 +1009,28 @@ async function createFrozenInputManifest(
   budget: StorageBudget,
   progress: MiningProgress,
   assertSafeOutput: () => Promise<void>,
+  metrics: MiningMetrics,
 ): Promise<ScanState["manifest"]> {
+  const traversalStarted = performance.now();
   progress.phase = "inventory";
   progress.filesTotal = 0;
+  let currentMounts = await mounts();
+  let mountsUpdatedAt = Date.now();
   const walked = walkRegularFiles(options.inputs, {
     ...(options.signal === undefined ? {} : { signal: options.signal }),
     onError: (sourcePath, error) => store.recordError(sourcePath, "walk-entry", error),
     shouldEnterDirectory: async (directory) => {
-      const currentMounts = await mounts();
+      if (Date.now() - mountsUpdatedAt >= PERIODIC_SAFETY_INTERVAL_MS) {
+        currentMounts = await mounts();
+        mountsUpdatedAt = Date.now();
+      }
       const mounted = mountForPathFrom(currentMounts, directory);
       return mounted !== undefined && !(await isNetworkMount(mounted));
     },
   });
   async function* tracked(): AsyncGenerator<WalkedFile> {
     for await (const file of walked) {
-      if (interrupted(options.signal)) throw new Error("scan paused during input inventory");
+      if (interrupted(options.signal)) throw new ScanPauseError("scan paused during input inventory");
       progress.filesTotal = (progress.filesTotal ?? 0) + 1;
       if (progress.filesTotal % 1_000 === 0) {
         Object.assign(progress, store.counts());
@@ -734,11 +1042,22 @@ async function createFrozenInputManifest(
       }
       yield file;
     }
-    if (interrupted(options.signal)) throw new Error("scan paused during input inventory");
+    if (interrupted(options.signal)) throw new ScanPauseError("scan paused during input inventory");
   }
-  const manifest = await createScanManifest(options.output, tracked(), budget, assertSafeOutput);
-  Object.assign(progress, store.counts());
-  return manifest;
+  try {
+    const manifest = await createScanManifest(options.output, tracked(), budget, assertSafeOutput);
+    Object.assign(progress, store.counts());
+    return manifest;
+  } catch (error) {
+    if (
+      interrupted(options.signal)
+      && error instanceof Error
+      && error.message === "regular-file walk was paused"
+    ) throw new ScanPauseError("scan paused during input inventory", { cause: error });
+    throw error;
+  } finally {
+    metrics.inventoryTraversalMs += performance.now() - traversalStarted;
+  }
 }
 
 async function* emptyManifestFiles(): AsyncGenerator<WalkedFile> {
@@ -752,9 +1071,10 @@ async function finalizeInventoryPause(
   budget: StorageBudget,
   progress: MiningProgress,
   reason: NonNullable<ScanState["pauseReason"]>,
+  metrics: MiningMetrics,
 ): Promise<Record<string, unknown>> {
   progress.phase = "inventory";
-  return await finalizeCleanPause(options, state, store, budget, progress, reason, `scan paused during input inventory: ${reason}`);
+  return await finalizeCleanPause(options, state, store, budget, progress, reason, `scan paused during input inventory: ${reason}`, metrics);
 }
 
 async function finalizeCleanPause(
@@ -765,6 +1085,8 @@ async function finalizeCleanPause(
   progress: MiningProgress,
   reason: NonNullable<ScanState["pauseReason"]>,
   message = `scan paused: ${reason}`,
+  metrics?: MiningMetrics,
+  pool?: DetectorWorkerPool,
 ): Promise<Record<string, unknown>> {
   Object.assign(progress, store.counts());
   state.status = "paused";
@@ -775,15 +1097,22 @@ async function finalizeCleanPause(
   const inventory = await store.finalize("paused", progress, message, true, inventoryCheckpoint(state));
   state.inventory = { filename: "inventory-sensitive.json", ...inventory };
   await writeScanState(options.output, state, budget, true);
-  return resultObject("paused", progress, state, options.deepKeySchedules === true);
+  return resultObject("paused", progress, state, options.deepKeySchedules === true, metrics, pool);
 }
 
 async function persistCheckpoint(runtime: ScanRuntime): Promise<void> {
+  const started = performance.now();
   runtime.state.updatedAt = new Date().toISOString();
   runtime.state.progress = { ...runtime.progress };
-  const inventory = await runtime.store.checkpoint(runtime.progress, inventoryCheckpoint(runtime.state));
-  runtime.state.inventory = { filename: "inventory-sensitive.json", ...inventory };
-  await writeScanState(runtime.options.output, runtime.state, runtime.budget);
+  try {
+    const inventory = await runtime.store.checkpoint(runtime.progress, inventoryCheckpoint(runtime.state));
+    runtime.state.inventory = { filename: "inventory-sensitive.json", ...inventory };
+    await writeScanState(runtime.options.output, runtime.state, runtime.budget);
+    runtime.metrics.checkpointBytes += inventory.bytes;
+  } finally {
+    runtime.metrics.checkpoints += 1;
+    runtime.metrics.checkpointMs += performance.now() - started;
+  }
 }
 
 async function verifyCompletedManifestFiles(output: string, state: ScanState, inputRoots: PathSafetySnapshot[], signal?: AbortSignal): Promise<void> {
@@ -807,8 +1136,14 @@ async function verifyCompletedManifestFiles(output: string, state: ScanState, in
       ) throw new Error("scan resume cursor is not aligned with its frozen input file");
     }
     if (file.index > state.cursor.fileIndex || (file.index === state.cursor.fileIndex && state.cursor.nextOffset === 0 && state.cursor.phase === "stream")) continue;
-    const metadata = await lstat(file.path);
-    if (metadata.isSymbolicLink() || !metadata.isFile() || await realpath(file.path) !== file.path) {
+    let metadata: Awaited<ReturnType<typeof lstat>>;
+    let canonicalPath: string;
+    try {
+      [metadata, canonicalPath] = await Promise.all([lstat(file.path), realpath(file.path)]);
+    } catch (error) {
+      throw new Error("a completed or partial resume input is no longer stably addressable", { cause: error });
+    }
+    if (metadata.isSymbolicLink() || !metadata.isFile() || canonicalPath !== file.path) {
       throw new Error("a completed resume input is no longer a canonical regular file");
     }
     if (metadata.dev !== file.device || metadata.ino !== file.inode || metadata.size !== file.bytes || metadata.mtimeMs !== file.modifiedMs || metadata.ctimeMs !== file.changedMs) {
@@ -821,22 +1156,33 @@ async function verifyCompletedManifestFiles(output: string, state: ScanState, in
 async function processFile(runtime: ScanRuntime, file: FrozenScanFile, cursor: ScanCursor, maybeCheckpoint: (force?: boolean) => Promise<void>): Promise<boolean> {
   const handle = await open(file.path, constants.O_RDONLY | constants.O_NOFOLLOW);
   let clean = true;
+  let completeFileData: Buffer | undefined;
   try {
     const assertSourceCurrent = async (): Promise<void> => {
-      const current = await handle.stat();
-      assertFileSnapshot(file, current);
-      await assertOpenedFilePathCurrent(file.path, handle, current);
+      const started = performance.now();
+      try {
+        const current = await handle.stat();
+        assertFileSnapshot(file, current);
+        await assertOpenedFilePathCurrent(file.path, handle, current);
+      } finally {
+        runtime.metrics.fileValidationCalls += 1;
+        runtime.metrics.fileValidationMs += performance.now() - started;
+      }
     };
     await assertSourceCurrent();
     if (cursor.phase === "stream") {
       let offset = cursor.nextOffset;
       while (offset < file.bytes) {
-        if (interrupted(runtime.options.signal)) throw new Error("scan paused");
+        if (interrupted(runtime.options.signal)) {
+          await assertSourceCurrent();
+          throw new ScanPauseError("scan paused");
+        }
         if (runtime.options.deepKeySchedules === true) {
           const primaryOffset = offset;
           const primaryEnd = Math.min(file.bytes, primaryOffset + runtime.options.chunkBytes);
           const windowStart = primaryOffset === 0 ? 0 : Math.max(0, primaryOffset - runtime.options.overlapBytes);
-          const data = await readExact(handle, windowStart, primaryEnd - windowStart);
+          const data = await readExact(handle, windowStart, primaryEnd - windowStart, runtime.metrics);
+          if (cursor.nextOffset === 0 && windowStart === 0 && primaryEnd === file.bytes) completeFileData = data;
           const context: DetectionContext = { sourcePath: file.path, baseOffset: windowStart, wholeFile: false, deepKeySchedules: false };
           clean = await commitDetectorWorkInBatches(
             runtime,
@@ -844,15 +1190,14 @@ async function processFile(runtime: ScanRuntime, file: FrozenScanFile, cursor: S
             file.path,
             assertSourceCurrent,
           ) && clean;
-          if (interrupted(runtime.options.signal)) throw new Error("scan paused");
           await assertSourceCurrent();
+          if (interrupted(runtime.options.signal)) throw new ScanPauseError("scan paused");
           offset = primaryEnd;
           runtime.state.cursor = { fileIndex: file.index, phase: "stream", nextOffset: offset };
           runtime.progress.bytesScanned += primaryEnd - primaryOffset;
-          await assertRuntimeOutputCurrent(runtime);
-          await assertStorageCapacity(runtime.options.output, runtime.policy, runtime.budget.outputBytes());
           await publishProgress(runtime);
           await maybeCheckpoint();
+          await assertSourceCurrent();
           continue;
         }
         const offsets: number[] = [];
@@ -867,7 +1212,8 @@ async function processFile(runtime: ScanRuntime, file: FrozenScanFile, cursor: S
         const windows = await Promise.all(offsets.map(async (primaryOffset) => {
           const primaryEnd = Math.min(file.bytes, primaryOffset + runtime.options.chunkBytes);
           const windowStart = primaryOffset === 0 ? 0 : Math.max(0, primaryOffset - runtime.options.overlapBytes);
-          const data = await readExact(handle, windowStart, primaryEnd - windowStart);
+          const data = await readExact(handle, windowStart, primaryEnd - windowStart, runtime.metrics);
+          if (cursor.nextOffset === 0 && windowStart === 0 && primaryEnd === file.bytes) completeFileData = data;
           const context: DetectionContext = { sourcePath: file.path, baseOffset: windowStart, wholeFile: false, deepKeySchedules: false };
           return { primaryOffset, primaryEnd, data, context };
         }));
@@ -875,22 +1221,25 @@ async function processFile(runtime: ScanRuntime, file: FrozenScanFile, cursor: S
         const orderedWork = windows.flatMap((window) => workForWindow(window.data, window.context, false));
         let completedWork = 0;
         for await (const result of runDetectorWorkOrdered(runtime.pool, orderedWork, runtime.options.signal)) {
-          if (interrupted(runtime.options.signal)) throw new Error("scan paused");
           await assertSourceCurrent();
-          clean = await commitDetectorResults(result, file.path, runtime.options.provenance, runtime.store, runtime.options.signal) && clean;
+          if (interrupted(runtime.options.signal)) throw new ScanPauseError("scan paused");
+          const commitStarted = performance.now();
+          try {
+            clean = await commitDetectorResults(result, file.path, runtime.options.provenance, runtime.store, runtime.options.signal) && clean;
+          } finally {
+            runtime.metrics.deterministicCommitMs += performance.now() - commitStarted;
+          }
           completedWork += 1;
-          if (completedWork % STREAMING_DETECTOR_KINDS.length !== 0) continue;
-          const analyzedChunk = windows[Math.floor(completedWork / STREAMING_DETECTOR_KINDS.length) - 1];
+          const analyzedChunk = windows[completedWork - 1];
           if (analyzedChunk === undefined) throw new Error("detector chunk ordering became inconsistent");
-          if (interrupted(runtime.options.signal)) throw new Error("scan paused");
           await assertSourceCurrent();
+          if (interrupted(runtime.options.signal)) throw new ScanPauseError("scan paused");
           offset = analyzedChunk.primaryEnd;
           runtime.state.cursor = { fileIndex: file.index, phase: "stream", nextOffset: offset };
           runtime.progress.bytesScanned += analyzedChunk.primaryEnd - analyzedChunk.primaryOffset;
-          await assertRuntimeOutputCurrent(runtime);
-          await assertStorageCapacity(runtime.options.output, runtime.policy, runtime.budget.outputBytes());
           await publishProgress(runtime);
           await maybeCheckpoint();
+          await assertSourceCurrent();
         }
         if (completedWork !== orderedWork.length) throw new Error("detector work did not complete its ordered batch");
         await assertSourceCurrent();
@@ -898,8 +1247,10 @@ async function processFile(runtime: ScanRuntime, file: FrozenScanFile, cursor: S
       runtime.state.cursor = { fileIndex: file.index, phase: "whole-file", nextOffset: 0 };
     }
     if (file.bytes <= runtime.options.wholeFileBytes) {
-      if (interrupted(runtime.options.signal)) throw new Error("scan paused");
-      const data = await readExact(handle, 0, file.bytes);
+      await assertSourceCurrent();
+      if (interrupted(runtime.options.signal)) throw new ScanPauseError("scan paused");
+      const data = completeFileData ?? await readExact(handle, 0, file.bytes, runtime.metrics);
+      if (completeFileData !== undefined) runtime.metrics.completeFileBuffersReused += 1;
       const context: DetectionContext = {
         sourcePath: file.path,
         baseOffset: 0,
@@ -909,7 +1260,12 @@ async function processFile(runtime: ScanRuntime, file: FrozenScanFile, cursor: S
       const [result] = await runDetectorWork(runtime.pool, [{ kind: "structured", data, context }], runtime.options.signal);
       if (result === undefined) throw new Error("structured detector worker returned no result");
       await assertSourceCurrent();
-      clean = await commitDetectorResults(result, file.path, runtime.options.provenance, runtime.store, runtime.options.signal) && clean;
+      const commitStarted = performance.now();
+      try {
+        clean = await commitDetectorResults(result, file.path, runtime.options.provenance, runtime.store, runtime.options.signal) && clean;
+      } finally {
+        runtime.metrics.deterministicCommitMs += performance.now() - commitStarted;
+      }
     }
     await assertSourceCurrent();
     return clean;
@@ -918,7 +1274,14 @@ async function processFile(runtime: ScanRuntime, file: FrozenScanFile, cursor: S
   }
 }
 
-function resultObject(status: MiningRunStatus, progress: MiningProgress, state: ScanState, deep: boolean): Record<string, unknown> {
+function resultObject(
+  status: MiningRunStatus,
+  progress: MiningProgress,
+  state: ScanState,
+  deep: boolean,
+  metrics?: MiningMetrics,
+  pool?: DetectorWorkerPool,
+): Record<string, unknown> {
   const complete = status === "complete" || status === "complete-with-errors";
   return {
     status,
@@ -937,6 +1300,7 @@ function resultObject(status: MiningRunStatus, progress: MiningProgress, state: 
     workers: state.operational.workers,
     valuesPrinted: false,
     reports: { sensitive: "final-report-sensitive.md", redacted: "final-report-redacted.md" },
+    ...(metrics === undefined ? {} : { performance: metrics.snapshot(pool?.metrics()) }),
     ...(status === "paused" ? { resumeCommand: "aark mine resume --output <OUTPUT_DIRECTORY>" } : {}),
   };
 }
@@ -953,78 +1317,195 @@ function quotaReason(error: unknown): ScanState["pauseReason"] | undefined {
 async function runManifest(runtime: ScanRuntime): Promise<Record<string, unknown>> {
   let lastCheckpoint = Date.now();
   let filesAtCheckpoint = runtime.progress.filesVisited;
+  let bytesAtCheckpoint = runtime.progress.bytesScanned;
+  let lastSafetyCheck = 0;
+  let bytesAtSafetyCheck = runtime.progress.bytesScanned;
+  let cachedInputInspection: { records: MountRecord[]; changedFileRoots: Set<string> } | undefined;
+  let inputInspectedAt = 0;
   const recordedChangedFileRoots = new Set<string>();
-  const inspectInputs = async (): Promise<{ records: MountRecord[]; changedFileRoots: Set<string> }> => await inspectRuntimeInputRoots(
-    runtime.inputSafety,
-    (snapshot, error) => {
-      if (recordedChangedFileRoots.has(snapshot.path)) return;
-      recordedChangedFileRoots.add(snapshot.path);
-      runtime.store.recordError(snapshot.path, "input-root", error);
-    },
-  );
+  const inspectInputs = async (force = false): Promise<{ records: MountRecord[]; changedFileRoots: Set<string> }> => {
+    if (!force && cachedInputInspection !== undefined && Date.now() - inputInspectedAt < PERIODIC_SAFETY_INTERVAL_MS) {
+      return cachedInputInspection;
+    }
+    const started = performance.now();
+    try {
+      cachedInputInspection = await inspectRuntimeInputRoots(
+        runtime.inputSafety,
+        (snapshot, error) => {
+          if (recordedChangedFileRoots.has(snapshot.path)) return;
+          recordedChangedFileRoots.add(snapshot.path);
+          runtime.store.recordError(snapshot.path, "input-root", error);
+        },
+      );
+      inputInspectedAt = Date.now();
+      return cachedInputInspection;
+    } finally {
+      runtime.metrics.rootValidationCalls += 1;
+      runtime.metrics.rootValidationMs += performance.now() - started;
+    }
+  };
+  const inspectRuntimeSafety = async (force = false): Promise<void> => {
+    const due = force
+      || Date.now() - lastSafetyCheck >= PERIODIC_SAFETY_INTERVAL_MS
+      || runtime.progress.bytesScanned - bytesAtSafetyCheck >= PERIODIC_SAFETY_BYTES;
+    if (!due) return;
+    const started = performance.now();
+    try {
+      await inspectInputs(true);
+      await assertRuntimeOutputCurrent(runtime);
+      await assertStorageCapacity(runtime.options.output, runtime.policy, runtime.budget.outputBytes());
+      lastSafetyCheck = Date.now();
+      bytesAtSafetyCheck = runtime.progress.bytesScanned;
+    } finally {
+      runtime.metrics.periodicSafetyChecks += 1;
+      runtime.metrics.periodicSafetyCheckMs += performance.now() - started;
+    }
+  };
   const maybeCheckpoint = async (force = false): Promise<void> => {
-    if (force || Date.now() - lastCheckpoint >= 60_000 || runtime.progress.filesVisited - filesAtCheckpoint >= 25) {
+    await inspectRuntimeSafety(false);
+    const madeProgress = runtime.progress.filesVisited !== filesAtCheckpoint
+      || runtime.progress.bytesScanned !== bytesAtCheckpoint;
+    if (force || (madeProgress && Date.now() - lastCheckpoint >= CHECKPOINT_INTERVAL_MS)) {
+      await inspectRuntimeSafety(true);
       await persistCheckpoint(runtime);
       lastCheckpoint = Date.now();
       filesAtCheckpoint = runtime.progress.filesVisited;
+      bytesAtCheckpoint = runtime.progress.bytesScanned;
     }
   };
   const abortPool = (): void => { void runtime.pool.close(true).catch(() => undefined); };
   runtime.options.signal?.addEventListener("abort", abortPool, { once: true });
+  const skipManifestFile = async (file: FrozenScanFile, operation?: string, error?: unknown): Promise<void> => {
+    beginManifestFile(runtime, file);
+    if (operation !== undefined) runtime.store.recordError(file.path, operation, error);
+    await completeManifestFile(runtime, file, false);
+    await maybeCheckpoint();
+  };
+  const fileIsOnAcceptedMount = async (
+    file: FrozenScanFile,
+    inspection: { records: MountRecord[]; changedFileRoots: Set<string> },
+  ): Promise<boolean> => {
+    if (inspection.changedFileRoots.has(file.path)) return false;
+    const fileMount = mountForPathFrom(inspection.records, file.path);
+    return fileMount !== undefined && !(await runtime.isNetworkMount(fileMount));
+  };
+  const processRegularManifestFile = async (file: FrozenScanFile): Promise<void> => {
+    const inspection = await inspectInputs(false);
+    if (inspection.changedFileRoots.has(file.path)) {
+      await skipManifestFile(file);
+      return;
+    }
+    if (!(await fileIsOnAcceptedMount(file, inspection))) {
+      await skipManifestFile(file, "walk-entry", new Error("refusing to scan a network-mounted file"));
+      return;
+    }
+    beginManifestFile(runtime, file);
+    runtime.progress.phase = runtime.state.cursor.phase;
+    let completelyScanned = false;
+    try {
+      completelyScanned = await processFile(runtime, file, runtime.state.cursor, maybeCheckpoint);
+    } catch (error) {
+      if (error instanceof ArtifactWriteError || error instanceof ScanControlError || quotaReason(error) !== undefined || interrupted(runtime.options.signal)) throw error;
+      runtime.store.recordError(file.path, "read-or-scan", error);
+    }
+    await completeManifestFile(runtime, file, completelyScanned);
+    await maybeCheckpoint();
+    if (interrupted(runtime.options.signal)) throw new ScanPauseError("scan paused");
+  };
+  const processCandidateSmallBatch = async (files: FrozenScanFile[]): Promise<void> => {
+    if (files.length === 0) return;
+    const inspection = await inspectInputs(false);
+    let accepted: FrozenScanFile[] = [];
+    const flushAccepted = async (): Promise<void> => {
+      if (accepted.length === 0) return;
+      const current = accepted;
+      accepted = [];
+      await processSmallFileBatch(runtime, current, maybeCheckpoint);
+    };
+    for (const file of files) {
+      if (inspection.changedFileRoots.has(file.path)) {
+        await flushAccepted();
+        await skipManifestFile(file);
+      } else if (!(await fileIsOnAcceptedMount(file, inspection))) {
+        await flushAccepted();
+        await skipManifestFile(file, "walk-entry", new Error("refusing to scan a network-mounted file"));
+      } else {
+        accepted.push(file);
+      }
+    }
+    await flushAccepted();
+    if (interrupted(runtime.options.signal)) throw new ScanPauseError("scan paused");
+  };
   try {
     runtime.state.status = "in-progress";
     runtime.state.resumable = false;
     delete runtime.state.pauseReason;
+    await inspectRuntimeSafety(true);
     await persistCheckpoint(runtime);
+    let pendingSmallFiles: FrozenScanFile[] = [];
+    let pendingSmallBytes = 0;
+    const flushSmallFiles = async (): Promise<void> => {
+      if (pendingSmallFiles.length === 0) return;
+      const current = pendingSmallFiles;
+      pendingSmallFiles = [];
+      pendingSmallBytes = 0;
+      await processCandidateSmallBatch(current);
+    };
     for await (const file of readScanManifest(runtime.options.output, runtime.state.manifest, runtime.options.signal)) {
       if (file.index < runtime.state.cursor.fileIndex) continue;
-      if (interrupted(runtime.options.signal)) throw new Error("scan paused");
+      if (interrupted(runtime.options.signal)) throw new ScanPauseError("scan paused");
       if (!manifestFileIsAuthorized(file.path, runtime.inputSafety)) {
         throw new ScanControlError("scan manifest contains a file outside the authorized input roots");
       }
-      const continuing = file.index === runtime.state.cursor.fileIndex
-        && runtime.progress.filesVisited > file.index;
-      if (!continuing) runtime.progress.filesVisited += 1;
-      const inputInspection = await inspectInputs();
-      if (inputInspection.changedFileRoots.has(file.path)) {
-        runtime.state.cursor = { fileIndex: file.index + 1, phase: "stream", nextOffset: 0 };
-        runtime.progress.phase = "stream";
-        await publishProgress(runtime);
-        await maybeCheckpoint();
+      const startsAtBeginning = file.index !== runtime.state.cursor.fileIndex
+        || (runtime.state.cursor.phase === "stream" && runtime.state.cursor.nextOffset === 0);
+      const smallFileEligible = startsAtBeginning
+        && runtime.options.deepKeySchedules !== true
+        && file.bytes <= runtime.options.chunkBytes
+        && file.bytes <= runtime.options.wholeFileBytes
+        && file.bytes <= MAX_BUFFERED_SMALL_FILES_BYTES;
+      if (!smallFileEligible) {
+        await flushSmallFiles();
+        await processRegularManifestFile(file);
         continue;
       }
-      const currentMounts = inputInspection.records;
-      const fileMount = mountForPathFrom(currentMounts, file.path);
-      if (fileMount === undefined || await runtime.isNetworkMount(fileMount)) {
-        runtime.store.recordError(file.path, "walk-entry", new Error("refusing to scan a network-mounted file"));
-        runtime.state.cursor = { fileIndex: file.index + 1, phase: "stream", nextOffset: 0 };
-        runtime.progress.phase = "stream";
-        await publishProgress(runtime);
-        await maybeCheckpoint();
-        continue;
-      }
-      runtime.progress.phase = runtime.state.cursor.phase;
-      let completelyScanned = false;
-      try {
-        completelyScanned = await processFile(runtime, file, runtime.state.cursor, maybeCheckpoint);
-      } catch (error) {
-        if (error instanceof ArtifactWriteError || error instanceof ScanControlError || quotaReason(error) !== undefined || interrupted(runtime.options.signal)) throw error;
-        runtime.store.recordError(file.path, "read-or-scan", error);
-      }
-      if (completelyScanned) runtime.progress.filesScanned += 1;
-      runtime.state.cursor = { fileIndex: file.index + 1, phase: "stream", nextOffset: 0 };
-      runtime.progress.phase = "stream";
-      await publishProgress(runtime);
-      await maybeCheckpoint();
-      if (interrupted(runtime.options.signal)) throw new Error("scan paused");
+      if (
+        pendingSmallFiles.length >= runtime.options.workers
+        || (pendingSmallFiles.length > 0 && pendingSmallBytes + file.bytes > MAX_BUFFERED_SMALL_FILES_BYTES)
+      ) await flushSmallFiles();
+      pendingSmallFiles.push(file);
+      pendingSmallBytes += file.bytes;
+      if (pendingSmallFiles.length >= runtime.options.workers) await flushSmallFiles();
     }
-    if (interrupted(runtime.options.signal)) throw new Error("scan paused");
-    await inspectInputs();
-    await assertRuntimeOutputCurrent(runtime);
-    await assertStorageCapacity(runtime.options.output, runtime.policy, runtime.budget.outputBytes());
+    await flushSmallFiles();
+    if (interrupted(runtime.options.signal)) throw new ScanPauseError("scan paused");
+    await inspectRuntimeSafety(true);
     await runtime.pool.close();
   } catch (error) {
-    const reason = interrupted(runtime.options.signal) ? "signal" : quotaReason(error);
+    let failure = error;
+    const manifestInterrupted = manifestVerificationInterrupted(error, runtime.options.signal);
+    const candidateReason = error instanceof ScanPauseError || manifestInterrupted
+      ? "signal"
+      : quotaReason(error);
+    if (candidateReason !== undefined) {
+      try {
+        const pauseInspection = await inspectInputs(true);
+        if (pauseInspection.changedFileRoots.size > 0) {
+          throw new ScanControlError("an explicit file input root changed, so the scan cannot publish a resumable pause");
+        }
+        // A root identity check cannot see a changed child. Validate the exact
+        // completed/partial manifest prefix before claiming the checkpoint can
+        // be resumed; future files remain intentionally outside that claim.
+        await verifyCompletedManifestFiles(
+          runtime.options.output,
+          runtime.state,
+          runtime.inputSafety,
+        );
+      } catch (validationError) {
+        failure = validationError;
+      }
+    }
+    const reason = failure === error ? candidateReason : undefined;
     Object.assign(runtime.progress, runtime.store.counts());
     if (reason !== undefined) {
       await runtime.pool.close(true).catch(() => undefined);
@@ -1036,9 +1517,9 @@ async function runManifest(runtime: ScanRuntime): Promise<Record<string, unknown
       const inventory = await runtime.store.finalize("paused", runtime.progress, `scan paused: ${reason}`, true, inventoryCheckpoint(runtime.state));
       runtime.state.inventory = { filename: "inventory-sensitive.json", ...inventory };
       await writeScanState(runtime.options.output, runtime.state, runtime.budget, true);
-      return resultObject("paused", runtime.progress, runtime.state, runtime.options.deepKeySchedules === true);
+      return resultObject("paused", runtime.progress, runtime.state, runtime.options.deepKeySchedules === true, runtime.metrics, runtime.pool);
     }
-    runtime.store.recordError("<scan>", "scan-run", error);
+    runtime.store.recordError("<scan>", "scan-run", failure);
     await runtime.pool.close(true).catch(() => undefined);
     Object.assign(runtime.progress, runtime.store.counts());
     runtime.state.status = "failed";
@@ -1046,13 +1527,13 @@ async function runManifest(runtime: ScanRuntime): Promise<Record<string, unknown
     runtime.state.updatedAt = new Date().toISOString();
     runtime.state.progress = { ...runtime.progress };
     try {
-      const inventory = await runtime.store.finalize("failed", runtime.progress, error instanceof Error ? error.message : String(error), true, inventoryCheckpoint(runtime.state));
+      const inventory = await runtime.store.finalize("failed", runtime.progress, failure instanceof Error ? failure.message : String(failure), true, inventoryCheckpoint(runtime.state));
       runtime.state.inventory = { filename: "inventory-sensitive.json", ...inventory };
       await writeScanState(runtime.options.output, runtime.state, runtime.budget, true);
     } catch (reportError) {
-      throw new AggregateError([error, reportError], "scan failed and final report generation also failed");
+      throw new AggregateError([failure, reportError], "scan failed and final report generation also failed");
     }
-    throw error;
+    throw failure;
   } finally {
     runtime.options.signal?.removeEventListener("abort", abortPool);
   }
@@ -1069,13 +1550,22 @@ async function runManifest(runtime: ScanRuntime): Promise<Record<string, unknown
     const inventory = await runtime.store.finalize(status, runtime.progress, undefined, false, inventoryCheckpoint(runtime.state));
     runtime.state.inventory = { filename: "inventory-sensitive.json", ...inventory };
     await writeScanState(runtime.options.output, runtime.state, runtime.budget);
-    return resultObject(status, runtime.progress, runtime.state, runtime.options.deepKeySchedules === true);
+    return resultObject(status, runtime.progress, runtime.state, runtime.options.deepKeySchedules === true, runtime.metrics, runtime.pool);
   } catch (error) {
-    const reason = quotaReason(error);
-    if (reason !== undefined) {
-      return await finalizeCleanPause(runtime.options, runtime.state, runtime.store, runtime.budget, runtime.progress, reason);
+    let failure = error;
+    const candidateReason = quotaReason(error);
+    if (candidateReason !== undefined) {
+      try {
+        await assertPauseInputRootsCurrent(runtime.inputSafety);
+        await verifyCompletedManifestFiles(runtime.options.output, runtime.state, runtime.inputSafety);
+      } catch (validationError) {
+        failure = validationError;
+      }
     }
-    runtime.store.recordError("<scan>", "finalize", error);
+    if (failure === error && candidateReason !== undefined) {
+      return await finalizeCleanPause(runtime.options, runtime.state, runtime.store, runtime.budget, runtime.progress, candidateReason, undefined, runtime.metrics, runtime.pool);
+    }
+    runtime.store.recordError("<scan>", "finalize", failure);
     Object.assign(runtime.progress, runtime.store.counts());
     runtime.state.status = "failed";
     runtime.state.resumable = false;
@@ -1083,13 +1573,13 @@ async function runManifest(runtime: ScanRuntime): Promise<Record<string, unknown
     runtime.state.updatedAt = new Date().toISOString();
     runtime.state.progress = { ...runtime.progress };
     try {
-      const inventory = await runtime.store.finalize("failed", runtime.progress, error instanceof Error ? error.message : String(error), true, inventoryCheckpoint(runtime.state));
+      const inventory = await runtime.store.finalize("failed", runtime.progress, failure instanceof Error ? failure.message : String(failure), true, inventoryCheckpoint(runtime.state));
       runtime.state.inventory = { filename: "inventory-sensitive.json", ...inventory };
       await writeScanState(runtime.options.output, runtime.state, runtime.budget, true);
     } catch (reportError) {
-      throw new AggregateError([error, reportError], "scan completion failed and its final failure report could not be fully written");
+      throw new AggregateError([failure, reportError], "scan completion failed and its final failure report could not be fully written");
     }
-    throw error;
+    throw failure;
   }
 }
 
@@ -1122,6 +1612,7 @@ async function mountSetup(inputs: string[], outputParent: string): Promise<{
 }
 
 export async function scanSensitiveMaterial(input: MiningOptions): Promise<Record<string, unknown>> {
+  const metrics = new MiningMetrics();
   const validated = validatedOptions(input);
   const canonical = await assertFreshSafeOutput(validated.inputs, validated.output);
   const options = { ...validated, ...canonical };
@@ -1147,7 +1638,7 @@ export async function scanSensitiveMaterial(input: MiningOptions): Promise<Recor
     // let an already-aborted signal prevent creation of the clean, resumable
     // inventory-phase pause that the caller requested.
     const budget = new StorageBudget(options.output, policy, await directoryLogicalBytes(options.output));
-    const store = new ArtifactStore(options.output, options.inputs, options.deepKeySchedules === true, assertSafeOutput, budget);
+    const store = new ArtifactStore(options.output, options.inputs, options.deepKeySchedules === true, assertSafeOutput, budget, metrics);
     await store.initialize();
     const progress: MiningProgress = {
       phase: "inventory",
@@ -1161,9 +1652,18 @@ export async function scanSensitiveMaterial(input: MiningOptions): Promise<Recor
     };
     let manifest: ScanState["manifest"];
     try {
-      manifest = await createFrozenInputManifest(options, setup.isNetworkMount, store, budget, progress, assertSafeOutput);
+      manifest = await createFrozenInputManifest(options, setup.isNetworkMount, store, budget, progress, assertSafeOutput, metrics);
     } catch (error) {
-      const reason = interrupted(options.signal) ? "signal" : quotaReason(error);
+      let failure = error;
+      const candidateReason = error instanceof ScanPauseError ? "signal" : quotaReason(error);
+      if (candidateReason !== undefined) {
+        try {
+          await assertPauseInputRootsCurrent(setup.inputSafety);
+        } catch (validationError) {
+          failure = validationError;
+        }
+      }
+      const reason = failure === error ? candidateReason : undefined;
       const emptyManifest = await createScanManifest(options.output, emptyManifestFiles(), budget, assertSafeOutput);
       const state = newScanState(semanticOptions(options), operationalOptions(options), emptyManifest, {
         filename: "inventory-sensitive.json",
@@ -1171,21 +1671,21 @@ export async function scanSensitiveMaterial(input: MiningOptions): Promise<Recor
         sha256: "0".repeat(64),
       }, progress, setup.inputSafety);
       state.inventoryComplete = false;
-      if (reason !== undefined) return await finalizeInventoryPause(options, state, store, budget, progress, reason);
-      store.recordError("<scan>", "input-inventory", error);
+      if (reason !== undefined) return await finalizeInventoryPause(options, state, store, budget, progress, reason, metrics);
+      store.recordError("<scan>", "input-inventory", failure);
       Object.assign(progress, store.counts());
       state.status = "failed";
       state.resumable = false;
       state.updatedAt = new Date().toISOString();
       state.progress = { ...progress };
       try {
-        const failedInventory = await store.finalize("failed", progress, error instanceof Error ? error.message : String(error), true, inventoryCheckpoint(state));
+        const failedInventory = await store.finalize("failed", progress, failure instanceof Error ? failure.message : String(failure), true, inventoryCheckpoint(state));
         state.inventory = { filename: "inventory-sensitive.json", ...failedInventory };
         await writeScanState(options.output, state, budget, true);
       } catch (reportError) {
-        throw new AggregateError([error, reportError], "input inventory failed and final report generation also failed");
+        throw new AggregateError([failure, reportError], "input inventory failed and final report generation also failed");
       }
-      throw error;
+      throw failure;
     }
     progress.filesTotal = manifest.entries;
     progress.phase = "stream";
@@ -1202,24 +1702,33 @@ export async function scanSensitiveMaterial(input: MiningOptions): Promise<Recor
       await verifyCompletedManifestFiles(options.output, state, setup.inputSafety, options.signal);
       pool = new DetectorWorkerPool(options.workers);
     } catch (error) {
-      const reason = interrupted(options.signal) ? "signal" : quotaReason(error);
-      if (reason !== undefined) {
-        return await finalizeCleanPause(options, state, store, budget, progress, reason);
+      let failure = error;
+      const candidateReason = manifestVerificationInterrupted(error, options.signal) ? "signal" : quotaReason(error);
+      if (candidateReason !== undefined) {
+        try {
+          await assertPauseInputRootsCurrent(setup.inputSafety);
+        } catch (validationError) {
+          failure = validationError;
+        }
       }
-      store.recordError("<scan>", "manifest-or-worker-start", error);
+      const reason = failure === error ? candidateReason : undefined;
+      if (reason !== undefined) {
+        return await finalizeCleanPause(options, state, store, budget, progress, reason, undefined, metrics);
+      }
+      store.recordError("<scan>", "manifest-or-worker-start", failure);
       Object.assign(progress, store.counts());
       state.status = "failed";
       state.resumable = false;
       state.updatedAt = new Date().toISOString();
       state.progress = { ...progress };
       try {
-        const failedInventory = await store.finalize("failed", progress, error instanceof Error ? error.message : String(error), true, inventoryCheckpoint(state));
+        const failedInventory = await store.finalize("failed", progress, failure instanceof Error ? failure.message : String(failure), true, inventoryCheckpoint(state));
         state.inventory = { filename: "inventory-sensitive.json", ...failedInventory };
         await writeScanState(options.output, state, budget, true);
       } catch (reportError) {
-        throw new AggregateError([error, reportError], "scan startup verification failed and final report generation also failed");
+        throw new AggregateError([failure, reportError], "scan startup verification failed and final report generation also failed");
       }
-      throw error;
+      throw failure;
     }
     return await runManifest({
       options,
@@ -1234,6 +1743,7 @@ export async function scanSensitiveMaterial(input: MiningOptions): Promise<Recor
       state,
       progress,
       isNetworkMount: setup.isNetworkMount,
+      metrics,
     });
   } catch (error) {
     runFailure = error;
@@ -1267,6 +1777,7 @@ function resumeOptions(state: ScanState, input: MiningResumeOptions): Normalized
 }
 
 export async function resumeSensitiveMaterial(input: MiningResumeOptions): Promise<Record<string, unknown>> {
+  const metrics = new MiningMetrics();
   const output = path.resolve(input.output);
   const metadata = await lstat(output);
   if (metadata.isSymbolicLink() || !metadata.isDirectory() || await realpath(output) !== output) {
@@ -1301,13 +1812,13 @@ export async function resumeSensitiveMaterial(input: MiningResumeOptions): Promi
     await verifyResumeArtifacts(output, inventory, options.signal);
     state.operational = operationalOptions(options);
     state.updatedAt = new Date().toISOString();
-    const store = new ArtifactStore(output, options.inputs, options.deepKeySchedules === true, assertSafeOutput, budget);
+    const store = new ArtifactStore(output, options.inputs, options.deepKeySchedules === true, assertSafeOutput, budget, metrics);
     store.restore(inventory);
     const progress: MiningProgress = { ...state.progress };
     try {
       await assertStorageCapacity(output, policy, budget.outputBytes());
     } catch (error) {
-      if (error instanceof StorageQuotaError) return await finalizeCleanPause(options, state, store, budget, progress, error.reason);
+      if (error instanceof StorageQuotaError) return await finalizeCleanPause(options, state, store, budget, progress, error.reason, undefined, metrics);
       throw error;
     }
     if (!state.inventoryComplete) {
@@ -1315,12 +1826,15 @@ export async function resumeSensitiveMaterial(input: MiningResumeOptions): Promi
         throw new Error("an incomplete input inventory must reference an empty scan manifest");
       }
       try {
-        state.manifest = await createFrozenInputManifest(options, setup.isNetworkMount, store, budget, progress, assertSafeOutput);
+        state.manifest = await createFrozenInputManifest(options, setup.isNetworkMount, store, budget, progress, assertSafeOutput, metrics);
         state.inventoryComplete = true;
         state.cursor = { fileIndex: 0, phase: "stream", nextOffset: 0 };
         progress.filesTotal = state.manifest.entries;
         progress.phase = "stream";
-        if (interrupted(options.signal)) return await finalizeInventoryPause(options, state, store, budget, progress, "signal");
+        if (interrupted(options.signal)) {
+          await assertPauseInputRootsCurrent(setup.inputSafety);
+          return await finalizeInventoryPause(options, state, store, budget, progress, "signal", metrics);
+        }
         state.status = "paused";
         state.resumable = true;
         state.updatedAt = new Date().toISOString();
@@ -1329,16 +1843,18 @@ export async function resumeSensitiveMaterial(input: MiningResumeOptions): Promi
         state.inventory = { filename: "inventory-sensitive.json", ...checkpoint };
         await writeScanState(output, state, budget);
       } catch (error) {
-        const reason = interrupted(options.signal) ? "signal" : quotaReason(error);
+        const reason = error instanceof ScanPauseError ? "signal" : quotaReason(error);
         if (reason === undefined) throw error;
-        return await finalizeInventoryPause(options, state, store, budget, progress, reason);
+        await assertPauseInputRootsCurrent(setup.inputSafety);
+        return await finalizeInventoryPause(options, state, store, budget, progress, reason, metrics);
       }
     }
     try {
       await verifyCompletedManifestFiles(output, state, setup.inputSafety, options.signal);
     } catch (error) {
-      if (interrupted(options.signal)) {
-        return await finalizeCleanPause(options, state, store, budget, progress, "signal");
+      if (manifestVerificationInterrupted(error, options.signal)) {
+        await assertPauseInputRootsCurrent(setup.inputSafety);
+        return await finalizeCleanPause(options, state, store, budget, progress, "signal", undefined, metrics);
       }
       throw error;
     }
@@ -1355,6 +1871,7 @@ export async function resumeSensitiveMaterial(input: MiningResumeOptions): Promi
       state,
       progress,
       isNetworkMount: setup.isNetworkMount,
+      metrics,
     };
     return await runManifest(runtime);
   } catch (error) {

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { lstat, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import type { Candidate, JsonValue, Provenance } from "../core/types.js";
 import { sha256Hex } from "../core/crypto.js";
 import type { StorageBudget } from "../core/storage.js";
@@ -16,6 +17,10 @@ import {
 } from "./limits.js";
 import { renderMiningRedactedReport, renderMiningSensitiveReport } from "./report.js";
 import type { MiningProgress, MiningRunStatus, SensitiveFinding, SensitiveScanInventory } from "./types.js";
+
+export interface ArtifactStoreObserver {
+  artifactPublished(logicalBytes: number, elapsedMs: number): void;
+}
 
 function genericId(id: number): string {
   return `finding-${String(id).padStart(6, "0")}`;
@@ -47,6 +52,7 @@ export class ArtifactStore {
     private readonly deepKeySchedules: boolean,
     private readonly assertOutputSafe?: () => Promise<void>,
     private readonly storageBudget?: StorageBudget,
+    private readonly observer?: ArtifactStoreObserver,
   ) {}
 
   public restore(inventory: SensitiveScanInventory): void {
@@ -145,6 +151,7 @@ export class ArtifactStore {
       const artifactFiles: string[] = [];
       const artifactIntegrity: SensitiveFinding["artifactIntegrity"] = [];
       if (candidate.confidence !== "marker-only") {
+        const publicationStarted = performance.now();
         const directory = safeJoin(this.output, "artifacts", directoryName);
         const staging = safeJoin(this.output, "artifacts", `.staging-${directoryName}-${randomUUID()}`);
         await assertNoSymlinkComponents(this.output, directory);
@@ -202,6 +209,12 @@ export class ArtifactStore {
           await assertPublishedDirectory();
           this.storageBudget?.committedWrite(artifactBytes);
           await this.assertOutputSafe?.();
+          try {
+            this.observer?.artifactPublished(Number(artifactBytes), performance.now() - publicationStarted);
+          } catch {
+            // Aggregate instrumentation is advisory and must never change the
+            // outcome of an already durable sensitive-artifact publication.
+          }
         } catch (error) {
           let cleanupError: unknown;
           if (!published && stagingIdentity !== undefined) {

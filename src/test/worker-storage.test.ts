@@ -31,6 +31,28 @@ test("detector workers preserve candidate bytes and offsets across pool sizes", 
   assert.deepEqual(await run(4), await run(1));
 });
 
+test("fused worker requests preserve detector order while copying each buffer once", async () => {
+  const { privateKey } = generateKeyPairSync("ed25519");
+  const data = Buffer.from(privateKey.export({ type: "pkcs8", format: "pem" }));
+  const context = { sourcePath: "/synthetic", baseOffset: 123, wholeFile: false } as const;
+  const pool = new DetectorWorkerPool(2);
+  try {
+    const fused = await pool.run("streaming", data, context);
+    assert.deepEqual(fused.map((batch) => batch.detector), [
+      "cryptographic-keys",
+      "configuration-secrets",
+      "wallet-secrets",
+      "provider-credentials",
+    ]);
+    const metrics = pool.metrics();
+    assert.equal(metrics.jobsSubmitted, 1);
+    assert.equal(metrics.payloadCopies, 1);
+    assert.equal(metrics.payloadBytesCopied, data.length);
+  } finally {
+    await pool.close();
+  }
+});
+
 test("deep detector jobs recover schedules through worker serialization", async () => {
   const key = Buffer.from("000102030405060708090a0b0c0d0e0f", "hex");
   const data = Buffer.concat([Buffer.alloc(37), expandAesKey(key), Buffer.alloc(11)]);

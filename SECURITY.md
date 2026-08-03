@@ -21,6 +21,7 @@ An authorized software agent may operate AARK without an interactive human appro
 - Orchestrating agents should consume command JSON and redacted reports. They must not open or inject sensitive reports, resume state, manifests, logs, recovery outputs, or artifacts into a hosted model context.
 - Recovery, mining, and the optional DPAPI bridge refuse known network-mounted inputs and outputs such as NFS, SMB, SSHFS, cloud-backed FUSE mounts, NBD, RBD, DRBD, iSCSI, FCoE, AoE, and TCP/RDMA block transports. Layered FUSE types whose backing store cannot be proven from the mount record, including bindfs, mergerfs, encfs, and unionfs, fail closed as potentially remote.
 - Symlinks are not followed during mining unless future code adds an explicit, reviewed option.
+- Mining caches root/mount snapshots only for bounded batches: it refreshes them after 30 seconds of committed progress and forces validation at checkpoints, clean pauses, and completion. Every source still uses `O_NOFOLLOW` plus descriptor/canonical-path and frozen inode/size/time checks at open, before ordered commit, and after processing. Artifact/control writes retain their destination, lock, and capacity checks.
 - Cleanup is never automatic. Its run command requires an unchanged approval token, `--execute`, and `--confirm-delete-recovered-copy`; evidence deletion has a separate opt-in and confirmation.
 
 ## Sensitive output
@@ -44,6 +45,10 @@ Deletion is irreversible and cannot guarantee secure erasure from SSDs, copy-on-
 ## Wallet recovery
 
 Assume any recovered seed or private key may already have been exposed. Do not type it into a website or an internet-connected password form. Use a trusted offline environment, verify addresses independently, and sweep assets to a newly generated wallet rather than continuing to use the recovered key.
+
+## Future OCR attack surface
+
+The current miner scans raw bytes; it does not claim visual OCR coverage. Any future OCR implementation must be explicit, fully offline, resource-bounded against decompression bombs and malformed media, deterministic where practical, and subject to the same redaction, source-retention, ordered-commit, checkpoint, and artifact-integrity rules. Unsupported or failed visual inputs prevent an OCR-complete claim without erasing independently complete raw-byte coverage. See the [initial OCR interface plan](docs/ocr-plan.md).
 
 ## Reporting vulnerabilities
 

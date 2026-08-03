@@ -1,5 +1,7 @@
 # Cleanup workflow
 
+The current cleanup contract understands raw-byte mining findings. A future OCR-derived finding must retain its whole original image/document—not only recognized text or a crop—and cleanup must not accept OCR provenance until the type, inventory, integrity, coverage, and retention rules in the [offline OCR interface plan](ocr-plan.md) are implemented and tested consistently.
+
 Cleanup is AARK's optional destructive post-processing layer. Its purpose is to reduce the sensitive recovery footprint after recovery and mining are finished: keep the case-root final reports, each mining result, exact finding artifacts, every complete source file associated with a finding, and the metadata needed to locate and verify those artifacts; remove other recovered data and intermediate recovery logs/state copies. It is safe for an authorized agent to build the plan, but only the end user can authorize execution after seeing that plan.
 
 ## What is retained and removed
