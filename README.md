@@ -4,6 +4,8 @@ AARK (Agentic Artifact Recovery Kit) is an offline-first toolkit for recovering 
 
 Its reviewed plans, bounded commands, structured manifests, resumable checkpoints, and deterministic reports are designed for both direct human operation and fully delegated agentic workflows. The current implementation remains fully local and does not bundle an autonomous agent. See [AGENTS.md](AGENTS.md) for the recommended authorization and automation contract.
 
+Delegated agents should treat each CLI exit as a stage boundary rather than an implicit pause for human prompting. After checking the redacted result, they should immediately run the next safe, already authorized action and remain idle only for a named approval, required operator input, safety failure, or storage-reserve stop. The detailed no-idle and truthful-status rules are in [AGENTS.md](AGENTS.md#agent-continuity-no-idle-stage-boundaries).
+
 The project is deliberately split into three layers:
 
 1. `recover` orchestrates mature Linux forensic tools against a read-only source and records provenance.

@@ -16,6 +16,14 @@ An agent may inventory, build and inspect plans, execute approved stages, monito
 
 Deletion is intentionally outside that standing authorization. Even if the original request said to complete the whole case, an agent must obtain fresh end-user approval after presenting the exact aggregate cleanup plan. It may never assume, pre-answer, or automate that decision.
 
+## Agent continuity: no idle stage boundaries
+
+A completed command is a workflow boundary, not permission to leave an authorized case idle. After each bounded recovery, mining, verification, retention, or planning command exits, immediately inspect its redacted result and start the next safe, in-scope action. Read-only checks, non-destructive retention, monitoring, resumable continuation, and stages already covered by the case authorization do not require a second confirmation merely because the previous process ended. If the current command does not automatically start another batch or stage, the controlling agent must do so.
+
+An agent may wait only while an operation or explicit monitor is actually running, or when progress requires fresh deletion approval, additional authorization, operator-supplied hardware or information, remediation of a safety/test failure, or restoration of the configured free-space reserve. When waiting, state that no operation is active, name the exact blocker and requested response, and preserve a concrete resume command or next action. Never describe a case as progressing when all relevant processes are idle. For multi-day work, keep a durable controller or resumable checkpoint, verify liveness from redacted process and progress state, and advance at clean boundaries without waiting for the operator to ask for another status update.
+
+This continuity rule never weakens the authorization, sensitive-data, cleanup-approval, read-only-source, or storage-reserve requirements below. A safe stop is preferable to guessing when one of those gates is unresolved.
+
 ## Safe delegated workflow
 
 1. Run `aark recover inventory --json` and identify the exact source and a destination on a different physical device.
