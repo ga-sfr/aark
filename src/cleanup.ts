@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import type { Stats } from "node:fs";
-import { lstat, mkdir, open, opendir, readlink, realpath, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, open, opendir, readlink, realpath, rename, rm, statfs } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -30,6 +30,7 @@ import {
 } from "./mining/resume.js";
 import type { ScanState } from "./mining/resume.js";
 import type { SensitiveScanInventory } from "./mining/types.js";
+import { resolveMiningOutputs } from "./mining/batch.js";
 
 const RECOVERY_LOCK_FILENAMES = [".aark-recovery.lock", ".agetnic-recovery.lock"] as const;
 const MINING_LOCK_FILENAMES = [".aark-mining.lock", ".agetnic-mining.lock"] as const;
@@ -43,6 +44,8 @@ const MAX_RETAINED_CONTROL_BYTES = 256 * 1024 * 1024;
 const TOKEN = /^[a-f0-9]{64}$/;
 const RUN_ID = /^[0-9A-Za-z][0-9A-Za-z._-]{0,255}$/;
 const CLEANUP_QUARANTINE_PREFIX = ".aark-cleanup-pending-";
+const BATCH_LOCK_FILENAME = ".aark-batch.lock";
+const MAX_CLEANUP_MINING_OUTPUTS = 10_000;
 
 export interface CleanupOptions {
   caseDirectory: string;
@@ -79,6 +82,11 @@ export interface CleanupPlanResult {
     filesystemEntries: string;
     regularFiles: string;
     logicalBytes: string;
+    allocatedBytes: string;
+    expectedFreeSpaceGainMinimumBytes: string;
+    expectedFreeSpaceGainMaximumBytes: string;
+    allocationUnitBytes: string;
+    allocationUnitSource: "statfs-block-size";
     recoveredCopyLogicalBytes: string;
     evidenceCopyLogicalBytes: string;
     intermediateLogicalBytes: string;
@@ -124,9 +132,21 @@ interface TargetSnapshot {
   filesystemEntries: bigint;
   regularFiles: bigint;
   logicalBytes: bigint;
+  allocatedBytes: bigint;
+  minimumReclaimableAllocatedBytes: bigint;
+  hardLinkAllocations: HardLinkAllocation[];
   contentDigest: string;
+  deletionDigest: string;
   requiresScanCoverage: boolean;
   retainedSourceFiles: RetainedSourceFile[];
+}
+
+interface HardLinkAllocation {
+  device: number;
+  inode: number;
+  allocatedBytes: bigint;
+  links: number;
+  selectedLinks: number;
 }
 
 interface RetainedSourceFile {
@@ -137,6 +157,7 @@ interface RetainedSourceFile {
   mode: number;
   links: number;
   bytes: number;
+  allocatedBytes: bigint;
   modifiedMs: number;
   changedMs: number;
 }
@@ -190,6 +211,7 @@ interface InternalCleanupPlan {
   findingSources: FindingSourceIndex;
   targets: TargetSnapshot[];
   introducedLocks: Set<string>;
+  batchRoots: string[];
 }
 
 function interrupted(signal: AbortSignal | undefined): void {
@@ -234,11 +256,14 @@ function entryKind(metadata: Stats): "directory" | "file" | "symlink" | "block-d
 }
 
 function assertBoundedEntryMetadata(metadata: Stats): void {
-  for (const value of [metadata.dev, metadata.ino, metadata.mode, metadata.nlink, metadata.uid, metadata.gid, metadata.rdev, metadata.mtimeMs, metadata.ctimeMs]) {
+  for (const value of [metadata.dev, metadata.ino, metadata.mode, metadata.nlink, metadata.uid, metadata.gid, metadata.rdev, metadata.blocks, metadata.mtimeMs, metadata.ctimeMs]) {
     if (!Number.isFinite(value) || value < 0) throw new Error("cleanup target contains filesystem metadata outside valid numeric bounds");
   }
   if (!Number.isSafeInteger(metadata.size) || metadata.size < 0) {
     throw new Error("cleanup target contains an entry whose size exceeds safe numeric bounds");
+  }
+  if (!Number.isSafeInteger(metadata.blocks) || metadata.blocks < 0) {
+    throw new Error("cleanup target contains allocated-block accounting outside safe numeric bounds");
   }
 }
 
@@ -254,6 +279,25 @@ function sameEntryMetadata(left: Stats, right: Stats): boolean {
     && left.size === right.size
     && left.mtimeMs === right.mtimeMs
     && left.ctimeMs === right.ctimeMs;
+}
+
+function deletionDigestLine(relative: string, kind: ReturnType<typeof entryKind>, metadata: Stats, linkTarget?: string): string {
+  return `${JSON.stringify({
+    path: relative,
+    kind,
+    device: metadata.dev,
+    inode: metadata.ino,
+    mode: metadata.mode,
+    links: metadata.nlink,
+    owner: metadata.uid,
+    group: metadata.gid,
+    deviceType: metadata.rdev,
+    bytes: kind === "directory" ? null : metadata.size,
+    blocks: kind === "directory" ? null : metadata.blocks,
+    modifiedMs: kind === "directory" ? null : metadata.mtimeMs,
+    changedMs: kind === "directory" || kind === "file" && metadata.nlink > 1 ? null : metadata.ctimeMs,
+    ...(linkTarget === undefined ? {} : { linkTarget }),
+  })}\n`;
 }
 
 function boundedFailure(error: unknown): string | undefined {
@@ -822,9 +866,14 @@ async function targetSnapshot(
   let filesystemEntries = 0n;
   let regularFiles = 0n;
   let logicalBytes = 0n;
+  let allocatedBytes = 0n;
+  let minimumReclaimableAllocatedBytes = 0n;
+  const allocatedIdentities = new Set<string>();
+  const hardLinkAllocations = new Map<string, HardLinkAllocation>();
   const retainedSourceFiles: RetainedSourceFile[] = [];
   const directoryIdentities = new Map<string, { device: number; inode: number }>();
   const contentHash = createHash("sha256");
+  const deletionHash = createHash("sha256");
   type Work = { phase: "enter"; filename: string } | { phase: "exit"; filename: string; relative: string; before: Stats };
   const pending: Work[] = [{ phase: "enter", filename: target }];
   let pendingEntries = 1;
@@ -854,6 +903,7 @@ async function targetSnapshot(
           modifiedMs: afterDirectory.mtimeMs,
           changedMs: afterDirectory.ctimeMs,
         })}\n`);
+        deletionHash.update(deletionDigestLine(work.relative, "directory", afterDirectory));
       }
       continue;
     }
@@ -863,6 +913,31 @@ async function targetSnapshot(
     assertBoundedEntryMetadata(metadata);
     const relative = path.relative(target, work.filename);
     const kind = entryKind(metadata);
+    const allocationIdentity = `${metadata.dev}:${metadata.ino}`;
+    const entryAllocatedBytes = BigInt(metadata.blocks) * 512n;
+    if (kind === "file" && metadata.nlink > 1) {
+      const existing = hardLinkAllocations.get(allocationIdentity);
+      if (existing === undefined) {
+        hardLinkAllocations.set(allocationIdentity, {
+          device: metadata.dev,
+          inode: metadata.ino,
+          allocatedBytes: entryAllocatedBytes,
+          links: metadata.nlink,
+          selectedLinks: 1,
+        });
+      } else {
+        if (existing.allocatedBytes !== entryAllocatedBytes || existing.links !== metadata.nlink) {
+          throw new Error("cleanup target hard-link metadata changed during verification");
+        }
+        existing.selectedLinks += 1;
+        if (existing.selectedLinks > existing.links) throw new Error("cleanup target contains more hard links than the inode reports");
+      }
+    }
+    if (!allocatedIdentities.has(allocationIdentity)) {
+      allocatedIdentities.add(allocationIdentity);
+      allocatedBytes += entryAllocatedBytes;
+      if (kind !== "file" || metadata.nlink === 1) minimumReclaimableAllocatedBytes += entryAllocatedBytes;
+    }
     if (work.filename !== target) filesystemEntries += 1n;
 
     if (kind === "directory") {
@@ -907,6 +982,7 @@ async function targetSnapshot(
     if (!sameEntryMetadata(metadata, current)) {
       throw new Error("cleanup deletion target changed while it was being measured");
     }
+    let retained = false;
     if (kind === "file") {
       regularFiles += 1n;
       logicalBytes += BigInt(metadata.size);
@@ -929,6 +1005,7 @@ async function targetSnapshot(
           metadata.ino,
         ))
       ) {
+        retained = true;
         retainedSourceFiles.push({
           originalPath: coveragePath,
           relativePath: relative,
@@ -937,6 +1014,7 @@ async function targetSnapshot(
           mode: metadata.mode,
           links: metadata.nlink,
           bytes: metadata.size,
+          allocatedBytes: entryAllocatedBytes,
           modifiedMs: metadata.mtimeMs,
           changedMs: metadata.ctimeMs,
         });
@@ -957,6 +1035,7 @@ async function targetSnapshot(
       changedMs: metadata.ctimeMs,
       ...(linkTarget === undefined ? {} : { linkTarget }),
     })}\n`);
+    if (!retained) deletionHash.update(deletionDigestLine(relative, kind, metadata, linkTarget));
   }
   const after = await lstat(target);
   if (
@@ -978,7 +1057,12 @@ async function targetSnapshot(
     filesystemEntries,
     regularFiles,
     logicalBytes,
+    allocatedBytes,
+    minimumReclaimableAllocatedBytes,
+    hardLinkAllocations: [...hardLinkAllocations.values()]
+      .sort((left, right) => left.device - right.device || left.inode - right.inode),
     contentDigest: contentHash.digest("hex"),
+    deletionDigest: deletionHash.digest("hex"),
     requiresScanCoverage,
     retainedSourceFiles,
   };
@@ -995,9 +1079,13 @@ function targetIdentity(target: TargetSnapshot): Record<string, unknown> {
     filesystemEntries: target.filesystemEntries.toString(),
     regularFiles: target.regularFiles.toString(),
     logicalBytes: target.logicalBytes.toString(),
+    allocatedBytes: target.allocatedBytes.toString(),
+    minimumReclaimableAllocatedBytes: target.minimumReclaimableAllocatedBytes.toString(),
+    hardLinkAllocations: target.hardLinkAllocations.map((allocation) => ({ ...allocation, allocatedBytes: allocation.allocatedBytes.toString() })),
     contentDigest: target.contentDigest,
+    deletionDigest: target.deletionDigest,
     requiresScanCoverage: target.requiresScanCoverage,
-    retainedSourceFiles: target.retainedSourceFiles.map((source) => ({ ...source })),
+    retainedSourceFiles: target.retainedSourceFiles.map((source) => ({ ...source, allocatedBytes: source.allocatedBytes.toString() })),
   };
 }
 
@@ -1024,24 +1112,29 @@ function approvalToken(
     })),
     targets: targets.map(targetIdentity),
   };
-  return createHash("sha256").update(JSON.stringify(material)).digest("hex");
+  const serialized = JSON.stringify(material);
+  if (Buffer.byteLength(serialized) > MAX_RETAINED_CONTROL_BYTES) {
+    throw new Error("cleanup approval control state exceeds its bounded size; split the cleanup target set");
+  }
+  return createHash("sha256").update(serialized).digest("hex");
 }
 
 function normalizeOptions(options: CleanupOptions): { caseDirectory: string; miningOutputs: string[]; includeEvidence: boolean; signal?: AbortSignal } {
-  if (options.miningOutputs.length < 1 || options.miningOutputs.length > 128) {
-    throw new Error("cleanup requires from 1 through 128 completed mining output directories");
+  if (options.miningOutputs.length < 1 || options.miningOutputs.length > MAX_CLEANUP_MINING_OUTPUTS) {
+    throw new Error(`cleanup requires from 1 through ${MAX_CLEANUP_MINING_OUTPUTS} completed mining output directories`);
   }
   const caseDirectory = path.resolve(options.caseDirectory);
   const miningOutputs = [...new Set(options.miningOutputs.map((value) => path.resolve(value)))].sort(bytewiseLexical);
   if (miningOutputs.length !== options.miningOutputs.length) throw new Error("cleanup mining output directories must be unique");
   if (miningOutputs.some((output) => output === caseDirectory)) throw new Error("a mining output cannot also be the recovery case root");
-  for (let index = 0; index < miningOutputs.length; index += 1) {
-    for (let other = index + 1; other < miningOutputs.length; other += 1) {
-      const left = miningOutputs[index];
-      const right = miningOutputs[other];
-      if (left !== undefined && right !== undefined && (inside(left, right) || inside(right, left))) {
-        throw new Error("cleanup mining output directories must not contain one another");
-      }
+  const outputSet = new Set(miningOutputs);
+  for (const output of miningOutputs) {
+    let parent = path.dirname(output);
+    while (parent !== output) {
+      if (outputSet.has(parent)) throw new Error("cleanup mining output directories must not contain one another");
+      const next = path.dirname(parent);
+      if (next === parent) break;
+      parent = next;
     }
   }
   return {
@@ -1052,7 +1145,26 @@ function normalizeOptions(options: CleanupOptions): { caseDirectory: string; min
   };
 }
 
-async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveLock[]): Promise<InternalCleanupPlan> {
+async function resolveCleanupOptions(options: CleanupOptions): Promise<{
+  normalized: ReturnType<typeof normalizeOptions>;
+  batchRoots: string[];
+}> {
+  const references = normalizeOptions(options);
+  const resolved = await resolveMiningOutputs(references.miningOutputs, MAX_CLEANUP_MINING_OUTPUTS);
+  const directOutputs = resolved.outputs.filter((output) => !resolved.batchRoots.some((root) => inside(root, output)));
+  if (directOutputs.length > 128) throw new Error("cleanup supports at most 128 independent mining outputs; use native batch workflow roots for larger sets");
+  return {
+    normalized: normalizeOptions({
+      caseDirectory: references.caseDirectory,
+      miningOutputs: resolved.outputs,
+      includeEvidence: references.includeEvidence,
+      ...(references.signal === undefined ? {} : { signal: references.signal }),
+    }),
+    batchRoots: resolved.batchRoots,
+  };
+}
+
+async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveLock[], batchRoots: string[] = []): Promise<InternalCleanupPlan> {
   const normalized = normalizeOptions(options);
   interrupted(normalized.signal);
   const records = await mounts();
@@ -1078,6 +1190,7 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
   if (heldLocks === undefined) {
     await assertNoOperationLocks(caseRoot.path, RECOVERY_LOCK_FILENAMES);
     for (const root of miningRoots) await assertNoOperationLocks(root.path, MINING_LOCK_FILENAMES);
+    for (const root of batchRoots) await assertNoOperationLocks(root, [BATCH_LOCK_FILENAME]);
   } else {
     for (const lock of heldLocks) await lock.assertHeld();
   }
@@ -1153,6 +1266,53 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
     (sum, target) => sum + target.logicalBytes - target.retainedSourceFiles.reduce((retained, source) => retained + BigInt(source.bytes), 0n),
     0n,
   );
+  let maximumReclaimableAllocatedBytes = targets.reduce((sum, target) => sum + target.allocatedBytes, 0n);
+  let minimumBeforeMetadata = targets.reduce((sum, target) => sum + target.minimumReclaimableAllocatedBytes, 0n);
+  const crossTargetHardLinks = new Map<string, HardLinkAllocation>();
+  for (const target of targets) {
+    for (const allocation of target.hardLinkAllocations) {
+      const identity = `${allocation.device}:${allocation.inode}`;
+      const existing = crossTargetHardLinks.get(identity);
+      if (existing !== undefined) {
+        throw new Error("hard links spanning separate cleanup targets cannot be deleted safely in sequence; rebuild the case without cross-target hard links");
+      }
+      crossTargetHardLinks.set(identity, allocation);
+      if (allocation.selectedLinks < allocation.links) {
+        maximumReclaimableAllocatedBytes -= allocation.allocatedBytes;
+      } else {
+        minimumBeforeMetadata += allocation.allocatedBytes;
+      }
+    }
+  }
+  const retainedAllocationIdentities = new Set<string>();
+  for (const source of retainedSources) {
+    const identity = `${source.device}:${source.inode}`;
+    if (retainedAllocationIdentities.has(identity)) continue;
+    retainedAllocationIdentities.add(identity);
+    const hardLink = crossTargetHardLinks.get(identity);
+    if (hardLink === undefined || hardLink.selectedLinks === hardLink.links) {
+      maximumReclaimableAllocatedBytes -= source.allocatedBytes;
+      minimumBeforeMetadata -= source.allocatedBytes;
+    }
+  }
+  const allocationUnitBytes = (await statfs(caseRoot.path, { bigint: true })).bsize;
+  const retainedDirectories = new Set<string>();
+  for (const target of targets) {
+    if (target.retainedSourceFiles.length > 0) retainedDirectories.add(target.name);
+    for (const source of target.retainedSourceFiles) {
+      let parent = path.dirname(source.relativePath);
+      while (parent !== "." && parent !== path.parse(parent).root) {
+        retainedDirectories.add(`${target.name}:${parent}`);
+        const next = path.dirname(parent);
+        if (next === parent) break;
+        parent = next;
+      }
+    }
+  }
+  const retentionMetadataReserve = BigInt(retainedSources.length + retainedDirectories.size + 16) * allocationUnitBytes;
+  const minimumReclaimableAllocatedBytes = minimumBeforeMetadata > retentionMetadataReserve
+    ? minimumBeforeMetadata - retentionMetadataReserve
+    : 0n;
   const deletableTargetBytes = (target: TargetSnapshot | undefined): bigint => target === undefined
     ? 0n
     : target.logicalBytes - target.retainedSourceFiles.reduce((sum, source) => sum + BigInt(source.bytes), 0n);
@@ -1193,6 +1353,11 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
       filesystemEntries: deletedEntries.toString(),
       regularFiles: deletedFiles.toString(),
       logicalBytes: deletedBytes.toString(),
+      allocatedBytes: maximumReclaimableAllocatedBytes.toString(),
+      expectedFreeSpaceGainMinimumBytes: minimumReclaimableAllocatedBytes.toString(),
+      expectedFreeSpaceGainMaximumBytes: maximumReclaimableAllocatedBytes.toString(),
+      allocationUnitBytes: allocationUnitBytes.toString(),
+      allocationUnitSource: "statfs-block-size",
       recoveredCopyLogicalBytes: recoveredBytes.toString(),
       evidenceCopyLogicalBytes: evidenceBytes.toString(),
       intermediateLogicalBytes: intermediateBytes.toString(),
@@ -1230,11 +1395,13 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
     findingSources,
     targets,
     introducedLocks,
+    batchRoots,
   };
 }
 
 export async function planCleanup(options: CleanupOptions): Promise<CleanupPlanResult> {
-  return (await buildInternalPlan(options)).public;
+  const resolved = await resolveCleanupOptions(options);
+  return (await buildInternalPlan(resolved.normalized, undefined, resolved.batchRoots)).public;
 }
 
 function reportText(
@@ -1253,6 +1420,9 @@ function reportText(
     `- Planned filesystem entries: ${plan.public.deletion.filesystemEntries}`,
     `- Planned regular files: ${plan.public.deletion.regularFiles}`,
     `- Planned logical bytes: ${plan.public.deletion.logicalBytes}`,
+    `- Planned allocated bytes: ${plan.public.deletion.allocatedBytes}`,
+    `- Expected free-space gain: ${plan.public.deletion.expectedFreeSpaceGainMinimumBytes} through ${plan.public.deletion.expectedFreeSpaceGainMaximumBytes} bytes`,
+    `- Filesystem allocation unit: ${plan.public.deletion.allocationUnitBytes} bytes (${plan.public.deletion.allocationUnitSource})`,
     `- Mining scans verified: ${plan.public.miningScansVerified}`,
     `- Exact finding artifacts retained: ${plan.public.artifactFilesRetained}`,
     `- Whole finding-containing source files retained: ${plan.public.sourceFilesRetained}`,
@@ -1385,6 +1555,7 @@ async function moveRetainedSourceFile(
   quarantine: string,
   retainedRunRoot: RootSnapshot,
   locks: ExclusiveLock[],
+  mutatedInodes: Set<string>,
 ): Promise<void> {
   if (safeJoin(target.path, source.relativePath) !== source.originalPath) {
     throw new Error("retained source-file mapping escaped its approved cleanup target");
@@ -1392,6 +1563,8 @@ async function moveRetainedSourceFile(
   const quarantinedSource = safeJoin(quarantine, source.relativePath);
   await assertNoSymlinkComponents(quarantine, quarantinedSource);
   const before = await lstat(quarantinedSource);
+  const identity = `${source.device}:${source.inode}`;
+  const changedByEarlierRetainedMove = mutatedInodes.has(identity);
   if (
     before.isSymbolicLink()
     || !before.isFile()
@@ -1401,7 +1574,7 @@ async function moveRetainedSourceFile(
     || before.nlink !== source.links
     || before.size !== source.bytes
     || before.mtimeMs !== source.modifiedMs
-    || before.ctimeMs !== source.changedMs
+    || (!changedByEarlierRetainedMove && before.ctimeMs !== source.changedMs)
     || await realpath(quarantinedSource) !== quarantinedSource
   ) throw new Error("a finding-containing source file changed before it could be retained");
 
@@ -1414,6 +1587,7 @@ async function moveRetainedSourceFile(
   await assertRootCurrent(plan.caseRoot);
   await assertRootCurrent(retainedRunRoot);
   await rename(quarantinedSource, destination);
+  mutatedInodes.add(identity);
   await syncDirectory(path.dirname(quarantinedSource));
   await syncDirectory(path.dirname(destination));
   const retained = await lstat(destination);
@@ -1430,6 +1604,30 @@ async function moveRetainedSourceFile(
   ) throw new Error("a finding-containing source file was not retained intact after its protected move");
   if (await pathExists(quarantinedSource)) throw new Error("a retained source file remained in the cleanup quarantine after its protected move");
   await assertRootCurrent(retainedRunRoot);
+}
+
+async function assertCleanupQuarantineSafe(
+  plan: InternalCleanupPlan,
+  target: TargetSnapshot,
+  quarantine: string,
+  locks: ExclusiveLock[],
+): Promise<void> {
+  for (const lock of locks) await lock.assertHeld();
+  await assertRootCurrent(plan.caseRoot);
+  const canonical = await existingRealDirectory(quarantine, "cleanup quarantine");
+  const metadata = await lstat(canonical);
+  if (metadata.dev !== target.device || metadata.ino !== target.inode) {
+    throw new Error("cleanup quarantine identity changed before recursive deletion");
+  }
+  const records = await mounts();
+  const mounted = mountForPathFrom(records, canonical);
+  if (mounted === undefined || mountIdentity(mounted) !== plan.caseRoot.mount) {
+    throw new Error("cleanup quarantine changed mount before recursive deletion");
+  }
+  if (path.resolve(mounted.target) === canonical || records.some((entry) => {
+    const targetPath = path.resolve(entry.target);
+    return targetPath !== canonical && inside(canonical, targetPath);
+  })) throw new Error("cleanup quarantine became a mount root or acquired a nested mount before deletion");
 }
 
 async function assertTargetCurrent(
@@ -1470,6 +1668,7 @@ async function removeApprovedTarget(
   target: TargetSnapshot,
   locks: ExclusiveLock[],
   retainedRunRoot: RootSnapshot | undefined,
+  mutatedInodes: Set<string>,
   signal?: AbortSignal,
 ): Promise<void> {
   await assertTargetCurrent(plan, target, locks, signal);
@@ -1509,7 +1708,11 @@ async function removeApprovedTarget(
     || quarantined.filesystemEntries !== target.filesystemEntries
     || quarantined.regularFiles !== target.regularFiles
     || quarantined.logicalBytes !== target.logicalBytes
+    || quarantined.allocatedBytes !== target.allocatedBytes
+    || quarantined.minimumReclaimableAllocatedBytes !== target.minimumReclaimableAllocatedBytes
+    || !isDeepStrictEqual(quarantined.hardLinkAllocations, target.hardLinkAllocations)
     || quarantined.contentDigest !== target.contentDigest
+    || quarantined.deletionDigest !== target.deletionDigest
     || quarantined.requiresScanCoverage !== target.requiresScanCoverage
     || !isDeepStrictEqual(quarantined.retainedSourceFiles, target.retainedSourceFiles)
   ) {
@@ -1522,18 +1725,36 @@ async function removeApprovedTarget(
   }
   for (const source of [...target.retainedSourceFiles].sort((left, right) => bytewiseLexical(left.originalPath, right.originalPath))) {
     interrupted(signal);
-    await moveRetainedSourceFile(plan, target, source, quarantine, retainedRunRoot as RootSnapshot, locks);
+    await moveRetainedSourceFile(plan, target, source, quarantine, retainedRunRoot as RootSnapshot, locks, mutatedInodes);
   }
+  const deletionSnapshot = await targetSnapshot(
+    plan.caseRoot,
+    target.name,
+    target.requiresScanCoverage,
+    plan.coverage,
+    plan.findingSources,
+    signal,
+    quarantine,
+    target.path,
+  );
+  if (deletionSnapshot === undefined || deletionSnapshot.deletionDigest !== target.deletionDigest
+    || deletionSnapshot.retainedSourceFiles.length !== 0) {
+    throw new Error("cleanup quarantine changed after finding sources were retained; the remainder was not deleted");
+  }
+  await assertCleanupQuarantineSafe(plan, target, quarantine, locks);
   await rm(quarantine, { recursive: true, force: false, maxRetries: 0 });
   await syncDirectory(plan.caseRoot.path);
   if (await pathExists(quarantine)) throw new Error("cleanup quarantine still exists after recursive deletion");
   await assertTargetRemoved(target);
 }
 
-async function acquireCleanupLocks(caseDirectory: string, miningOutputs: string[]): Promise<ExclusiveLock[]> {
+async function acquireCleanupLocks(caseDirectory: string, miningOutputs: string[], batchRoots: string[]): Promise<ExclusiveLock[]> {
   const requests = [
     ...RECOVERY_LOCK_FILENAMES.map((filename) => ({ root: caseDirectory, filename })),
-    ...miningOutputs.flatMap((root) => MINING_LOCK_FILENAMES.map((filename) => ({ root, filename }))),
+    ...batchRoots.map((root) => ({ root, filename: BATCH_LOCK_FILENAME })),
+    ...miningOutputs
+      .filter((output) => !batchRoots.some((root) => inside(root, output)))
+      .flatMap((root) => MINING_LOCK_FILENAMES.map((filename) => ({ root, filename }))),
   ].sort((left, right) => bytewiseLexical(left.root, right.root) || bytewiseLexical(left.filename, right.filename));
   const locks: ExclusiveLock[] = [];
   try {
@@ -1565,16 +1786,18 @@ export async function runCleanup(options: CleanupRunOptions): Promise<Record<str
     throw new Error("evidence-copy deletion additionally requires --confirm-delete-evidence");
   }
   if (!TOKEN.test(options.approvalToken)) throw new Error("cleanup requires the exact 64-character approval token from cleanup plan");
-  const normalized = normalizeOptions(options);
+  const resolved = await resolveCleanupOptions(options);
+  const normalized = resolved.normalized;
   for (const root of [normalized.caseDirectory, ...normalized.miningOutputs]) {
     await existingRealDirectory(root, "cleanup root");
   }
   await assertNoOperationLocks(normalized.caseDirectory, RECOVERY_LOCK_FILENAMES);
   for (const root of normalized.miningOutputs) await assertNoOperationLocks(root, MINING_LOCK_FILENAMES);
-  const locks = await acquireCleanupLocks(normalized.caseDirectory, normalized.miningOutputs);
+  for (const root of resolved.batchRoots) await assertNoOperationLocks(root, [BATCH_LOCK_FILENAME]);
+  const locks = await acquireCleanupLocks(normalized.caseDirectory, normalized.miningOutputs, resolved.batchRoots);
   let operationError: unknown;
   try {
-    const plan = await buildInternalPlan(normalized, locks);
+    const plan = await buildInternalPlan(normalized, locks, resolved.batchRoots);
     if (plan.public.approvalToken !== options.approvalToken) {
       throw new Error("cleanup inputs changed after planning; run cleanup plan again and obtain fresh approval");
     }
@@ -1582,9 +1805,10 @@ export async function runCleanup(options: CleanupRunOptions): Promise<Record<str
     try {
       await writeCleanupReports(plan, locks, "authorized-in-progress", completedTargets);
       const retainedRunRoot = await createRetainedSourceRunDirectory(plan, locks);
+      const mutatedInodes = new Set<string>();
       for (const target of plan.targets) {
         interrupted(normalized.signal);
-        await removeApprovedTarget(plan, target, locks, retainedRunRoot, normalized.signal);
+        await removeApprovedTarget(plan, target, locks, retainedRunRoot, mutatedInodes, normalized.signal);
         completedTargets.push(target.path);
       }
       await writeCleanupReports(plan, locks, "complete", completedTargets);
@@ -1606,6 +1830,9 @@ export async function runCleanup(options: CleanupRunOptions): Promise<Record<str
       deletedFilesystemEntries: plan.public.deletion.filesystemEntries,
       deletedRegularFiles: plan.public.deletion.regularFiles,
       deletedLogicalBytes: plan.public.deletion.logicalBytes,
+      deletedAllocatedBytes: plan.public.deletion.allocatedBytes,
+      expectedFreeSpaceGainMinimumBytes: plan.public.deletion.expectedFreeSpaceGainMinimumBytes,
+      expectedFreeSpaceGainMaximumBytes: plan.public.deletion.expectedFreeSpaceGainMaximumBytes,
       miningScansVerified: plan.public.miningScansVerified,
       artifactFilesRetained: plan.public.artifactFilesRetained,
       sourceFilesRetained: plan.public.sourceFilesRetained,

@@ -1,6 +1,6 @@
 {
   "name": "aark",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Agent-oriented, read-only disk recovery orchestration and offline sensitive-artifact analysis for authorized forensic recovery.",
   "type": "module",
@@ -55,6 +55,14 @@
   "homepage": "https://github.com/ga-nyc/aark#readme",
   "engines": {
     "node": ">=22.12.0"
+  },
+  "aarkCheckpointCompatibility": {
+    "workflow": [1],
+    "recovery": [1],
+    "miningBatch": [1],
+    "miningScan": [1],
+    "retention": [1],
+    "cleanup": [1]
   },
   "dependencies": {
     "@scure/bip39": "^2.2.0",

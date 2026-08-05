@@ -573,7 +573,7 @@ export async function loadScanState(output: string, signal?: AbortSignal): Promi
 async function loadMiningInventory(
   output: string,
   expected: ScanState["inventory"],
-  requiredStatus: "paused" | "complete",
+  requiredStatus: "paused" | "complete" | "complete-with-errors",
   signal?: AbortSignal,
 ): Promise<SensitiveScanInventory> {
   const filename = safeJoin(output, expected.filename);
@@ -603,7 +603,7 @@ async function loadMiningInventory(
     || document.layer !== "mining"
     || document.outputRoot !== output
     || document.status !== requiredStatus
-    || document.complete !== (requiredStatus === "complete")
+    || document.complete !== (requiredStatus === "complete" || requiredStatus === "complete-with-errors")
     || !boundedString(document.startedAt, 128)
     || !boundedString(document.updatedAt, 128)
     || !boundedString(document.finishedAt, 128)
@@ -749,6 +749,15 @@ export async function loadCompletedInventory(output: string, expected: ScanState
   if (inventory.errors.length !== 0 || inventory.errorsOmitted !== 0 || inventory.failureMessage !== undefined) {
     throw new Error("completed mining inventory contains errors or a failure message");
   }
+  return inventory;
+}
+
+export async function loadTerminalInventory(output: string, state: ScanState, signal?: AbortSignal): Promise<SensitiveScanInventory> {
+  if (state.status !== "complete" && state.status !== "complete-with-errors") {
+    throw new Error("terminal mining inventory requires a completed scan state");
+  }
+  const inventory = await loadMiningInventory(output, state.inventory, state.status, signal);
+  if (inventory.failureMessage !== undefined) throw new Error("terminal mining inventory contains a failure message");
   return inventory;
 }
 

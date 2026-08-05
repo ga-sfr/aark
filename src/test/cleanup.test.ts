@@ -109,6 +109,9 @@ test("cleanup requires fresh approval and retains reports, findings, and whole f
   assert.equal(firstPlan.deletion.recoveredCopyIncluded, true);
   assert.equal(firstPlan.deletion.evidenceCopyIncluded, true);
   assert.ok(BigInt(firstPlan.deletion.filesystemEntries) > BigInt(firstPlan.deletion.regularFiles));
+  assert.ok(BigInt(firstPlan.deletion.allocatedBytes) >= BigInt(firstPlan.deletion.expectedFreeSpaceGainMinimumBytes));
+  assert.equal(firstPlan.deletion.allocatedBytes, firstPlan.deletion.expectedFreeSpaceGainMaximumBytes);
+  assert.ok(BigInt(firstPlan.deletion.allocationUnitBytes) > 0n);
   assert.equal(firstPlan.retained.exactFindingArtifacts, true);
   assert.equal(firstPlan.retained.wholeFindingSourceFiles, true);
   assert.equal(firstPlan.sourceFilesRetained, "2");

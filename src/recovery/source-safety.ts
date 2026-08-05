@@ -13,8 +13,35 @@ interface LsblkNode {
   fstype?: string | null;
   tran?: string | null;
   subsystems?: string | null;
+  serial?: string | null;
+  wwn?: string | null;
+  uuid?: string | null;
   mountpoints?: Array<string | null> | null;
   children?: LsblkNode[];
+}
+
+function stableIdentityText(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized !== "" && Buffer.byteLength(normalized) <= 4 * 1024 && !/[\u0000-\u001f\u007f]/u.test(normalized)
+    ? normalized
+    : null;
+}
+
+export interface StableBlockDeviceIdentity {
+  path: string;
+  serial: string | null;
+  wwn: string | null;
+  filesystemUuid: string | null;
+}
+
+export function stableBlockDeviceKeys(identities: StableBlockDeviceIdentity[]): string[] {
+  return [...new Set(identities.map((identity) => identity.wwn === null
+    ? identity.serial === null
+      ? identity.filesystemUuid === null ? null : `uuid:${identity.filesystemUuid}`
+      : `serial:${identity.serial}`
+    : `wwn:${identity.wwn}`)
+    .filter((identity): identity is string => identity !== null))].sort();
 }
 
 export interface SourceSafety {
@@ -26,8 +53,10 @@ export interface SourceSafety {
   kernelReadOnly: boolean | null;
   writableMounts: string[];
   sourceTopDevices: string[];
+  sourceDeviceIdentities: StableBlockDeviceIdentity[];
   sourceTopDevice: string | null;
   destinationDevices: string[];
+  destinationDeviceIdentities: StableBlockDeviceIdentity[];
   destinationDevice: string | null;
   destinationFilesystemDevice: number;
   destinationMountSource: string | null;
@@ -46,9 +75,9 @@ export function blockDeviceIsNetworkBacked(device: string, transport?: string | 
   return blockTransportIsNetwork(device, transport, subsystems);
 }
 
-async function topDevices(input: string): Promise<{ devices: string[]; networkBacked: boolean }> {
-  const result = await captureCommand("lsblk", ["--inverse", "--json", "--paths", "--output", "PATH,TYPE,TRAN,SUBSYSTEMS", input], { maxCaptureBytes: 64 * 1024, timeoutMs: 30_000 });
-  if (result.exitCode !== 0) return { devices: [], networkBacked: false };
+async function topDevices(input: string): Promise<{ devices: string[]; identities: StableBlockDeviceIdentity[]; networkBacked: boolean }> {
+  const result = await captureCommand("lsblk", ["--inverse", "--json", "--paths", "--output", "PATH,TYPE,TRAN,SUBSYSTEMS,SERIAL,WWN,UUID", input], { maxCaptureBytes: 64 * 1024, timeoutMs: 30_000 });
+  if (result.exitCode !== 0) return { devices: [], identities: [], networkBacked: false };
   if (result.stdoutTruncated) throw new Error("lsblk output exceeded its bounded safety limit while resolving physical devices");
   let document: { blockdevices?: LsblkNode[] };
   try {
@@ -56,14 +85,29 @@ async function topDevices(input: string): Promise<{ devices: string[]; networkBa
   } catch (error) {
     throw new Error("lsblk returned invalid JSON while resolving physical devices", { cause: error });
   }
-  const disks = flatten(document.blockdevices ?? []).filter((node) => node.type === "disk" && node.path?.startsWith("/dev/") === true);
+  const nodes = flatten(document.blockdevices ?? []);
+  const disks = nodes.filter((node) => node.type === "disk" && node.path?.startsWith("/dev/") === true);
   const devices = [...new Set(disks.map((node) => node.path).filter((device): device is string => device !== undefined))].sort();
+  // Filesystem UUIDs normally belong to a partition rather than its parent
+  // disk. Keep stable identifiers from every node in the inverse dependency
+  // chain while retaining only physical disks in `devices` for overlap checks.
+  const identities = nodes
+    .filter((node): node is LsblkNode & { path: string } => node.path !== undefined)
+    .map((node) => ({
+      path: node.path,
+      serial: stableIdentityText(node.serial),
+      wwn: stableIdentityText(node.wwn),
+      filesystemUuid: stableIdentityText(node.uuid),
+    }))
+    .filter((identity) => identity.serial !== null || identity.wwn !== null || identity.filesystemUuid !== null)
+    .sort((left, right) => left.path.localeCompare(right.path));
   const networkBacked = disks.some((node) => blockDeviceIsNetworkBacked(node.path ?? "", node.tran, node.subsystems));
-  return { devices, networkBacked };
+  return { devices, identities, networkBacked };
 }
 
 async function destinationBacking(destination: string): Promise<{
   devices: string[];
+  identities: StableBlockDeviceIdentity[];
   filesystemDevice: number;
   mountSource: string | null;
   kind: "block-device" | "local-non-block" | "network" | "unresolved";
@@ -72,21 +116,22 @@ async function destinationBacking(destination: string): Promise<{
   const resolvedExisting = await realpath(existing);
   const filesystemDevice = (await stat(resolvedExisting)).dev;
   const mounted = await mountForPath(resolvedExisting);
-  if (mounted === undefined) return { devices: [], filesystemDevice, mountSource: null, kind: "unresolved" };
+  if (mounted === undefined) return { devices: [], identities: [], filesystemDevice, mountSource: null, kind: "unresolved" };
   const source = mounted.source;
   if (source.startsWith("/dev/")) {
     const resolution = await topDevices(source.replace(/\[[^\]]*\]$/, ""));
     return {
       devices: resolution.devices,
+      identities: resolution.identities,
       filesystemDevice,
       mountSource: source,
       kind: resolution.networkBacked ? "network" : resolution.devices.length === 0 ? "unresolved" : "block-device",
     };
   }
   const filesystem = mounted.filesystem.toLowerCase();
-  if (filesystemIsNetwork(mounted)) return { devices: [], filesystemDevice, mountSource: source, kind: "network" };
-  if (["ramfs", "tmpfs"].includes(filesystem)) return { devices: [], filesystemDevice, mountSource: source, kind: "local-non-block" };
-  return { devices: [], filesystemDevice, mountSource: source || null, kind: "unresolved" };
+  if (filesystemIsNetwork(mounted)) return { devices: [], identities: [], filesystemDevice, mountSource: source, kind: "network" };
+  if (["ramfs", "tmpfs"].includes(filesystem)) return { devices: [], identities: [], filesystemDevice, mountSource: source, kind: "local-non-block" };
+  return { devices: [], identities: [], filesystemDevice, mountSource: source || null, kind: "unresolved" };
 }
 
 export async function inspectSourceSafety(source: string, destination: string): Promise<SourceSafety> {
@@ -103,6 +148,7 @@ export async function inspectSourceSafety(source: string, destination: string): 
   const reasons: string[] = [];
   let kernelReadOnly: boolean | null = null;
   let sourceTopDevices: string[] = [];
+  let sourceDeviceIdentities: StableBlockDeviceIdentity[] = [];
   let sourceBytes = metadata.size;
   const writableMounts: string[] = [];
 
@@ -138,12 +184,14 @@ export async function inspectSourceSafety(source: string, destination: string): 
     const sourceResolution = await topDevices(resolvedSource);
     if (sourceResolution.networkBacked) throw new Error("network-backed block-device recovery sources are not allowed");
     sourceTopDevices = sourceResolution.devices;
+    sourceDeviceIdentities = sourceResolution.identities;
     if (!kernelReadOnly) reasons.push("kernel does not report the block device read-only");
     if (writableMounts.length > 0) reasons.push("source or a child volume has a writable mount");
   } else if (regularFileMount?.source.startsWith("/dev/") === true) {
     const sourceResolution = await topDevices(regularFileMount.source.replace(/\[[^\]]*\]$/, ""));
     if (sourceResolution.networkBacked) throw new Error("network-backed recovery image files are not allowed");
     sourceTopDevices = sourceResolution.devices;
+    sourceDeviceIdentities = sourceResolution.identities;
   }
 
   const destinationInfo = await destinationBacking(destination);
@@ -168,8 +216,10 @@ export async function inspectSourceSafety(source: string, destination: string): 
     kernelReadOnly,
     writableMounts,
     sourceTopDevices,
+    sourceDeviceIdentities,
     sourceTopDevice: sourceTopDevices[0] ?? null,
     destinationDevices,
+    destinationDeviceIdentities: destinationInfo.identities,
     destinationDevice: destinationDevices[0] ?? null,
     destinationFilesystemDevice: destinationInfo.filesystemDevice,
     destinationMountSource: destinationInfo.mountSource,

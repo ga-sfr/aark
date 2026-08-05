@@ -4,6 +4,9 @@ import path from "node:path";
 
 const GIBIBYTE = 1024n ** 3n;
 const MAX_OUTPUT_TREE_DEPTH = 256;
+const MAX_USAGE_DIRECTORY_ENTRIES = 100_000;
+const MAX_USAGE_PENDING_ENTRIES = 200_000;
+const MAX_USAGE_DIRECTORIES = 200_000;
 
 function fixedPointInteger(value: number, scale: number, label: string): number {
   const scaled = Math.round(value * scale);
@@ -26,6 +29,18 @@ export interface StorageCapacity {
   reservedBytes: bigint;
   outputBytes: bigint;
   plannedBytes: bigint;
+}
+
+export interface DirectoryUsage {
+  logicalBytes: bigint;
+  allocatedBytes: bigint;
+  minimumReclaimableAllocatedBytes: bigint;
+  regularFiles: bigint;
+  directories: bigint;
+  otherEntries: bigint;
+  hardLinkedRegularFiles: bigint;
+  allocationUnitBytes: bigint;
+  allocationUnitSource: "statfs-block-size";
 }
 
 export class StorageQuotaError extends Error {
@@ -174,4 +189,66 @@ export async function directoryLogicalBytes(root: string, signal?: AbortSignal):
     return total;
   };
   return await visit(resolvedRoot, 0);
+}
+
+/**
+ * Measure both apparent file bytes and blocks currently allocated by a tree.
+ * The lower reclaimable bound excludes multiply-linked regular-file data,
+ * because another link outside the selected tree may keep those blocks alive.
+ */
+export async function directoryUsage(root: string, signal?: AbortSignal): Promise<DirectoryUsage> {
+  const resolvedRoot = path.resolve(root);
+  const filesystem = await statfs(resolvedRoot, { bigint: true });
+  const result: DirectoryUsage = {
+    logicalBytes: 0n,
+    allocatedBytes: 0n,
+    minimumReclaimableAllocatedBytes: 0n,
+    regularFiles: 0n,
+    directories: 0n,
+    otherEntries: 0n,
+    hardLinkedRegularFiles: 0n,
+    allocationUnitBytes: filesystem.bsize,
+    allocationUnitSource: "statfs-block-size",
+  };
+  const pending: Array<{ filename: string; depth: number }> = [{ filename: resolvedRoot, depth: 0 }];
+  const visitedDirectories = new Set<string>();
+  const allocatedIdentities = new Set<string>();
+  while (pending.length > 0) {
+    if (signal?.aborted === true) throw new Error("directory usage walk was interrupted");
+    const current = pending.pop();
+    if (current === undefined) break;
+    if (current.depth > MAX_OUTPUT_TREE_DEPTH) throw new Error("output tree exceeds the bounded directory-depth limit");
+    const metadata = await lstat(current.filename, { bigint: true });
+    const identity = `${metadata.dev}:${metadata.ino}`;
+    const allocated = metadata.blocks * 512n;
+    if (!allocatedIdentities.has(identity)) {
+      allocatedIdentities.add(identity);
+      result.allocatedBytes += allocated;
+      if (!metadata.isFile() || metadata.nlink === 1n) result.minimumReclaimableAllocatedBytes += allocated;
+    }
+    if (metadata.isFile()) {
+      result.regularFiles += 1n;
+      result.logicalBytes += metadata.size;
+      if (metadata.nlink > 1n) result.hardLinkedRegularFiles += 1n;
+      continue;
+    }
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      result.otherEntries += 1n;
+      continue;
+    }
+    if (visitedDirectories.has(identity)) throw new Error("output tree contains a recursive directory identity");
+    visitedDirectories.add(identity);
+    if (visitedDirectories.size > MAX_USAGE_DIRECTORIES) throw new Error("directory usage walk exceeds its directory limit");
+    result.directories += 1n;
+    const directory = await opendir(current.filename);
+    const children: string[] = [];
+    for await (const entry of directory) {
+      if (children.length >= MAX_USAGE_DIRECTORY_ENTRIES) throw new Error("directory usage walk exceeds its per-directory entry limit");
+      children.push(path.join(current.filename, entry.name));
+    }
+    if (pending.length + children.length > MAX_USAGE_PENDING_ENTRIES) throw new Error("directory usage walk exceeds its pending-entry limit");
+    children.sort().reverse();
+    for (const child of children) pending.push({ filename: child, depth: current.depth + 1 });
+  }
+  return result;
 }

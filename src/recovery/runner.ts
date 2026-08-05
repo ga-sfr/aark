@@ -10,7 +10,7 @@ import type { JsonValue } from "../core/types.js";
 import { assertStorageCapacity, directoryLogicalBytes, StorageQuotaError, storagePolicyFromGiB } from "../core/storage.js";
 import type { RecoveryConfig, RecoveryPlan, RecoveryRunStatus, RecoveryStep } from "./types.js";
 import { buildRecoveryPlan } from "./plan.js";
-import { inspectSourceSafety } from "./source-safety.js";
+import { inspectSourceSafety, stableBlockDeviceKeys } from "./source-safety.js";
 import type { SourceSafety } from "./source-safety.js";
 import { renderRecoveryRedactedReport, renderRecoverySensitiveReport } from "./report.js";
 
@@ -154,6 +154,8 @@ async function assertSourceSafetyCurrent(
     || current.bytes !== expected.bytes
     || !sameStrings(current.sourceTopDevices, expected.sourceTopDevices)
     || !sameStrings(current.destinationDevices, expected.destinationDevices)
+    || JSON.stringify(current.sourceDeviceIdentities) !== JSON.stringify(expected.sourceDeviceIdentities)
+    || JSON.stringify(current.destinationDeviceIdentities) !== JSON.stringify(expected.destinationDeviceIdentities)
     || current.destinationFilesystemDevice !== expected.destinationFilesystemDevice
     || current.destinationMountSource !== expected.destinationMountSource
     || current.destinationBackingKind !== expected.destinationBackingKind
@@ -368,7 +370,56 @@ async function validateMountedReadOnlyInput(root: string, input: string): Promis
   return resolvedInput;
 }
 
-async function validateCaseDestination(destination: string, plan: RecoveryPlan, lockHeld = false): Promise<void> {
+function assertResumeDeviceIdentity(stored: unknown, current: SourceSafety): void {
+  if (typeof stored !== "object" || stored === null || Array.isArray(stored)) {
+    throw new Error("resumable recovery state lacks its prior source/device safety identity");
+  }
+  const expected = stored as Partial<SourceSafety>;
+  if (current.destinationBackingKind === "block-device") {
+    if (!Array.isArray(expected.destinationDeviceIdentities)) {
+      throw new Error("resumable recovery state predates stable destination disk identities; create and review a new case instead");
+    }
+    const expectedDestination = stableBlockDeviceKeys(expected.destinationDeviceIdentities);
+    const currentDestination = stableBlockDeviceKeys(current.destinationDeviceIdentities);
+    if (expectedDestination.length < 1 || currentDestination.length < 1 || !sameStrings(expectedDestination, currentDestination)) {
+      throw new Error("destination disk identity changed or is not stably identifiable at recovery resume");
+    }
+  } else if (
+    expected.destinationBackingKind !== current.destinationBackingKind
+    || expected.destinationFilesystemDevice !== current.destinationFilesystemDevice
+    || expected.destinationMountSource !== current.destinationMountSource
+  ) {
+    throw new Error("destination filesystem identity changed since the resumable checkpoint");
+  }
+  if (current.kind === "regular-file") {
+    if (JSON.stringify(expected.regularFileIdentity) !== JSON.stringify(current.regularFileIdentity)) {
+      throw new Error("recovery image identity changed since the resumable checkpoint");
+    }
+    const expectedSource = Array.isArray(expected.sourceDeviceIdentities)
+      ? stableBlockDeviceKeys(expected.sourceDeviceIdentities)
+      : [];
+    const currentSource = stableBlockDeviceKeys(current.sourceDeviceIdentities);
+    if (expectedSource.length > 0 || currentSource.length > 0) {
+      if (expectedSource.length < 1 || currentSource.length < 1 || !sameStrings(expectedSource, currentSource)) {
+        throw new Error("recovery image backing-disk identity changed since the resumable checkpoint");
+      }
+    }
+    return;
+  }
+  if (!Array.isArray(expected.sourceDeviceIdentities) || !Array.isArray(expected.destinationDeviceIdentities)) {
+    throw new Error("resumable block-device state predates stable disk identities; create and review a new recovery case instead");
+  }
+  const expectedSource = stableBlockDeviceKeys(expected.sourceDeviceIdentities);
+  const currentSource = stableBlockDeviceKeys(current.sourceDeviceIdentities);
+  if (expectedSource.length < 1 || currentSource.length < 1) {
+    throw new Error("a stable source disk identity is required for block-device recovery resume");
+  }
+  if (!sameStrings(expectedSource, currentSource)) {
+    throw new Error("source disk identity changed since the resumable checkpoint");
+  }
+}
+
+async function validateCaseDestination(destination: string, plan: RecoveryPlan, lockHeld = false, currentSafety?: SourceSafety): Promise<void> {
   let metadata: Awaited<ReturnType<typeof lstat>>;
   try {
     metadata = await lstat(destination);
@@ -401,7 +452,7 @@ async function validateCaseDestination(destination: string, plan: RecoveryPlan, 
       const marker = await lstat(safeJoin(destination, filename));
       if (marker.isSymbolicLink() || !marker.isFile() || marker.nlink !== 1) throw new Error("existing recovery case markers must be single-link regular, non-symbolic-link files");
     }
-    const state = await readJson<{ status?: unknown; plan?: unknown; results?: unknown }>(safeJoin(destination, "case-sensitive.json"));
+    const state = await readJson<{ status?: unknown; plan?: unknown; results?: unknown; sourceSafety?: unknown }>(safeJoin(destination, "case-sensitive.json"));
     if (state.status === "running") throw new Error("existing recovery state is still marked running; inspect the case before attempting another run");
     if (!["paused", "complete", "complete-with-warnings", "failed", "interrupted"].includes(String(state.status))) {
       throw new Error("existing recovery state does not contain a recognized terminal status");
@@ -424,6 +475,8 @@ async function validateCaseDestination(destination: string, plan: RecoveryPlan, 
     if (!quotaResume) {
       throw new Error("an existing recovery case can only be reused for its explicitly resumable ddrescue quota pause; choose a new destination for another run");
     }
+    if (currentSafety === undefined) throw new Error("resumable recovery requires a current source/device safety snapshot");
+    assertResumeDeviceIdentity(state.sourceSafety, currentSafety);
   }
 }
 
@@ -481,7 +534,7 @@ export async function runRecoveryPlan(
   const mountedReadOnlyRoot = config.mountedReadOnlyRoot === undefined
     ? undefined
     : await validateMountedReadOnlyRoot(config.mountedReadOnlyRoot);
-  await validateCaseDestination(plan.destination, plan);
+  await validateCaseDestination(plan.destination, plan, false, safety);
   await ensurePrivateDirectory(plan.destination);
   for (const controlPath of [
     plan.destination,
@@ -501,7 +554,7 @@ export async function runRecoveryPlan(
   const locks = await acquireRecoveryLocks(plan.destination);
   let runFailure: unknown;
   try {
-  await validateCaseDestination(plan.destination, plan, true);
+  await validateCaseDestination(plan.destination, plan, true, safety);
   const targetMount = await mountForPath(plan.destination);
   if (targetMount === undefined || await mountIsNetworkBacked(targetMount)) {
     throw new Error("recovery destination no longer has a verifiable local mount");

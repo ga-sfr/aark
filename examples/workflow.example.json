@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "workflowId": "example-authorized-workflow",
+  "directory": "/mnt/aark-control/example-workflow",
+  "stages": [
+    {
+      "id": "scan-closed-recovery-roots",
+      "kind": "mining-batch",
+      "inputs": [
+        "/mnt/aark-case/recovery/recup_dir.1",
+        "/mnt/aark-case/recovery/recup_dir.2"
+      ],
+      "output": "/mnt/aark-case/mining/closed-roots",
+      "provenance": "unallocated-carve",
+      "workers": 4,
+      "storage": {
+        "minimumFreeGiB": 400,
+        "minimumFreePercent": 10
+      },
+      "maximumRootsPerBatch": 128,
+      "maximumFilesPerBatch": 50000,
+      "maximumGiBPerBatch": 256
+    },
+    {
+      "id": "closed-segment-cleanup-approval",
+      "kind": "segmented-cleanup-plan",
+      "segments": [
+        "/mnt/aark-case/recovery/recup_dir.1",
+        "/mnt/aark-case/recovery/recup_dir.2"
+      ],
+      "activeSegments": [
+        "/mnt/aark-case/recovery/recup_dir.3"
+      ],
+      "miningOutputs": [
+        "/mnt/aark-case/mining/closed-roots"
+      ],
+      "retentionDirectory": "/mnt/aark-case/retained-closed-segment-sources",
+      "errorSourceDisposition": "retain"
+    }
+  ]
+}

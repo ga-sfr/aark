@@ -6,11 +6,13 @@ Its reviewed plans, bounded commands, structured manifests, resumable checkpoint
 
 Delegated agents should treat each CLI exit as a stage boundary rather than an implicit pause for human prompting. After checking the redacted result, they should immediately run the next safe, already authorized action and remain idle only for a named approval, required operator input, safety failure, or storage-reserve stop. The detailed no-idle and truthful-status rules are in [AGENTS.md](AGENTS.md#agent-continuity-no-idle-stage-boundaries).
 
-The project is deliberately split into three layers:
+The project is deliberately split into five cooperating layers:
 
 1. `recover` orchestrates mature Linux forensic tools against a read-only source and records provenance.
 2. `mine` scans recovered files or unallocated-space streams, strictly validates candidate structures, and stores sensitive values without printing them.
-3. `cleanup` proves that selected recovery copies were completely scanned, then can remove bulk data while retaining final reports, exact findings, every complete source file associated with a finding, and their integrity metadata.
+3. `retain` preserves whole finding-containing files in verified content-addressed storage outside a recovery case.
+4. `cleanup` proves that selected recovery copies were completely scanned, then can remove bulk data while retaining final reports, exact findings, every complete source file associated with a finding, and their integrity metadata. Segmented cleanup can operate on immutable closed recovery segments while explicitly preserving an active segment.
+5. `workflow run --until-blocked` durably chains authorized safe stages, publishes heartbeat/continuation state, and stops before every deletion approval gate.
 
 > [!CAUTION]
 > Use this only on media and data you own or are authorized to examine. Never recover back onto the source disk. SSD TRIM, overwrite, fragmentation, encryption, and filesystem reuse make “recover everything” impossible to guarantee.
@@ -81,6 +83,17 @@ aark mine scan /mnt/recovery/case-001/recovered \
   --min-free-gib 5 \
   --min-free-percent 5
 ```
+
+For thousands of closed recovery roots, use the adaptive controller instead of an external batching script:
+
+```bash
+aark mine batch /case/recovery/recup_dir.* \
+  --output /case/mining/all-closed-roots \
+  --provenance unallocated-carve \
+  --workers 4
+```
+
+The batch checkpoint automatically advances children, resumes clean pauses, reduces later batch sizes as finding density rises, and publishes one globally deduplicated redacted aggregate. A complete batch root can be passed directly to retention and cleanup commands.
 
 `SIGINT`, `SIGTERM`, the free-space reserve, and an optional `--max-output-gib` cap produce a clean mining pause at a committed chunk boundary. A paused command returns JSON with `resumable: true` and exits `75`; preserve the output and use its `resumeCommand`:
 
@@ -170,7 +183,7 @@ Small complete files are scanned through a bounded multi-file worker pipeline: u
 - FAT/exFAT cannot enforce Unix `0600` permissions. Physically secure removable destinations or use an encrypted Linux filesystem.
 - Never import a recovered wallet key or seed into software on an internet-connected machine before assessing exposure. Prefer sweeping funds to a newly generated wallet from a trusted offline environment.
 
-See [Security model](SECURITY.md), [data flow and failure behavior](docs/data-flow.md), [Recovery architecture](docs/recovery.md), [Mining architecture](docs/mining.md), [Cleanup workflow](docs/cleanup.md), the [OSS adapter matrix](docs/translation-matrix.md), and the [optional DPAPI bridge](docs/optional-dpapi.md).
+See [Security model](SECURITY.md), [data flow and failure behavior](docs/data-flow.md), [Durable workflow continuity](docs/workflow.md), [Recovery architecture](docs/recovery.md), [Mining architecture](docs/mining.md), [Cleanup workflow](docs/cleanup.md), the [offline OCR layer plan](docs/ocr-plan.md), the [OSS adapter matrix](docs/translation-matrix.md), and the [optional DPAPI bridge](docs/optional-dpapi.md).
 
 ## Project status
 

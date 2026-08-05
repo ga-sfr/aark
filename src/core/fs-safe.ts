@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { constants, open, opendir, rename, stat, lstat, chmod, mkdir, unlink } from "node:fs/promises";
 import path from "node:path";
+import { captureProcessIdentity, isProcessIdentity, probeProcess } from "./process-identity.js";
+import type { ProcessIdentity } from "./process-identity.js";
 
 export interface WalkedFile {
   path: string;
@@ -75,7 +77,64 @@ export async function syncDirectory(directory: string): Promise<void> {
   }
 }
 
-export async function acquireExclusiveLock(directory: string, filename: string): Promise<ExclusiveLock> {
+function storedProcessIdentity(value: unknown): ProcessIdentity | undefined {
+  return isProcessIdentity(value) ? value : undefined;
+}
+
+async function reclaimDeadLock(root: string, lockPath: string): Promise<boolean> {
+  let before: Awaited<ReturnType<typeof lstat>>;
+  try {
+    before = await lstat(lockPath);
+  } catch (error) {
+    const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+    if (code === "ENOENT") return true;
+    throw error;
+  }
+  if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1) return false;
+  let document: { version?: unknown; pid?: unknown; processIdentity?: unknown };
+  try {
+    document = await readJson<{ version?: unknown; pid?: unknown; processIdentity?: unknown }>(lockPath, 64 * 1024);
+  } catch {
+    return false;
+  }
+  if (document.version !== 2) return false;
+  const expected = storedProcessIdentity(document.processIdentity);
+  if (expected === undefined || document.pid !== expected.pid) return false;
+  const probe = await probeProcess(expected);
+  const dead = probe.existence === "missing" || probe.existence === "exists" && probe.identityMatches === false;
+  if (!dead) return false;
+  let current: Awaited<ReturnType<typeof lstat>>;
+  try {
+    current = await lstat(lockPath);
+  } catch (error) {
+    const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+    if (code === "ENOENT") return true;
+    throw error;
+  }
+  if (current.isSymbolicLink() || !current.isFile() || current.nlink !== 1 || current.dev !== before.dev || current.ino !== before.ino
+    || current.size !== before.size || current.mtimeMs !== before.mtimeMs || current.ctimeMs !== before.ctimeMs) return false;
+  // Claim the pathname with a rename before removing the stale inode. A
+  // direct lstat-then-unlink sequence could delete a fresh lock installed by
+  // a competing stale-lock reclaimer between those two syscalls.
+  const quarantine = safeJoin(root, `${path.basename(lockPath)}.reclaim-${process.pid}-${randomUUID()}`);
+  try {
+    await rename(lockPath, quarantine);
+  } catch (error) {
+    const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+    if (code === "ENOENT") return true;
+    throw error;
+  }
+  const moved = await lstat(quarantine);
+  if (moved.isSymbolicLink() || !moved.isFile() || moved.nlink !== 1 || moved.dev !== before.dev || moved.ino !== before.ino
+    || moved.size !== before.size || moved.mtimeMs !== before.mtimeMs) {
+    throw new Error("exclusive operation lock changed while its stale pathname was being claimed; the moved file was preserved for inspection");
+  }
+  await unlink(quarantine);
+  await syncDirectory(root);
+  return true;
+}
+
+export async function acquireExclusiveLock(directory: string, filename: string, options: { reclaimDeadOwner?: boolean } = {}): Promise<ExclusiveLock> {
   if (filename !== path.basename(filename) || !/^\.[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(filename)) {
     throw new Error("lock filename must be a safe hidden basename");
   }
@@ -84,12 +143,24 @@ export async function acquireExclusiveLock(directory: string, filename: string):
   const lockPath = safeJoin(root, filename);
   await assertNoSymlinkComponents(root, lockPath);
   let handle: Awaited<ReturnType<typeof open>>;
+  const create = async (): Promise<Awaited<ReturnType<typeof open>>> => await open(
+    lockPath,
+    constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+    0o600,
+  );
   try {
-    handle = await open(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    handle = await create();
   } catch (error) {
     const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
-    if (code === "EEXIST") throw new Error("an exclusive operation lock already exists; another process may be active or a prior process may have stopped abruptly", { cause: error });
-    throw error;
+    if (code !== "EEXIST") throw error;
+    if (options.reclaimDeadOwner !== true || !await reclaimDeadLock(root, lockPath)) {
+      throw new Error("an exclusive operation lock already exists; another process may be active or a prior process may have stopped abruptly", { cause: error });
+    }
+    try {
+      handle = await create();
+    } catch (retryError) {
+      throw new Error("exclusive operation lock changed while a dead-owner lock was being reclaimed", { cause: retryError });
+    }
   }
   let openedLock: Awaited<ReturnType<typeof handle.stat>>;
   try {
@@ -112,7 +183,12 @@ export async function acquireExclusiveLock(directory: string, filename: string):
     throw new Error("exclusive lock must be a single-link regular file");
   }
   try {
-    await handle.writeFile(`${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })}\n`);
+    await handle.writeFile(`${JSON.stringify({
+      version: 2,
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      processIdentity: await captureProcessIdentity(),
+    })}\n`);
     await handle.sync();
     await syncDirectory(root);
   } catch (error) {
