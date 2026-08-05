@@ -166,6 +166,7 @@ interface InternalPlan {
   batchRoots: string[];
   retentionFilesystemDevice: number;
   retentionMountIdentity: string;
+  retentionMetadataReserveBytes: bigint;
 }
 
 function interrupted(signal: AbortSignal | undefined): void {
@@ -330,15 +331,39 @@ function selectedFile(segments: string[], filename: string): boolean {
   return segments.some((segment) => filename !== segment && inside(segment, filename));
 }
 
+function scanSourceAuthorized(filename: string, roots: ScanState["inputRoots"]): boolean {
+  return roots.some((root) => root.kind === "file"
+    ? filename === root.path
+    : filename !== root.path && inside(root.path, filename));
+}
+
 function assertInventoryMatchesState(inventory: SensitiveScanInventory, state: ScanState): void {
   const occurrences = inventory.findings.reduce((sum, finding) => sum + finding.occurrences.length, 0);
   const checkpoint = inventory.resumeCheckpoint;
   if (
     inventory.status !== state.status
     || !inventory.complete
+    || state.resumable
+    || !state.inventoryComplete
+    || state.pauseReason !== undefined
+    || state.cursor.fileIndex !== state.manifest.entries
+    || state.cursor.phase !== "stream"
+    || state.cursor.nextOffset !== 0
+    || state.progress.phase !== "finalizing"
+    || state.progress.filesTotal !== state.manifest.entries
+    || state.progress.filesVisited !== state.manifest.entries
+    || (state.status === "complete") !== (state.progress.scanErrors === 0)
+    || (state.status === "complete-with-errors") !== (state.progress.scanErrors > 0)
+    || inventory.outputRoot !== state.semantic.output
+    || !isDeepStrictEqual(inventory.inputRoots, state.semantic.inputs)
     || inventory.findings.length !== state.progress.uniqueFindings
     || occurrences !== state.progress.occurrences
     || inventory.errors.length + inventory.errorsOmitted !== state.progress.scanErrors
+    || inventory.failureMessage !== undefined
+    || inventory.findings.some((finding) => finding.occurrences.some((occurrence) => (
+      occurrence.provenance !== state.semantic.provenance
+      || !scanSourceAuthorized(occurrence.sourcePath, state.inputRoots)
+    )))
     || checkpoint === undefined
     || checkpoint.runId !== state.runId
     || checkpoint.status !== state.status
@@ -351,7 +376,7 @@ function assertInventoryMatchesState(inventory: SensitiveScanInventory, state: S
   ) throw new Error("terminal mining inventory does not match its segmented-cleanup checkpoint");
 }
 
-async function buildCoverage(options: NormalizedOptions, locksHeld: boolean): Promise<Coverage> {
+async function buildCoverage(options: NormalizedOptions, miningOutputLocksHeld: ReadonlySet<string>): Promise<Coverage> {
   const files = new Map<string, FrozenScanFile>();
   const findingSources = new Set<string>();
   const errorSources = new Set<string>();
@@ -359,7 +384,7 @@ async function buildCoverage(options: NormalizedOptions, locksHeld: boolean): Pr
   for (const output of options.miningOutputs) {
     interrupted(options.signal);
     await canonicalDirectory(output, "mining output");
-    if (!locksHeld) await noMiningLock(output);
+    if (!miningOutputLocksHeld.has(output)) await noMiningLock(output);
     const state = await loadScanState(output, options.signal);
     if (state.status !== "complete" && state.status !== "complete-with-errors") {
       throw new Error("segmented cleanup requires terminal mining scans");
@@ -601,13 +626,17 @@ function sameQuarantinedSnapshot(actual: SegmentSnapshot, expected: SegmentSnaps
     && isDeepStrictEqual(actual.protectedSources, expected.protectedSources);
 }
 
-async function buildInternalPlan(options: SegmentedCleanupOptions, locksHeld = false): Promise<InternalPlan> {
+async function buildInternalPlan(options: SegmentedCleanupOptions, heldLocks?: readonly ExclusiveLock[]): Promise<InternalPlan> {
   const references = normalize(options);
   const resolvedMining = await resolveMiningOutputs(references.miningOutputs, MAX_MINING_OUTPUTS);
   const normalized: NormalizedOptions = { ...references, miningOutputs: resolvedMining.outputs };
   const directOutputs = normalized.miningOutputs.filter((output) => !resolvedMining.batchRoots.some((root) => inside(root, output)));
   if (directOutputs.length > 128) throw new Error("segmented cleanup supports at most 128 independent mining outputs; use native batch workflow roots for larger sets");
-  if (!locksHeld) for (const root of resolvedMining.batchRoots) await noBatchLock(root);
+  const heldPaths = new Set(heldLocks?.map((lock) => lock.path) ?? []);
+  for (const lock of heldLocks ?? []) await lock.assertHeld();
+  for (const root of resolvedMining.batchRoots) {
+    if (!heldPaths.has(safeJoin(root, ".aark-batch.lock"))) await noBatchLock(root);
+  }
   const mountTable = await mounts();
   const retentionParent = await nearestExistingParent(normalized.retentionDirectory);
   const retentionMetadata = await canonicalDirectory(retentionParent, "segment retention directory or its nearest parent");
@@ -630,7 +659,10 @@ async function buildInternalPlan(options: SegmentedCleanupOptions, locksHeld = f
   for (const root of [...resolvedMining.batchRoots, ...normalized.miningOutputs]) {
     await assertLocalControlTree(root, mountTable, "mining output");
   }
-  const coverage = await buildCoverage(normalized, locksHeld);
+  const lockedDirectOutputs = new Set(directOutputs.filter((output) => (
+    MINING_LOCKS.every((filename) => heldPaths.has(safeJoin(output, filename)))
+  )));
+  const coverage = await buildCoverage(normalized, lockedDirectOutputs);
   const snapshots: SegmentSnapshot[] = [];
   for (const segment of normalized.segments) {
     const metadata = await canonicalDirectory(segment, "selected segment");
@@ -674,22 +706,8 @@ async function buildInternalPlan(options: SegmentedCleanupOptions, locksHeld = f
       minimumBeforeMetadata -= source.allocatedBytes;
     }
   }
-  const tokenMaterial = {
-    version: 1,
-    segments: snapshots.map(snapshotTokenValue),
-    active,
-    scans: coverage.scans,
-    retentionDirectory: normalized.retentionDirectory,
-    retentionFilesystemDevice: retentionMetadata.dev,
-    retentionMountIdentity,
-    errorSourceDisposition: normalized.errorSourceDisposition,
-  };
-  const serializedTokenMaterial = JSON.stringify(tokenMaterial);
-  if (Buffer.byteLength(serializedTokenMaterial) > MAX_SEGMENT_CONTROL_BYTES) {
-    throw new Error("segmented cleanup approval control state exceeds its bounded size; split the selected segment set");
-  }
-  const approvalToken = createHash("sha256").update(serializedTokenMaterial).digest("hex");
   const filesystem = await statfs(retentionParent, { bigint: true });
+  if (filesystem.bsize < 1n) throw new Error("segmented cleanup filesystem reported an invalid allocation unit");
   const retainedDirectories = new Set<string>();
   for (let index = 0; index < snapshots.length; index += 1) {
     retainedDirectories.add(`segment-${index + 1}`);
@@ -704,7 +722,7 @@ async function buildInternalPlan(options: SegmentedCleanupOptions, locksHeld = f
     }
   }
   retainedDirectories.add("retained-segment-source-files");
-  retainedDirectories.add(`retained-segment-source-files:${approvalToken}`);
+  retainedDirectories.add("retained-segment-source-files:<token-run>");
   // The lower gain estimate reserves one allocation unit for every retained
   // file entry and created directory. It also reserves rounded allocations
   // for both token-scoped and top-level reports; the sensitive report can be
@@ -719,6 +737,23 @@ async function buildInternalPlan(options: SegmentedCleanupOptions, locksHeld = f
     + 4n * roundedAllocation(smallReportBytes);
   const retentionMetadataReserve = BigInt(protectedSources.length + retainedDirectories.size + 4) * filesystem.bsize
     + reportAllocationReserve;
+  const tokenMaterial = {
+    version: 1,
+    segments: snapshots.map(snapshotTokenValue),
+    active,
+    scans: coverage.scans,
+    retentionDirectory: normalized.retentionDirectory,
+    retentionFilesystemDevice: retentionMetadata.dev,
+    retentionMountIdentity,
+    allocationUnitBytes: filesystem.bsize.toString(),
+    retentionMetadataReserveBytes: retentionMetadataReserve.toString(),
+    errorSourceDisposition: normalized.errorSourceDisposition,
+  };
+  const serializedTokenMaterial = JSON.stringify(tokenMaterial);
+  if (Buffer.byteLength(serializedTokenMaterial) > MAX_SEGMENT_CONTROL_BYTES) {
+    throw new Error("segmented cleanup approval control state exceeds its bounded size; split the selected segment set");
+  }
+  const approvalToken = createHash("sha256").update(serializedTokenMaterial).digest("hex");
   const expectedMinimumGain = minimumBeforeMetadata > retentionMetadataReserve
     ? minimumBeforeMetadata - retentionMetadataReserve
     : 0n;
@@ -768,6 +803,7 @@ async function buildInternalPlan(options: SegmentedCleanupOptions, locksHeld = f
     batchRoots: resolvedMining.batchRoots,
     retentionFilesystemDevice: retentionMetadata.dev,
     retentionMountIdentity,
+    retentionMetadataReserveBytes: retentionMetadataReserve,
   };
 }
 
@@ -951,8 +987,12 @@ export async function runSegmentedCleanup(options: SegmentedCleanupRunOptions): 
   const locks = await acquireLocks(initial);
   let operationError: unknown;
   try {
-    const plan = await buildInternalPlan(options, true);
+    const plan = await buildInternalPlan(options, locks);
     if (plan.public.approvalToken !== options.approvalToken) throw new Error("segmented cleanup inputs changed while locks were acquired");
+    const cleanupFilesystem = await statfs(plan.normalized.retentionDirectory, { bigint: true });
+    if (cleanupFilesystem.bavail * cleanupFilesystem.bsize < plan.retentionMetadataReserveBytes) {
+      throw new Error("segmented cleanup lacks free space for retained-source metadata and final reports before deletion");
+    }
     const assertControlSafe = async (): Promise<void> => {
       for (const lock of locks) await lock.assertHeld();
       await assertRetentionCurrent(plan);
@@ -1037,7 +1077,7 @@ export async function runSegmentedCleanup(options: SegmentedCleanupRunOptions): 
       status: "complete",
       deletedSegments: completed,
       deletedLogicalBytes: plan.public.deletion.logicalBytes,
-      deletedAllocatedBytes: plan.public.deletion.allocatedBytes,
+      plannedMaximumReclaimableAllocatedBytes: plan.public.deletion.allocatedBytes,
       expectedFreeSpaceGainMinimumBytes: plan.public.deletion.expectedFreeSpaceGainMinimumBytes,
       expectedFreeSpaceGainMaximumBytes: plan.public.deletion.expectedFreeSpaceGainMaximumBytes,
       findingSourceFilesRetained: plan.public.findingSourceFilesRetained,

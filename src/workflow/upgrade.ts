@@ -1,8 +1,16 @@
-import { createHash } from "node:crypto";
-import { lstat, mkdir, realpath } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { lstat, mkdir, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { captureCommand } from "../core/command.js";
-import { acquireExclusiveLock, atomicWriteJson, ensurePrivateDirectory, readJson, safeJoin } from "../core/fs-safe.js";
+import {
+  acquireExclusiveLock,
+  atomicWriteFile,
+  atomicWriteJson,
+  ensurePrivateDirectory,
+  readDirectoryNamesBounded,
+  readJson,
+  safeJoin,
+} from "../core/fs-safe.js";
 import { probeProcess } from "../core/process-identity.js";
 import { loadWorkflowConfig, workflowConfigHash } from "./config.js";
 import { validateWorkflowState, WORKFLOW_STATE_FILE } from "./state.js";
@@ -15,6 +23,8 @@ const TOKEN = /^[a-f0-9]{64}$/u;
 const COMMIT = /^[a-f0-9]{40}$/u;
 const SAFE_SCRIPT = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$/u;
 const OPTIONAL_LINUX_TEST_SCRIPTS = ["test:linux", "test:integration:linux", "test:python"] as const;
+const MAX_UPGRADE_LOG_BYTES = 16 * 1024 * 1024;
+const MAX_UPGRADE_ATTEMPTS_PER_TOKEN = 100;
 
 export interface WorkflowUpgradeOptions {
   workflowDirectory: string;
@@ -224,19 +234,77 @@ export async function planWorkflowUpgrade(options: WorkflowUpgradeOptions): Prom
 async function runNpm(
   plan: InternalUpgradePlan,
   runRoot: string,
+  cacheRoot: string,
   name: string,
   args: string[],
   signal?: AbortSignal,
 ): Promise<void> {
-  const result = await captureCommand("npm", ["--cache", safeJoin(runRoot, "npm-cache"), ...args], {
+  const result = await captureCommand("npm", ["--cache", cacheRoot, ...args], {
     cwd: plan.candidateTool,
     temporaryDirectory: safeJoin(runRoot, "tmp"),
-    stdoutFile: safeJoin(runRoot, `${name}.stdout.log`),
-    stderrFile: safeJoin(runRoot, `${name}.stderr.log`),
-    maxCaptureBytes: 0,
+    maxCaptureBytes: MAX_UPGRADE_LOG_BYTES,
     ...(signal === undefined ? {} : { signal }),
   });
+  await writeCommandLogs(runRoot, name, result);
   if (result.exitCode !== 0 || result.signal !== null || result.terminationReason !== null) throw new Error(`candidate ${name} validation failed`);
+}
+
+async function writeCommandLogs(
+  runRoot: string,
+  name: string,
+  result: Awaited<ReturnType<typeof captureCommand>>,
+): Promise<void> {
+  const bounded = (contents: Buffer, truncated: boolean): Buffer => truncated
+    ? Buffer.concat([contents, Buffer.from("\n[AARK: log truncated at the bounded capture limit]\n")])
+    : contents;
+  await atomicWriteFile(safeJoin(runRoot, `${name}.stdout.log`), bounded(result.stdout, result.stdoutTruncated));
+  await atomicWriteFile(safeJoin(runRoot, `${name}.stderr.log`), bounded(result.stderr, result.stderrTruncated));
+}
+
+async function removeGeneratedCandidateBuild(candidate: string): Promise<void> {
+  const generated = safeJoin(candidate, "dist");
+  try {
+    const metadata = await lstat(generated);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory() || await realpath(generated) !== generated) {
+      throw new Error("candidate generated build path must be a canonical real directory");
+    }
+    await rm(generated, { recursive: true, force: false, maxRetries: 0 });
+  } catch (error) {
+    const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+    if (code !== "ENOENT") throw error;
+  }
+}
+
+async function assertFreshCandidateExecutable(candidate: string): Promise<string> {
+  const executable = safeJoin(candidate, "dist", "cli.js");
+  const metadata = await lstat(executable);
+  if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.nlink !== 1
+    || metadata.size < 1 || metadata.size > 64 * 1024 * 1024 || await realpath(executable) !== executable) {
+    throw new Error("candidate validation did not produce a bounded canonical CLI executable");
+  }
+  return executable;
+}
+
+async function createUpgradeAttemptRoot(
+  upgradesRoot: string,
+  approvalToken: string,
+): Promise<{ runRoot: string; cacheRoot: string }> {
+  const tokenRoot = safeJoin(upgradesRoot, approvalToken);
+  await ensurePrivateDirectory(tokenRoot);
+  // Older versions wrote their logs directly in tokenRoot. Preserve those
+  // records and count only the append-only attempt directories introduced by
+  // this version, so a failed legacy attempt remains safely retryable.
+  const entries = await readDirectoryNamesBounded(tokenRoot, 10_000);
+  const attempts = entries.filter((entry) => /^attempt-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(entry));
+  if (attempts.length >= MAX_UPGRADE_ATTEMPTS_PER_TOKEN) {
+    throw new Error("workflow upgrade exceeded its bounded validation-attempt limit for this approval token");
+  }
+  const runRoot = safeJoin(tokenRoot, `attempt-${randomUUID()}`);
+  await mkdir(runRoot, { mode: 0o700 });
+  await ensurePrivateDirectory(runRoot);
+  const cacheRoot = safeJoin(tokenRoot, "npm-cache");
+  await ensurePrivateDirectory(cacheRoot);
+  return { runRoot, cacheRoot };
 }
 
 export async function runWorkflowUpgrade(options: WorkflowUpgradeRunOptions): Promise<Record<string, unknown>> {
@@ -254,13 +322,15 @@ export async function runWorkflowUpgrade(options: WorkflowUpgradeRunOptions): Pr
     if (currentCandidate.dev !== plan.candidateDevice || currentCandidate.ino !== plan.candidateInode) throw new Error("candidate tool directory identity changed");
     const upgradesRoot = safeJoin(plan.workflowDirectory, "upgrades");
     await ensurePrivateDirectory(upgradesRoot);
-    const runRoot = safeJoin(upgradesRoot, options.approvalToken);
-    await mkdir(runRoot, { mode: 0o700 });
-    await ensurePrivateDirectory(runRoot);
-    await runNpm(plan, runRoot, "npm-ci", ["ci"], options.signal);
-    await runNpm(plan, runRoot, "npm-check", ["run", "check"], options.signal);
+    const { runRoot, cacheRoot } = await createUpgradeAttemptRoot(upgradesRoot, options.approvalToken);
+    // `dist/` is ignored by git, so cleanliness alone cannot bind it to the
+    // reviewed commit. Remove only this verified generated tree and require
+    // the validation scripts to produce a fresh CLI before any resume.
+    await removeGeneratedCandidateBuild(plan.candidateTool);
+    await runNpm(plan, runRoot, cacheRoot, "npm-ci", ["ci"], options.signal);
+    await runNpm(plan, runRoot, cacheRoot, "npm-check", ["run", "check"], options.signal);
     for (const script of plan.public.optionalTests) {
-      await runNpm(plan, runRoot, script.replace(/[^A-Za-z0-9._-]/gu, "-"), ["run", script], options.signal);
+      await runNpm(plan, runRoot, cacheRoot, script.replace(/[^A-Za-z0-9._-]/gu, "-"), ["run", script], options.signal);
     }
     const afterCommit = await git(plan.candidateTool, ["rev-parse", "HEAD"]);
     if (afterCommit !== plan.public.candidateCommit) throw new Error("candidate commit changed while upgrade tests were running");
@@ -282,7 +352,7 @@ export async function runWorkflowUpgrade(options: WorkflowUpgradeRunOptions): Pr
     } | null = null;
     if (plan.resumeConfig !== undefined) {
       const config = plan.resumeConfig;
-      const executable = safeJoin(plan.candidateTool, "dist", "cli.js");
+      const executable = await assertFreshCandidateExecutable(plan.candidateTool);
       await workflowLock.release();
       workflowLock = undefined;
       const result = await captureCommand(process.execPath, [
@@ -291,11 +361,10 @@ export async function runWorkflowUpgrade(options: WorkflowUpgradeRunOptions): Pr
         ...(plan.public.executeRecoveryAuthorized ? ["--execute-recovery"] : []),
       ], {
         cwd: plan.candidateTool,
-        stdoutFile: safeJoin(runRoot, "resume.stdout.log"),
-        stderrFile: safeJoin(runRoot, "resume.stderr.log"),
-        maxCaptureBytes: 0,
+        maxCaptureBytes: MAX_UPGRADE_LOG_BYTES,
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
+      await writeCommandLogs(runRoot, "resume", result);
       resumeStatus = result.exitCode;
       if (![0, 75].includes(result.exitCode) || result.signal !== null || result.terminationReason !== null) throw new Error("candidate tool could not resume the workflow to its next boundary");
       const boundary = await workflowStatus(plan.workflowDirectory, false);

@@ -199,6 +199,7 @@ export async function directoryLogicalBytes(root: string, signal?: AbortSignal):
 export async function directoryUsage(root: string, signal?: AbortSignal): Promise<DirectoryUsage> {
   const resolvedRoot = path.resolve(root);
   const filesystem = await statfs(resolvedRoot, { bigint: true });
+  if (filesystem.bsize < 1n) throw new Error("filesystem reported an invalid allocation unit");
   const result: DirectoryUsage = {
     logicalBytes: 0n,
     allocatedBytes: 0n,

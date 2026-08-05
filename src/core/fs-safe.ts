@@ -81,7 +81,7 @@ function storedProcessIdentity(value: unknown): ProcessIdentity | undefined {
   return isProcessIdentity(value) ? value : undefined;
 }
 
-async function reclaimDeadLock(root: string, lockPath: string): Promise<boolean> {
+async function reclaimDeadLockUnserialized(root: string, lockPath: string): Promise<boolean> {
   let before: Awaited<ReturnType<typeof lstat>>;
   try {
     before = await lstat(lockPath);
@@ -132,6 +132,46 @@ async function reclaimDeadLock(root: string, lockPath: string): Promise<boolean>
   await unlink(quarantine);
   await syncDirectory(root);
   return true;
+}
+
+async function reclaimDeadLock(root: string, lockPath: string): Promise<boolean> {
+  // Serialize cooperative stale-lock reclaimers. Without this guard, two
+  // reclaimers can both validate the stale inode; one can then install its
+  // fresh lock just before the other rename, causing the second reclaimer to
+  // displace a live owner even though it later notices the inode mismatch.
+  const guardPath = safeJoin(root, `${path.basename(lockPath)}.reclaim-guard`);
+  let guard: Awaited<ReturnType<typeof open>>;
+  try {
+    guard = await open(
+      guardPath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+      0o600,
+    );
+  } catch (error) {
+    const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+    if (code === "EEXIST") return false;
+    throw error;
+  }
+  const identity = await guard.stat();
+  if (!identity.isFile() || identity.nlink !== 1) {
+    await guard.close().catch(() => undefined);
+    throw new Error("stale-lock reclamation guard must be a single-link regular file");
+  }
+  try {
+    await guard.writeFile(`${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })}\n`);
+    await guard.sync();
+    await syncDirectory(root);
+    return await reclaimDeadLockUnserialized(root, lockPath);
+  } finally {
+    await guard.close().catch(() => undefined);
+    const current = await lstat(guardPath);
+    if (current.isSymbolicLink() || !current.isFile() || current.nlink !== 1
+      || current.dev !== identity.dev || current.ino !== identity.ino) {
+      throw new Error("stale-lock reclamation guard changed while it was held");
+    }
+    await unlink(guardPath);
+    await syncDirectory(root);
+  }
 }
 
 export async function acquireExclusiveLock(directory: string, filename: string, options: { reclaimDeadOwner?: boolean } = {}): Promise<ExclusiveLock> {

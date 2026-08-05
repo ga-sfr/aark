@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, open, opendir, realpath, rename, unlink } from "node:fs/promises";
+import { chmod, lstat, open, opendir, realpath, rename, statfs, unlink } from "node:fs/promises";
 import path from "node:path";
 import {
   acquireExclusiveLock,
@@ -17,7 +17,7 @@ import {
 import { mountForPathFrom, mountIsNetworkBacked, mountIsReadOnly, mounts } from "./core/mounts.js";
 import type { MountRecord } from "./core/mounts.js";
 import { assertStorageCapacity, directoryLogicalBytes, storagePolicyFromGiB, StorageBudget, StorageQuotaError } from "./core/storage.js";
-import { loadCompletedInventory, loadScanState, readScanManifest, verifyResumeArtifacts } from "./mining/resume.js";
+import { loadScanState, loadVerifiedCompletedInventory, readScanManifest } from "./mining/resume.js";
 import type { FrozenScanFile, ScanState } from "./mining/resume.js";
 import { resolveMiningOutputs } from "./mining/batch.js";
 
@@ -76,6 +76,7 @@ export interface RetentionPlanResult {
   sourceAllocatedBytes: string;
   contentObjects: string;
   deduplicatedLogicalBytes: string;
+  deduplicatedAllocatedBytes: string;
   allSourcesReadOnly: boolean;
   planToken: string;
   approvalRequired: false;
@@ -117,6 +118,7 @@ interface InternalRetentionPlan {
   sources: SourceRecord[];
   scans: VerifiedMiningScan[];
   storage: { minimumFreeGiB: number; minimumFreePercent: number; maximumOutputGiB?: number };
+  allocationUnitBytes: bigint;
   signal?: AbortSignal;
   progress?: (progress: RetentionProgress) => void;
 }
@@ -259,6 +261,7 @@ async function prepareObjectsRoot(objectsRoot: string, safetyCheck: () => Promis
   await safetyCheck();
   const shards = await readDirectoryNamesBounded(objectsRoot, 257);
   let entries = 0;
+  let lastSafetyAt = Date.now();
   for (const shard of shards) {
     if (!/^[a-f0-9]{2}$/u.test(shard)) throw new Error("retention object store contains an invalid shard entry");
     const shardRoot = safeJoin(objectsRoot, shard);
@@ -271,6 +274,11 @@ async function prepareObjectsRoot(objectsRoot: string, safetyCheck: () => Promis
     for await (const entry of directory) {
       entries += 1;
       if (entries > MAX_RETENTION_OBJECT_ENTRIES) throw new Error("retention object store exceeds its bounded entry limit");
+      const now = Date.now();
+      if (entries % 1_024 === 0 || now - lastSafetyAt >= SAFETY_CHECK_INTERVAL_MS) {
+        await safetyCheck();
+        lastSafetyAt = now;
+      }
       const filename = safeJoin(shardRoot, entry.name);
       const metadata = await lstat(filename);
       if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.nlink !== 1) {
@@ -457,6 +465,9 @@ async function buildInternalPlan(options: RetentionOptions): Promise<InternalRet
     normalized.storage.maximumOutputGiB,
   );
   await assertStorageCapacity(destinationParent, policy);
+  const destinationFilesystem = await statfs(destinationParent, { bigint: true });
+  if (destinationFilesystem.bsize < 1n) throw new Error("retention destination reported an invalid allocation unit");
+  const allocationUnitBytes = destinationFilesystem.bsize;
   await assertRetentionDirectoryEntries(normalized.destination);
   try {
     await destinationSnapshot(normalized.destination);
@@ -476,8 +487,7 @@ async function buildInternalPlan(options: RetentionOptions): Promise<InternalRet
     if (state.status !== "complete" || state.resumable || !state.inventoryComplete) {
       throw new Error("retention requires exact, error-free completed mining scans");
     }
-    const inventory = await loadCompletedInventory(output, state.inventory, normalized.signal);
-    await verifyResumeArtifacts(output, inventory, normalized.signal);
+    const inventory = await loadVerifiedCompletedInventory(output, state, normalized.signal);
     const wanted = new Set(inventory.findings.flatMap((finding) => finding.occurrences.map((occurrence) => occurrence.sourcePath)));
     for (const filename of wanted) {
       if (!fileAuthorized(filename, state.inputRoots)) throw new Error("a finding source escaped its mining input roots");
@@ -527,6 +537,8 @@ async function buildInternalPlan(options: RetentionOptions): Promise<InternalRet
   const tokenMaterial = {
     version: 1,
     destination: normalized.destination,
+    destinationMount: mountIdentity(destinationMount),
+    allocationUnitBytes: allocationUnitBytes.toString(),
     requireReadOnlySources: normalized.requireReadOnlySources,
     storage: normalized.storage,
     scans,
@@ -562,6 +574,10 @@ async function buildInternalPlan(options: RetentionOptions): Promise<InternalRet
     sourceAllocatedBytes: sourceAllocatedBytes.toString(),
     contentObjects: objects.size.toString(),
     deduplicatedLogicalBytes: [...objects.values()].reduce((sum, bytes) => sum + BigInt(bytes), 0n).toString(),
+    deduplicatedAllocatedBytes: [...objects.values()].reduce(
+      (sum, bytes) => sum + (BigInt(bytes) + allocationUnitBytes - 1n) / allocationUnitBytes * allocationUnitBytes,
+      0n,
+    ).toString(),
     allSourcesReadOnly: sources.every((source) => source.readOnlyMount),
     planToken,
     approvalRequired: false,
@@ -573,6 +589,7 @@ async function buildInternalPlan(options: RetentionOptions): Promise<InternalRet
     sources,
     scans,
     storage: normalized.storage,
+    allocationUnitBytes,
     ...(normalized.signal === undefined ? {} : { signal: normalized.signal }),
     ...(normalized.progress === undefined ? {} : { progress: normalized.progress }),
   };
@@ -708,8 +725,13 @@ export async function runRetention(options: RetentionRunOptions): Promise<Record
     await prepareObjectsRoot(objectsRoot, assertDestinationSafe);
     const currentOutputBytes = await directoryLogicalBytes(plan.destination, plan.signal);
     const budget = new StorageBudget(plan.destination, policy, currentOutputBytes);
+    const freeSpacePolicy = storagePolicyFromGiB(plan.storage.minimumFreeGiB, plan.storage.minimumFreePercent);
+    const roundedAllocation = (bytes: bigint): bigint => bytes === 0n
+      ? 0n
+      : (bytes + plan.allocationUnitBytes - 1n) / plan.allocationUnitBytes * plan.allocationUnitBytes;
     const assertCopySafe = async (remainingBytes: bigint): Promise<void> => {
       await assertDestinationSafe();
+      await assertStorageCapacity(plan.destination, freeSpacePolicy, 0n, roundedAllocation(remainingBytes));
       await budget.beforeWrite(remainingBytes);
     };
     await assertCopySafe(0n);
@@ -738,6 +760,29 @@ export async function runRetention(options: RetentionRunOptions): Promise<Record
     })) + 1024 * 1024;
     if (controlEstimate > MAX_RETENTION_CONTROL_BYTES) throw new Error("retention output control mapping exceeds its bounded size limit");
     const newObjectBytes = [...missingObjects.values()].reduce((sum, bytes) => sum + BigInt(bytes), 0n);
+    const newObjectAllocatedBytes = [...missingObjects.values()].reduce(
+      (sum, bytes) => sum + roundedAllocation(BigInt(bytes)),
+      0n,
+    );
+    const existingShards = new Set(await readDirectoryNamesBounded(objectsRoot, 257));
+    const newShards = new Set([...missingObjects.keys()]
+      .map((digest) => digest.slice(0, 2))
+      .filter((shard) => !existingShards.has(shard)));
+    // Object data is cluster-rounded above. Conservatively reserve another
+    // allocation unit for every new object directory entry, every new shard,
+    // and each independent progress/mapping/manifest/report file. Directory
+    // formats differ, but this bound avoids materially understating metadata
+    // growth for huge sets of tiny or zero-byte files on large-cluster media.
+    const controlAllocatedBytes = roundedAllocation(BigInt(controlEstimate))
+      + BigInt(missingObjects.size + newShards.size + 4) * plan.allocationUnitBytes;
+    await assertStorageCapacity(
+      plan.destination,
+      freeSpacePolicy,
+      0n,
+      newObjectAllocatedBytes + controlAllocatedBytes,
+    );
+    // The maximum-output contract is expressed in logical bytes. Keep that
+    // check separate from the cluster-rounded free-space reservation above.
     await assertStorageCapacity(plan.destination, policy, currentOutputBytes, newObjectBytes + BigInt(controlEstimate));
     const progress: RetentionProgress = {
       filesCompleted: 0,

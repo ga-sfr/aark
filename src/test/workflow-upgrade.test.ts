@@ -129,6 +129,14 @@ test("workflow upgrade validates compatibility, Linux checks, and optional platf
   assert.equal(result.resumeWorkflowState, null);
   assert.equal(result.resumeBlocker, null);
   assert.deepEqual(result.testsPassed, ["npm ci", "npm run check", "test:linux", "test:python"]);
+  const retry = await runWorkflowUpgrade({
+    workflowDirectory,
+    candidateTool,
+    approvalToken: plan.approvalToken,
+    execute: true,
+  });
+  assert.equal(retry.status, "complete");
+  assert.equal(retry.readyToResume, true);
   await writeFile(path.join(candidateTool, "unexpected.txt"), "untracked\n");
   await assert.rejects(planWorkflowUpgrade({ workflowDirectory, candidateTool }), /tracked or untracked modifications/);
 });

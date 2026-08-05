@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, open, realpath, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { isDeepStrictEqual } from "node:util";
 import type { Provenance } from "../core/types.js";
 import { sha256Hex } from "../core/crypto.js";
 import { assertNoSymlinkComponents, atomicWriteJson, readDirectoryNamesBounded, safeJoin, syncDirectory } from "../core/fs-safe.js";
@@ -749,6 +750,71 @@ export async function loadCompletedInventory(output: string, expected: ScanState
   if (inventory.errors.length !== 0 || inventory.errorsOmitted !== 0 || inventory.failureMessage !== undefined) {
     throw new Error("completed mining inventory contains errors or a failure message");
   }
+  return inventory;
+}
+
+function exactCheckpointForState(state: ScanState): NonNullable<SensitiveScanInventory["resumeCheckpoint"]> {
+  return {
+    runId: state.runId,
+    status: state.status,
+    inventoryComplete: state.inventoryComplete,
+    semantic: state.semantic,
+    inputRoots: state.inputRoots,
+    manifest: state.manifest,
+    cursor: state.cursor,
+    progress: state.progress,
+  };
+}
+
+function occurrenceIsAuthorized(filename: string, roots: ScanState["inputRoots"]): boolean {
+  return roots.some((root) => {
+    if (root.kind === "file") return filename === root.path;
+    const relative = path.relative(root.path, filename);
+    return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+  });
+}
+
+export function assertExactCompletedInventory(inventory: SensitiveScanInventory, state: ScanState): void {
+  const occurrences = inventory.findings.reduce((sum, finding) => sum + finding.occurrences.length, 0);
+  if (
+    state.status !== "complete"
+    || state.resumable
+    || !state.inventoryComplete
+    || state.pauseReason !== undefined
+    || state.cursor.fileIndex !== state.manifest.entries
+    || state.cursor.phase !== "stream"
+    || state.cursor.nextOffset !== 0
+    || state.progress.phase !== "finalizing"
+    || state.progress.filesTotal !== state.manifest.entries
+    || state.progress.filesVisited !== state.manifest.entries
+    || state.progress.filesScanned !== state.manifest.entries
+    || state.progress.scanErrors !== 0
+    || inventory.status !== "complete"
+    || inventory.complete !== true
+    || inventory.outputRoot !== state.semantic.output
+    || !isDeepStrictEqual(inventory.inputRoots, state.semantic.inputs)
+    || inventory.findings.length !== state.progress.uniqueFindings
+    || occurrences !== state.progress.occurrences
+    || inventory.errors.length !== 0
+    || inventory.errorsOmitted !== 0
+    || inventory.failureMessage !== undefined
+    || inventory.resumeCheckpoint === undefined
+    || !isDeepStrictEqual(inventory.resumeCheckpoint, exactCheckpointForState(state))
+    || inventory.findings.some((finding) => finding.occurrences.some((occurrence) => (
+      occurrence.provenance !== state.semantic.provenance
+      || !occurrenceIsAuthorized(occurrence.sourcePath, state.inputRoots)
+    )))
+  ) throw new Error("operation requires an exact error-free completed mining checkpoint");
+}
+
+export async function loadVerifiedCompletedInventory(
+  output: string,
+  state: ScanState,
+  signal?: AbortSignal,
+): Promise<SensitiveScanInventory> {
+  const inventory = await loadCompletedInventory(output, state.inventory, signal);
+  assertExactCompletedInventory(inventory, state);
+  await verifyResumeArtifacts(output, inventory, signal);
   return inventory;
 }
 

@@ -63,6 +63,7 @@ function dependencies(calls: string[]): WorkflowDependencies {
         sourceAllocatedBytes: "4096",
         contentObjects: "1",
         deduplicatedLogicalBytes: "10",
+        deduplicatedAllocatedBytes: "4096",
         allSourcesReadOnly: true,
         planToken: "a".repeat(64),
         approvalRequired: false,
@@ -75,11 +76,53 @@ function dependencies(calls: string[]): WorkflowDependencies {
     },
     planCleanup: async () => {
       calls.push("cleanup-plan");
-      return { status: "ready", approvalToken: "b".repeat(64), miningScansVerified: 1 };
+      return {
+        status: "ready",
+        destructive: true,
+        approvalRequired: true,
+        pathsRedacted: true,
+        valuesPrinted: false,
+        approvalToken: "b".repeat(64),
+        miningScansVerified: 1,
+        deletion: {
+          directories: 2,
+          filesystemEntries: "100",
+          regularFiles: "90",
+          logicalBytes: "1000",
+          allocatedBytes: "4096",
+          expectedFreeSpaceGainMinimumBytes: "2048",
+          expectedFreeSpaceGainMaximumBytes: "4096",
+          allocationUnitBytes: "4096",
+          recoveredCopyIncluded: true,
+          evidenceCopyIncluded: false,
+          evidenceCopyPresent: true,
+          intermediateLogsAndRunsIncluded: true,
+        },
+      };
     },
     planSegmentedCleanup: async () => {
       calls.push("segmented-plan");
-      return { status: "ready", approvalToken: "c".repeat(64) };
+      return {
+        status: "ready",
+        destructive: true,
+        approvalRequired: true,
+        pathsRedacted: true,
+        valuesPrinted: false,
+        approvalToken: "c".repeat(64),
+        miningScansVerified: 1,
+        selectedClosedSegments: 1,
+        activeSegmentsPreserved: 0,
+        scanErrorSourceDisposition: "retain",
+        deletion: {
+          filesystemEntries: "1",
+          regularFiles: "1",
+          logicalBytes: "10",
+          allocatedBytes: "4096",
+          expectedFreeSpaceGainMinimumBytes: "0",
+          expectedFreeSpaceGainMaximumBytes: "4096",
+          allocationUnitBytes: "4096",
+        },
+      };
     },
   };
 }
@@ -95,6 +138,10 @@ test("workflow controller immediately chains safe stages and stops at approval",
   assert.equal(result.currentStage, 1);
   assert.equal((result.stages as Array<{ status: string }>)[0]?.status, "complete");
   assert.equal((result.stages as Array<{ status: string }>)[1]?.status, "blocked");
+  const approval = (result.stages as Array<{ summary: Record<string, unknown> }>)[1]?.summary;
+  assert.equal(approval?.deletionLogicalBytes, "1000");
+  assert.equal(approval?.deletionPlannedMaximumReclaimableAllocatedBytes, "4096");
+  assert.equal(approval?.recoveredCopyIncluded, true);
 });
 
 test("workflow checkpoints bind the validated nested recovery configuration", async () => {
@@ -275,6 +322,27 @@ test("capacity safety stops before an authorized stage is invoked", async () => 
   assert.equal(result.safeToAutoContinue, false);
 });
 
+test("a signal already aborted at a clean workflow boundary persists a truthful safety block", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-workflow-pre-aborted-"));
+  const calls: string[] = [];
+  const stopped = new AbortController();
+  stopped.abort();
+  const config = workflow(root);
+  const result = await runWorkflowUntilBlocked(config, { executeRecovery: false, signal: stopped.signal }, dependencies(calls));
+  assert.deepEqual(calls, []);
+  assert.equal(result.workflowState, "blocked-safety");
+  assert.equal(result.genuinelyRunning, false);
+  assert.equal(result.activeProcess, null);
+  const persisted = JSON.parse(await readFile(path.join(config.directory, WORKFLOW_STATE_FILE), "utf8")) as {
+    status: string;
+    process: unknown;
+    stages: Array<{ status: string }>;
+  };
+  assert.equal(persisted.status, "blocked-safety");
+  assert.equal(persisted.process, null);
+  assert.equal(persisted.stages[0]?.status, "blocked");
+});
+
 test("a resumably paused retention stage cannot be marked complete or auto-advanced", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "aark-workflow-retention-pause-"));
   const calls: string[] = [];
@@ -303,6 +371,12 @@ test("process identity treats EPERM as existing and detects the current process"
   assert.deepEqual(stableBlockDeviceKeys([
     { path: "/dev/synthetic-partition", serial: null, wwn: null, filesystemUuid: "filesystem-uuid" },
   ]), ["uuid:filesystem-uuid"]);
+  assert.throws(() => stableBlockDeviceKeys([
+    { path: "/dev/synthetic", serial: undefined, wwn: null, filesystemUuid: null },
+  ] as unknown), /identity/u);
+  assert.throws(() => stableBlockDeviceKeys([
+    { path: "relative-device", serial: "serial", wwn: null, filesystemUuid: null },
+  ]), /identity/u);
 });
 
 test("continuation checkpoints reject unsupported states and missing runtime fields", () => {
@@ -502,6 +576,72 @@ test("native mining batch automatically advances child scans and globally consol
   assert.equal(recovered.status, "complete");
   assert.equal(recovered.batchesCompleted, 2);
   assert.equal(recovered.globallyDeduplicatedFindings, 1);
+
+  // An explicit rerun after remediation must re-enter exact verification
+  // instead of treating a prior safety blocker as permanently terminal.
+  const retryableState = JSON.parse(await readFile(stateFilename, "utf8")) as { status: string; blocker: string | null };
+  retryableState.status = "blocked-safety";
+  retryableState.blocker = "synthetic remediated safety blocker";
+  await writeFile(stateFilename, `${JSON.stringify(retryableState, null, 2)}\n`);
+  const retried = await runMiningBatch(batchOptions);
+  assert.equal(retried.status, "complete");
+
+  // Terminal publication is not a trust-on-first-use shortcut: every later
+  // invocation must still verify the exact child inventories and artifacts.
+  const childInventory = path.join(batchOutput, "batches", "batch-000001", "inventory-sensitive.json");
+  await writeFile(childInventory, `${await readFile(childInventory, "utf8")} `);
+  await assert.rejects(runMiningBatch(batchOptions), /inventory|completed|integrity/u);
+});
+
+test("native mining batch durably resumes root partitioning and refuses silent empty-root omission", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-mining-partition-resume-"));
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  const one = path.join(root, "one");
+  const two = path.join(root, "two");
+  const empty = path.join(root, "empty");
+  await mkdir(one);
+  await mkdir(two);
+  await mkdir(empty);
+  await writeFile(path.join(one, "one.txt"), "one\n");
+  await writeFile(path.join(two, "two.txt"), "two\n");
+  const output = path.join(root, "output");
+  const controller = new AbortController();
+  const options = {
+    inputs: [one, two],
+    output,
+    provenance: "unknown" as const,
+    chunkBytes: 17 * 1024 * 1024,
+    overlapBytes: 17 * 1024 * 1024,
+    wholeFileBytes: 1024 * 1024,
+    workers: 1,
+    minimumFreeGiB: 0,
+    minimumFreePercent: 0,
+    maximumRootsPerBatch: 1,
+  };
+  const paused = await runMiningBatch({
+    ...options,
+    signal: controller.signal,
+    progress: (progress) => {
+      if (progress.phase === "partitioning" && progress.rootsCompleted === 1) controller.abort();
+    },
+  });
+  assert.equal(paused.status, "paused");
+  assert.equal(paused.rootsPartitioned, 1);
+  const checkpoint = JSON.parse(await readFile(path.join(output, "batch-state-sensitive.json"), "utf8")) as {
+    partitionNextInput: number;
+    units: unknown[];
+  };
+  assert.equal(checkpoint.partitionNextInput, 1);
+  assert.equal(checkpoint.units.length, 1);
+  const resumed = await runMiningBatch(options);
+  assert.equal(resumed.status, "complete");
+  assert.equal(resumed.rootsPartitioned, 2);
+
+  await assert.rejects(runMiningBatch({
+    ...options,
+    inputs: [empty],
+    output: path.join(root, "empty-output"),
+  }), /each contain at least one regular file/u);
 });
 
 test("native mining batch refuses to advance after losing its controller lock", async () => {

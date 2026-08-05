@@ -35,8 +35,22 @@ export interface StableBlockDeviceIdentity {
   filesystemUuid: string | null;
 }
 
-export function stableBlockDeviceKeys(identities: StableBlockDeviceIdentity[]): string[] {
-  return [...new Set(identities.map((identity) => identity.wwn === null
+export function stableBlockDeviceKeys(identities: StableBlockDeviceIdentity[] | unknown): string[] {
+  if (!Array.isArray(identities) || identities.length > 4_096) throw new Error("stored block-device identity list is invalid");
+  for (const identity of identities) {
+    if (typeof identity !== "object" || identity === null || Array.isArray(identity)) {
+      throw new Error("stored block-device identity is invalid");
+    }
+    const item = identity as Record<string, unknown>;
+    if (typeof item.path !== "string" || !item.path.startsWith("/dev/") || path.resolve(item.path) !== item.path
+      || Buffer.byteLength(item.path) > 4 * 1024 || /[\u0000-\u001f\u007f]/u.test(item.path)
+      || ![item.serial, item.wwn, item.filesystemUuid].every((value) => value === null
+        || typeof value === "string" && stableIdentityText(value) === value)) {
+      throw new Error("stored block-device identity is invalid");
+    }
+  }
+  const validated = identities as StableBlockDeviceIdentity[];
+  return [...new Set(validated.map((identity) => identity.wwn === null
     ? identity.serial === null
       ? identity.filesystemUuid === null ? null : `uuid:${identity.filesystemUuid}`
       : `serial:${identity.serial}`
@@ -67,8 +81,24 @@ export interface SourceSafety {
   reasons: string[];
 }
 
-function flatten(nodes: LsblkNode[]): LsblkNode[] {
-  return nodes.flatMap((node) => [node, ...flatten(node.children ?? [])]);
+function flatten(nodes: unknown): LsblkNode[] {
+  if (!Array.isArray(nodes)) throw new Error("lsblk returned an invalid block-device list");
+  const flattened: LsblkNode[] = [];
+  const pending = [...nodes].reverse();
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error("lsblk returned an invalid block-device entry");
+    }
+    const node = value as LsblkNode;
+    flattened.push(node);
+    if (flattened.length > 4_096) throw new Error("lsblk block-device graph exceeds its bounded node limit");
+    if (node.children !== undefined) {
+      if (!Array.isArray(node.children)) throw new Error("lsblk returned invalid block-device children");
+      for (let index = node.children.length - 1; index >= 0; index -= 1) pending.push(node.children[index]);
+    }
+  }
+  return flattened;
 }
 
 export function blockDeviceIsNetworkBacked(device: string, transport?: string | null, subsystems?: string | null): boolean {
@@ -92,7 +122,9 @@ async function topDevices(input: string): Promise<{ devices: string[]; identitie
   // disk. Keep stable identifiers from every node in the inverse dependency
   // chain while retaining only physical disks in `devices` for overlap checks.
   const identities = nodes
-    .filter((node): node is LsblkNode & { path: string } => node.path !== undefined)
+    .filter((node): node is LsblkNode & { path: string } => typeof node.path === "string"
+      && node.path.startsWith("/dev/") && path.resolve(node.path) === node.path
+      && Buffer.byteLength(node.path) <= 4 * 1024 && !/[\u0000-\u001f\u007f]/u.test(node.path))
     .map((node) => ({
       path: node.path,
       serial: stableIdentityText(node.serial),

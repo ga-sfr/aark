@@ -375,6 +375,9 @@ function assertResumeDeviceIdentity(stored: unknown, current: SourceSafety): voi
     throw new Error("resumable recovery state lacks its prior source/device safety identity");
   }
   const expected = stored as Partial<SourceSafety>;
+  if (expected.kind !== current.kind || expected.destinationBackingKind !== current.destinationBackingKind) {
+    throw new Error("source or destination backing kind changed since the resumable recovery checkpoint");
+  }
   if (current.destinationBackingKind === "block-device") {
     if (!Array.isArray(expected.destinationDeviceIdentities)) {
       throw new Error("resumable recovery state predates stable destination disk identities; create and review a new case instead");

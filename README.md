@@ -93,7 +93,7 @@ aark mine batch /case/recovery/recup_dir.* \
   --workers 4
 ```
 
-The batch checkpoint automatically advances children, resumes clean pauses, reduces later batch sizes as finding density rises, and publishes one globally deduplicated redacted aggregate. A complete batch root can be passed directly to retention and cleanup commands.
+The batch checkpoint durably resumes both root partitioning and child scans, automatically advances children, reduces later batch sizes as finding density rises, and publishes one globally deduplicated redacted aggregate. Terminal use re-verifies every exact child inventory and artifact tree. A complete batch root can be passed directly to retention and cleanup commands.
 
 `SIGINT`, `SIGTERM`, the free-space reserve, and an optional `--max-output-gib` cap produce a clean mining pause at a committed chunk boundary. A paused command returns JSON with `resumable: true` and exits `75`; preserve the output and use its `resumeCommand`:
 

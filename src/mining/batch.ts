@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   acquireExclusiveLock,
   atomicWriteJson,
@@ -13,7 +14,8 @@ import {
 import { directoryLogicalBytes, gibibytesToBytes } from "../core/storage.js";
 import type { MiningOptions, MiningProgress } from "./types.js";
 import { MAX_INPUT_ROOTS, MAX_RECORDED_OCCURRENCES, MAX_UNIQUE_FINDINGS } from "./limits.js";
-import { loadCompletedInventory, loadScanState } from "./resume.js";
+import { loadScanState, loadVerifiedCompletedInventory } from "./resume.js";
+import type { SensitiveScanInventory } from "./types.js";
 import { resumeSensitiveMaterial, scanSensitiveMaterial } from "./scanner.js";
 
 const BATCH_LOCK = ".aark-batch.lock";
@@ -27,7 +29,9 @@ const DEFAULT_MAX_FILES = 50_000;
 const DEFAULT_MAX_BYTES = 256 * 1024 ** 3;
 const FINDING_HEADROOM = Math.floor(MAX_UNIQUE_FINDINGS * 0.8);
 const OCCURRENCE_HEADROOM = Math.floor(MAX_RECORDED_OCCURRENCES * 0.8);
-const BATCH_CONTROL_RESERVE_BYTES = 8n * 1024n * 1024n;
+const BATCH_CONTROL_RESERVE_BYTES = 2n * BigInt(MAX_BATCH_STATE_BYTES) + 1024n * 1024n;
+const PARTITION_CHECKPOINT_ROOTS = 1_024;
+const PARTITION_CHECKPOINT_INTERVAL_MS = 5_000;
 
 export interface MiningBatchOptions extends Omit<MiningOptions, "output" | "progress"> {
   output: string;
@@ -86,9 +90,11 @@ interface BatchState {
   layer: "mining-batch";
   runId: string;
   configSha256: string;
-  status: "running" | "paused" | "blocked-safety" | "complete";
+  status: "partitioning" | "running" | "paused" | "blocked-safety" | "complete";
   startedAt: string;
   updatedAt: string;
+  inputsTotal: number;
+  partitionNextInput: number;
   units: BatchUnit[];
   nextUnit: number;
   active: ActiveBatch | null;
@@ -126,6 +132,10 @@ export interface ResolvedMiningOutputs {
 
 function interrupted(signal: AbortSignal | undefined): void {
   if (signal?.aborted === true) throw new Error("mining batch was interrupted");
+}
+
+function signalAborted(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true;
 }
 
 function safeAdd(left: number, right: number, label: string): number {
@@ -201,58 +211,37 @@ function configHash(options: NormalizedBatchOptions): string {
   return createHash("sha256").update(JSON.stringify(configMaterial(options))).digest("hex");
 }
 
-async function inventoryUnits(options: NormalizedBatchOptions): Promise<BatchUnit[]> {
-  const units: BatchUnit[] = [];
-  for (let index = 0; index < options.inputs.length; index += 1) {
-    interrupted(options.signal);
-    const input = options.inputs[index];
-    if (input === undefined) continue;
-    const canonical = await realpath(input);
-    if (canonical !== input) throw new Error("mine batch inputs must be canonical paths without symbolic-link aliases");
-    const before = await lstat(input);
-    if (!before.isFile() && !before.isDirectory()) throw new Error("mine batch inputs must be regular files or directories");
-    let files = 0;
-    let bytes = 0;
-    for await (const file of walkRegularFiles([input], {
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
-      onError: (_filename, error) => { throw error; },
-    })) {
-      files += 1;
-      bytes += file.bytes;
-      if (!Number.isSafeInteger(files) || !Number.isSafeInteger(bytes)) throw new Error("mine batch inventory exceeds safe numeric limits");
-    }
-    const after = await lstat(input);
-    if (before.dev !== after.dev || before.ino !== after.ino || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
-      throw new Error("mine batch input changed while it was partitioned");
-    }
-    if (files > 0) {
-      units.push({
-        input,
-        kind: before.isFile() ? "file" : "directory",
-        device: before.dev,
-        inode: before.ino,
-        modifiedMs: before.mtimeMs,
-        changedMs: before.ctimeMs,
-        files,
-        bytes,
-      });
-    }
-    options.progress?.({
-      phase: "partitioning",
-      batch: 0,
-      batchesCompleted: 0,
-      rootsCompleted: index + 1,
-      rootsTotal: options.inputs.length,
-      filesTotal: 0,
-      filesScanned: 0,
-      bytesScanned: 0,
-      uniqueFindings: 0,
-      occurrences: 0,
-      scanErrors: 0,
-    });
+async function inventoryUnit(input: string, options: NormalizedBatchOptions): Promise<BatchUnit> {
+  interrupted(options.signal);
+  const canonical = await realpath(input);
+  if (canonical !== input) throw new Error("mine batch inputs must be canonical paths without symbolic-link aliases");
+  const before = await lstat(input);
+  if (!before.isFile() && !before.isDirectory()) throw new Error("mine batch inputs must be regular files or directories");
+  let files = 0;
+  let bytes = 0;
+  for await (const file of walkRegularFiles([input], {
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    onError: (_filename, error) => { throw error; },
+  })) {
+    files += 1;
+    bytes += file.bytes;
+    if (!Number.isSafeInteger(files) || !Number.isSafeInteger(bytes)) throw new Error("mine batch inventory exceeds safe numeric limits");
   }
-  if (units.length < 1) throw new Error("mine batch inputs contain no regular files");
-  return units;
+  const after = await lstat(input);
+  if (before.dev !== after.dev || before.ino !== after.ino || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+    throw new Error("mine batch input changed while it was partitioned");
+  }
+  if (files === 0) throw new Error("mine batch input roots must each contain at least one regular file");
+  return {
+    input,
+    kind: before.isFile() ? "file" : "directory",
+    device: before.dev,
+    inode: before.ino,
+    modifiedMs: before.mtimeMs,
+    changedMs: before.ctimeMs,
+    files,
+    bytes,
+  };
 }
 
 function record(value: unknown, label: string): Record<string, unknown> {
@@ -279,7 +268,7 @@ function parseState(value: unknown): BatchState {
     item.version !== 1 || item.tool !== "aark" || item.layer !== "mining-batch"
     || typeof item.runId !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(item.runId)
     || typeof item.configSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(item.configSha256)
-    || !["running", "paused", "blocked-safety", "complete"].includes(String(item.status))
+    || !["partitioning", "running", "paused", "blocked-safety", "complete"].includes(String(item.status))
     || !validIsoDate(item.startedAt) || !validIsoDate(item.updatedAt)
     || !Array.isArray(item.units) || !Array.isArray(item.completed)
     || !Number.isSafeInteger(item.nextUnit) || Number(item.nextUnit) < 0
@@ -287,10 +276,20 @@ function parseState(value: unknown): BatchState {
     || typeof item.totals !== "object" || item.totals === null
     || !(item.blocker === null || typeof item.blocker === "string" && Buffer.byteLength(item.blocker) <= 4096)
   ) throw new Error("mining batch state is invalid");
-  const state = value as BatchState;
+  // Pre-partition-checkpoint v1 states were written only after every root was
+  // inventoried. Default the new counters accordingly so those checkpoints
+  // remain forward compatible.
+  const legacyUnits = item.units as BatchUnit[];
+  const inputsTotal = item.inputsTotal ?? legacyUnits.length;
+  const partitionNextInput = item.partitionNextInput ?? legacyUnits.length;
+  if (!Number.isSafeInteger(inputsTotal) || Number(inputsTotal) < 1 || Number(inputsTotal) > MAX_BATCH_INPUTS
+    || !Number.isSafeInteger(partitionNextInput) || Number(partitionNextInput) < 0 || Number(partitionNextInput) > Number(inputsTotal)) {
+    throw new Error("mining batch partition checkpoint is invalid");
+  }
+  const state = { ...(value as BatchState), inputsTotal: Number(inputsTotal), partitionNextInput: Number(partitionNextInput) };
   const totalsValid = [state.totals.filesTotal, state.totals.filesScanned, state.totals.bytesScanned, state.totals.uniqueFindings, state.totals.occurrences]
     .every((count) => Number.isSafeInteger(count) && count >= 0);
-  const unitsValid = state.units.length >= 1 && state.units.length <= MAX_BATCH_INPUTS && state.units.every((unit) => (
+  const unitsValid = state.units.length <= MAX_BATCH_INPUTS && state.units.every((unit) => (
     typeof unit === "object" && unit !== null
     && typeof unit.input === "string" && path.isAbsolute(unit.input) && path.resolve(unit.input) === unit.input
     && (unit.kind === "file" || unit.kind === "directory")
@@ -328,17 +327,28 @@ function parseState(value: unknown): BatchState {
   } catch {
     throw new Error("mining batch state totals exceed safe numeric bounds");
   }
-  if (!unitsValid || !totalsValid || new Set(state.units.map((unit) => unit.input)).size !== state.units.length || !completedValid
+  const partitionIncomplete = state.partitionNextInput < state.inputsTotal;
+  const pausedPartition = state.status === "paused" && partitionIncomplete
+    && state.active === null && state.completed.length === 0 && state.nextUnit === 0;
+  if (!unitsValid || !totalsValid || state.units.length !== state.partitionNextInput
+    || new Set(state.units.map((unit) => unit.input)).size !== state.units.length || !completedValid
     || state.nextUnit !== expectedNext || !activeValid
     || state.totals.filesTotal !== expectedTotals.filesTotal
     || state.totals.filesScanned !== expectedTotals.filesScanned
     || state.totals.bytesScanned !== expectedTotals.bytesScanned
     || state.totals.uniqueFindings !== expectedTotals.uniqueFindings
     || state.totals.occurrences !== expectedTotals.occurrences
+    || (state.status === "partitioning" && !partitionIncomplete)
+    || (!partitionIncomplete && state.units.length < 1)
+    || (partitionIncomplete && state.status !== "partitioning" && !pausedPartition)
+    || (partitionIncomplete && (state.active !== null || state.completed.length !== 0 || state.nextUnit !== 0))
     || (state.status === "complete" && (state.nextUnit !== state.units.length || state.active !== null))
     || (state.status === "paused" && !(
-      state.active?.status === "paused"
-      || state.active === null && state.nextUnit < state.units.length
+      pausedPartition
+      || !partitionIncomplete && (
+        state.active?.status === "paused"
+        || state.active === null && state.nextUnit <= state.units.length
+      )
     ))
     || (state.status === "blocked-safety") !== (state.blocker !== null)
     || (state.status !== "blocked-safety" && state.blocker !== null)) {
@@ -350,7 +360,7 @@ function parseState(value: unknown): BatchState {
 function parseAggregate(value: unknown): AggregateState {
   const item = record(value, "mining batch aggregate");
   if (item.version !== 1 || !Array.isArray(item.completedBatches) || item.completedBatches.length > MAX_BATCHES
-    || !Array.isArray(item.keys) || typeof item.categories !== "object" || item.categories === null
+    || !Array.isArray(item.keys) || typeof item.categories !== "object" || item.categories === null || Array.isArray(item.categories)
     || !Number.isSafeInteger(item.occurrences) || Number(item.occurrences) < 0) {
     throw new Error("mining batch aggregate is invalid");
   }
@@ -443,8 +453,7 @@ export async function resolveMiningOutputs(references: string[], maximumOutputs 
     if (state.status !== "complete" || state.active !== null || state.nextUnit !== state.units.length) {
       throw new Error("referenced mining batch workflow is not exactly complete");
     }
-    const aggregate = await loadAggregate(reference);
-    if (aggregate.completedBatches.length !== state.completed.length) throw new Error("mining batch aggregate is not synchronized with its completed scans");
+    await verifyCompletedAggregate(reference, state);
     batchRoots.push(reference);
     outputs.push(...state.completed.map((batch) => batchDirectory(reference, batch.index)));
     if (outputs.length > maximumOutputs) throw new Error("expanded mining output set exceeds its supported range; retain or clean smaller workflow groups");
@@ -467,19 +476,96 @@ async function loadAggregate(output: string): Promise<AggregateState> {
   }
 }
 
-async function updateAggregate(output: string, active: ActiveBatch): Promise<AggregateState> {
+function assertChildBinding(
+  parentOutput: string,
+  parent: BatchState,
+  range: Pick<CompletedBatch, "firstUnit" | "nextUnit" | "index">,
+  child: Awaited<ReturnType<typeof loadScanState>>,
+  options?: NormalizedBatchOptions,
+): void {
+  const childOutput = batchDirectory(parentOutput, range.index);
+  const expectedInputs = parent.units.slice(range.firstUnit, range.nextUnit).map((unit) => unit.input);
+  if (child.semantic.output !== childOutput || !isDeepStrictEqual(child.semantic.inputs, expectedInputs)) {
+    throw new Error("completed child scan is not bound to its parent batch range");
+  }
+  if (options !== undefined && (
+    child.semantic.provenance !== options.provenance
+    || child.semantic.chunkBytes !== options.chunkBytes
+    || child.semantic.overlapBytes !== options.overlapBytes
+    || child.semantic.wholeFileBytes !== options.wholeFileBytes
+    || child.semantic.deepKeySchedules !== (options.deepKeySchedules === true)
+  )) throw new Error("completed child scan options disagree with its parent batch configuration");
+}
+
+async function loadVerifiedChild(
+  output: string,
+  parent: BatchState,
+  range: Pick<CompletedBatch, "firstUnit" | "nextUnit" | "index">,
+  options?: NormalizedBatchOptions,
+  signal?: AbortSignal,
+): Promise<{ state: Awaited<ReturnType<typeof loadScanState>>; inventory: SensitiveScanInventory }> {
+  const childOutput = batchDirectory(output, range.index);
+  const state = await loadScanState(childOutput, signal);
+  assertChildBinding(output, parent, range, state, options);
+  const inventory = await loadVerifiedCompletedInventory(childOutput, state, signal);
+  return { state, inventory };
+}
+
+async function verifyCompletedAggregate(
+  output: string,
+  state: BatchState,
+  options?: NormalizedBatchOptions,
+  signal?: AbortSignal,
+): Promise<AggregateState> {
+  const rebuilt: AggregateState = { version: 1, completedBatches: [], keys: [], categories: {}, occurrences: 0 };
+  const keys = new Set<string>();
+  for (const batch of state.completed) {
+    interrupted(signal);
+    const child = await loadVerifiedChild(output, state, batch, options, signal);
+    const childOccurrences = child.inventory.findings.reduce(
+      (sum, finding) => safeAdd(sum, finding.occurrences.length, "mining batch child occurrence total"),
+      0,
+    );
+    if (
+      batch.filesScanned !== child.state.progress.filesScanned
+      || batch.bytesScanned !== child.state.progress.bytesScanned
+      || batch.uniqueFindings !== child.state.progress.uniqueFindings
+      || batch.occurrences !== child.state.progress.occurrences
+      || childOccurrences !== batch.occurrences
+    ) throw new Error("completed child scan counters disagree with the parent batch checkpoint");
+    for (const finding of child.inventory.findings) {
+      const key = `${finding.category}\0${finding.sha256}`;
+      if (keys.has(key)) continue;
+      keys.add(key);
+      rebuilt.categories[finding.category] = safeAdd(
+        Object.hasOwn(rebuilt.categories, finding.category) ? rebuilt.categories[finding.category] ?? 0 : 0,
+        1,
+        "mining batch aggregate category total",
+      );
+    }
+    rebuilt.occurrences = safeAdd(rebuilt.occurrences, childOccurrences, "mining batch aggregate occurrence total");
+    rebuilt.completedBatches.push(batch.index);
+  }
+  rebuilt.keys = [...keys].sort();
+  const stored = await loadAggregate(output);
+  if (!isDeepStrictEqual(stored, rebuilt)) throw new Error("mining batch aggregate disagrees with its verified completed scans");
+  return stored;
+}
+
+async function updateAggregate(output: string, active: ActiveBatch, inventory: SensitiveScanInventory): Promise<AggregateState> {
   const aggregate = await loadAggregate(output);
   if (aggregate.completedBatches.includes(active.index)) return aggregate;
   if (aggregate.completedBatches.length + 1 !== active.index) throw new Error("mining batch aggregate completion order is inconsistent");
   const keys = new Set(aggregate.keys);
-  const scanOutput = batchDirectory(output, active.index);
-  const scanState = await loadScanState(scanOutput);
-  const inventory = await loadCompletedInventory(scanOutput, scanState.inventory);
   for (const finding of inventory.findings) {
     const key = `${finding.category}\0${finding.sha256}`;
     if (keys.has(key)) continue;
     keys.add(key);
-    aggregate.categories[finding.category] = (aggregate.categories[finding.category] ?? 0) + 1;
+    aggregate.categories[finding.category] = safeAdd(
+      Object.hasOwn(aggregate.categories, finding.category) ? aggregate.categories[finding.category] ?? 0 : 0,
+      1,
+      "mining batch aggregate category total",
+    );
   }
   aggregate.keys = [...keys].sort();
   const childOccurrences = inventory.findings.reduce(
@@ -495,11 +581,43 @@ async function updateAggregate(output: string, active: ActiveBatch): Promise<Agg
   return aggregate;
 }
 
+async function verifiedCompletedChild(
+  output: string,
+  parent: BatchState,
+  active: ActiveBatch,
+  options: NormalizedBatchOptions,
+  result: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<{
+  inventory: SensitiveScanInventory;
+  filesScanned: number;
+  bytesScanned: number;
+  uniqueFindings: number;
+  occurrences: number;
+}> {
+  const { state, inventory } = await loadVerifiedChild(output, parent, active, options, signal);
+  const expected = {
+    filesScanned: state.progress.filesScanned,
+    bytesScanned: state.progress.bytesScanned,
+    uniqueFindings: state.progress.uniqueFindings,
+    occurrences: state.progress.occurrences,
+  };
+  if (result.status !== "complete" || result.complete !== true || result.resumable !== false
+    || result.scanErrors !== 0
+    || result.filesScanned !== expected.filesScanned
+    || result.bytesScanned !== expected.bytesScanned
+    || result.uniqueFindings !== expected.uniqueFindings
+    || result.occurrences !== expected.occurrences) {
+    throw new Error("completed child scan result disagrees with its exact durable checkpoint");
+  }
+  return { inventory, ...expected };
+}
+
 function totalProgress(state: BatchState): Omit<MiningBatchProgress, "phase" | "batch"> {
   return {
     batchesCompleted: state.completed.length,
     rootsCompleted: state.nextUnit,
-    rootsTotal: state.units.length,
+    rootsTotal: state.inputsTotal,
     filesTotal: state.totals.filesTotal,
     filesScanned: state.totals.filesScanned,
     bytesScanned: state.totals.bytesScanned,
@@ -518,8 +636,9 @@ async function writeRedacted(output: string, state: BatchState, aggregate: Aggre
     layer: "mining-batch",
     status: state.status,
     complete,
-    resumable: state.status === "running" || state.status === "paused",
+    resumable: state.status === "partitioning" || state.status === "running" || state.status === "paused",
     batchesCompleted: totals.batchesCompleted,
+    rootsPartitioned: state.partitionNextInput,
     rootsCompleted: totals.rootsCompleted,
     rootsTotal: totals.rootsTotal,
     filesScanned: totals.filesScanned,
@@ -550,22 +669,24 @@ export async function runMiningBatch(input: MiningBatchOptions): Promise<Record<
   if (fresh) await ensurePrivateDirectory(options.output);
   else if (await realpath(options.output) !== options.output) throw new Error("mine batch output must be a canonical real directory");
   const allowed = new Set([BATCH_LOCK, STATE_FILE, AGGREGATE_FILE, REDACTED_FILE, "batches"]);
-  const entries = await readDirectoryNamesBounded(options.output, allowed.size + 1);
+  let entries = await readDirectoryNamesBounded(options.output, allowed.size + 1);
   if (entries.some((entry) => !allowed.has(entry))) throw new Error("mine batch output contains an unexpected entry");
   const lock = await acquireExclusiveLock(options.output, BATCH_LOCK, { reclaimDeadOwner: true });
   let operationError: unknown;
   try {
+    entries = await readDirectoryNamesBounded(options.output, allowed.size + 1);
+    if (entries.some((entry) => !allowed.has(entry))) throw new Error("mine batch output changed to contain an unexpected entry while its lock was acquired");
     const hash = configHash(options);
     let state: BatchState;
     if (entries.includes(STATE_FILE)) {
       state = parseState(await readJson<unknown>(safeJoin(options.output, STATE_FILE), MAX_BATCH_STATE_BYTES));
       if (state.configSha256 !== hash) throw new Error("mine batch options differ from its durable checkpoint");
-      if (state.units.some((unit) => !options.inputs.includes(unit.input))) {
-        throw new Error("mine batch checkpoint contains an input outside its current configuration");
+      if (state.inputsTotal !== options.inputs.length
+        || !isDeepStrictEqual(state.units.map((unit) => unit.input), options.inputs.slice(0, state.partitionNextInput))) {
+        throw new Error("mine batch checkpoint inputs do not exactly match its current configuration");
       }
       await assertUnitsCurrent(state.units, state.nextUnit);
     } else {
-      const units = await inventoryUnits(options);
       const now = new Date().toISOString();
       state = {
         version: 1,
@@ -573,15 +694,17 @@ export async function runMiningBatch(input: MiningBatchOptions): Promise<Record<
         layer: "mining-batch",
         runId: randomUUID(),
         configSha256: hash,
-        status: "running",
+        status: "partitioning",
         startedAt: now,
         updatedAt: now,
-        units,
+        inputsTotal: options.inputs.length,
+        partitionNextInput: 0,
+        units: [],
         nextUnit: 0,
         active: null,
         completed: [],
         totals: {
-          filesTotal: units.reduce((sum, unit) => safeAdd(sum, unit.files, "mining batch file inventory total"), 0),
+          filesTotal: 0,
           filesScanned: 0,
           bytesScanned: 0,
           uniqueFindings: 0,
@@ -593,8 +716,67 @@ export async function runMiningBatch(input: MiningBatchOptions): Promise<Record<
       await atomicWriteJson(safeJoin(options.output, AGGREGATE_FILE), { version: 1, completedBatches: [], keys: [], categories: {}, occurrences: 0 });
       await writeState(options.output, state);
     }
-    if (state.status === "complete") return await writeRedacted(options.output, state, await loadAggregate(options.output));
-    if (state.status === "blocked-safety") return await writeRedacted(options.output, state, await loadAggregate(options.output));
+    if (state.partitionNextInput < state.inputsTotal) {
+      state.status = "partitioning";
+      state.blocker = null;
+      await writeState(options.output, state);
+      let checkpointedInput = state.partitionNextInput;
+      let checkpointedAt = Date.now();
+      while (state.partitionNextInput < state.inputsTotal) {
+        if (options.signal?.aborted === true) {
+          state.status = "paused";
+          await writeState(options.output, state);
+          return await writeRedacted(options.output, state, await loadAggregate(options.output));
+        }
+        const input = options.inputs[state.partitionNextInput];
+        if (input === undefined) throw new Error("mine batch lost its next configured input root");
+        let unit: BatchUnit;
+        try {
+          unit = await inventoryUnit(input, options);
+        } catch (error) {
+          if (!signalAborted(options.signal)) throw error;
+          state.status = "paused";
+          await writeState(options.output, state);
+          return await writeRedacted(options.output, state, await loadAggregate(options.output));
+        }
+        state.units.push(unit);
+        state.partitionNextInput += 1;
+        state.totals.filesTotal = safeAdd(state.totals.filesTotal, unit.files, "mining batch file inventory total");
+        if (state.partitionNextInput === state.inputsTotal) state.status = "running";
+        const now = Date.now();
+        if (state.partitionNextInput === state.inputsTotal
+          || state.partitionNextInput - checkpointedInput >= PARTITION_CHECKPOINT_ROOTS
+          || now - checkpointedAt >= PARTITION_CHECKPOINT_INTERVAL_MS) {
+          await writeState(options.output, state);
+          checkpointedInput = state.partitionNextInput;
+          checkpointedAt = now;
+        }
+        options.progress?.({
+          phase: "partitioning",
+          batch: 0,
+          batchesCompleted: 0,
+          rootsCompleted: state.partitionNextInput,
+          rootsTotal: state.inputsTotal,
+          filesTotal: state.totals.filesTotal,
+          filesScanned: 0,
+          bytesScanned: 0,
+          uniqueFindings: 0,
+          occurrences: 0,
+          scanErrors: 0,
+        });
+      }
+      state.status = "running";
+    }
+    if (state.status === "complete") {
+      return await writeRedacted(options.output, state, await verifyCompletedAggregate(options.output, state, options, options.signal));
+    }
+    if (state.status === "blocked-safety") {
+      // A fresh invocation is an explicit retry after remediation. Re-enter
+      // the exact child/aggregate checks below; they will publish the same
+      // blocker again unless the underlying safety condition is truly fixed.
+      state.status = "running";
+      state.blocker = null;
+    }
 
     while (state.nextUnit < state.units.length || state.active !== null) {
       if (options.signal?.aborted === true && state.active === null) {
@@ -624,10 +806,14 @@ export async function runMiningBatch(input: MiningBatchOptions): Promise<Record<
       if (active === null) throw new Error("mine batch lost its active batch checkpoint");
       const output = batchDirectory(options.output, active.index);
       let recoveredResult: Record<string, unknown> | undefined;
+      let childOutputExists = false;
+      let childCheckpointLoaded = false;
       try {
         const outputMetadata = await lstat(output);
+        childOutputExists = true;
         if (!outputMetadata.isDirectory() || outputMetadata.isSymbolicLink()) throw new Error("existing child batch output is not a real directory");
-        const childState = await loadScanState(output, options.signal);
+        const childState = await loadScanState(output);
+        childCheckpointLoaded = true;
         active.progress = { ...childState.progress };
         if (childState.status === "paused" && childState.resumable) {
           active.status = "paused";
@@ -649,8 +835,32 @@ export async function runMiningBatch(input: MiningBatchOptions): Promise<Record<
         const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
         const causeCode = error instanceof Error && "cause" in error && error.cause instanceof Error && "code" in error.cause
           ? (error.cause as NodeJS.ErrnoException).code : undefined;
-        if (code !== "ENOENT" && causeCode !== "ENOENT") throw error;
-        if (active.status === "paused") throw new Error("paused child batch output disappeared");
+        if (code !== "ENOENT" && causeCode !== "ENOENT") {
+          state.status = "blocked-safety";
+          state.blocker = "an existing child batch output failed durable checkpoint or filesystem verification";
+          await lock.assertHeld();
+          await writeState(options.output, state);
+          return await writeRedacted(options.output, state, await loadAggregate(options.output));
+        }
+        if (active.status === "paused") {
+          state.status = "blocked-safety";
+          state.blocker = "a paused child batch output disappeared and cannot be resumed safely";
+          await lock.assertHeld();
+          await writeState(options.output, state);
+          return await writeRedacted(options.output, state, await loadAggregate(options.output));
+        }
+      }
+      if (options.signal?.aborted === true) {
+        if (!childOutputExists) state.active = null;
+        else if (childCheckpointLoaded) active.status = "paused";
+        else {
+          state.status = "blocked-safety";
+          state.blocker = "an existing child output has no durable scan checkpoint; inspect it before retrying";
+        }
+        if (state.status !== "blocked-safety") state.status = "paused";
+        await lock.assertHeld();
+        await writeState(options.output, state);
+        return await writeRedacted(options.output, state, await loadAggregate(options.output));
       }
       let childMaximumOutputGiB: number | undefined;
       if (recoveredResult === undefined && options.maximumOutputGiB !== undefined) {
@@ -665,11 +875,18 @@ export async function runMiningBatch(input: MiningBatchOptions): Promise<Record<
       }
       let heartbeatError: unknown;
       let heartbeat = Promise.resolve();
+      const heartbeatAbort = new AbortController();
+      const childSignal = options.signal === undefined
+        ? heartbeatAbort.signal
+        : AbortSignal.any([options.signal, heartbeatAbort.signal]);
       const timer = setInterval(() => {
         heartbeat = heartbeat.then(async () => {
           await lock.assertHeld();
           await writeState(options.output, state);
-        }).catch((error: unknown) => { heartbeatError ??= error; });
+        }).catch((error: unknown) => {
+          heartbeatError ??= error;
+          heartbeatAbort.abort();
+        });
       }, 5_000);
       timer.unref();
       const completedProgress = totalProgress(state);
@@ -695,7 +912,7 @@ export async function runMiningBatch(input: MiningBatchOptions): Promise<Record<
             ...(options.minimumFreeGiB === undefined ? {} : { minimumFreeGiB: options.minimumFreeGiB }),
             ...(options.minimumFreePercent === undefined ? {} : { minimumFreePercent: options.minimumFreePercent }),
             ...(childMaximumOutputGiB === undefined ? {} : { maximumOutputGiB: childMaximumOutputGiB }),
-            ...(options.signal === undefined ? {} : { signal: options.signal }),
+            signal: childSignal,
             progress: reportProgress,
           })
           : await scanSensitiveMaterial({
@@ -710,7 +927,7 @@ export async function runMiningBatch(input: MiningBatchOptions): Promise<Record<
             ...(options.minimumFreeGiB === undefined ? {} : { minimumFreeGiB: options.minimumFreeGiB }),
             ...(options.minimumFreePercent === undefined ? {} : { minimumFreePercent: options.minimumFreePercent }),
             ...(childMaximumOutputGiB === undefined ? {} : { maximumOutputGiB: childMaximumOutputGiB }),
-            ...(options.signal === undefined ? {} : { signal: options.signal }),
+            signal: childSignal,
             progress: reportProgress,
           }));
       } catch (error) {
@@ -725,6 +942,18 @@ export async function runMiningBatch(input: MiningBatchOptions): Promise<Record<
         clearInterval(timer);
         await heartbeat;
       }
+      if (heartbeatError !== undefined) {
+        // The child was asked to stop at its own durable boundary. Do not
+        // advance the outer batch even if the child happened to finish while
+        // the heartbeat write was failing; a later invocation will verify and
+        // commit that completed checkpoint idempotently.
+        await lock.assertHeld();
+        active.status = "paused";
+        state.status = "paused";
+        state.blocker = null;
+        await writeState(options.output, state);
+        return await writeRedacted(options.output, state, await loadAggregate(options.output));
+      }
       // A heartbeat may have discovered a substituted or removed lock while
       // the child was still finishing. Never commit child advancement unless
       // ownership is freshly re-established at the stage boundary.
@@ -732,6 +961,12 @@ export async function runMiningBatch(input: MiningBatchOptions): Promise<Record<
       // A successful final checkpoint supersedes a transient heartbeat write
       // failure. If persistence is still unavailable, the state write below
       // will fail and prevent unsafe advancement.
+      if (signalAborted(options.signal) && result.status === "complete") {
+        active.status = "paused";
+        state.status = "paused";
+        await writeState(options.output, state);
+        return await writeRedacted(options.output, state, await loadAggregate(options.output));
+      }
       if (result.status === "paused" && result.resumable === true) {
         active.status = "paused";
         state.status = "paused";
@@ -741,6 +976,15 @@ export async function runMiningBatch(input: MiningBatchOptions): Promise<Record<
       if (result.status !== "complete" || result.scanErrors !== 0) {
         state.status = "blocked-safety";
         state.blocker = "a mining batch did not finish exactly and error-free; it will not be auto-advanced";
+        await writeState(options.output, state);
+        return await writeRedacted(options.output, state, await loadAggregate(options.output));
+      }
+      let completedChild: Awaited<ReturnType<typeof verifiedCompletedChild>>;
+      try {
+        completedChild = await verifiedCompletedChild(options.output, state, active, options, result, options.signal);
+      } catch {
+        state.status = "blocked-safety";
+        state.blocker = "a completed child scan failed exact checkpoint, counter, or artifact verification; inspect it before advancement";
         await writeState(options.output, state);
         return await writeRedacted(options.output, state, await loadAggregate(options.output));
       }
@@ -755,7 +999,7 @@ export async function runMiningBatch(input: MiningBatchOptions): Promise<Record<
       }
       let aggregate: AggregateState;
       try {
-        aggregate = await updateAggregate(options.output, active);
+        aggregate = await updateAggregate(options.output, active, completedChild.inventory);
       } catch (error) {
         state.status = "blocked-safety";
         state.blocker = "the global mining aggregate could not be committed within its bounded integrity limits; split the workflow group";
@@ -767,10 +1011,10 @@ export async function runMiningBatch(input: MiningBatchOptions): Promise<Record<
         index: active.index,
         firstUnit: active.firstUnit,
         nextUnit: active.nextUnit,
-        filesScanned: Number(result.filesScanned),
-        bytesScanned: Number(result.bytesScanned),
-        uniqueFindings: Number(result.uniqueFindings),
-        occurrences: Number(result.occurrences),
+        filesScanned: completedChild.filesScanned,
+        bytesScanned: completedChild.bytesScanned,
+        uniqueFindings: completedChild.uniqueFindings,
+        occurrences: completedChild.occurrences,
       });
       const completedBatch = state.completed.at(-1);
       if (completedBatch === undefined) throw new Error("mining batch lost its completed-child accounting");
@@ -784,12 +1028,26 @@ export async function runMiningBatch(input: MiningBatchOptions): Promise<Record<
       await writeState(options.output, state);
       await writeRedacted(options.output, state, aggregate);
     }
-    state.status = "complete";
+    if (options.signal?.aborted === true) {
+      state.status = "paused";
+      await writeState(options.output, state);
+      return await writeRedacted(options.output, state, await loadAggregate(options.output));
+    }
     state.active = null;
     state.blocker = null;
+    let aggregate: AggregateState;
+    try {
+      aggregate = await verifyCompletedAggregate(options.output, state, options, options.signal);
+    } catch (error) {
+      if (!signalAborted(options.signal)) throw error;
+      state.status = "paused";
+      await writeState(options.output, state);
+      return await writeRedacted(options.output, state, await loadAggregate(options.output));
+    }
+    state.status = "complete";
     await writeState(options.output, state);
     options.progress?.({ phase: "finalizing", batch: state.completed.length, ...totalProgress(state) });
-    return await writeRedacted(options.output, state, await loadAggregate(options.output));
+    return await writeRedacted(options.output, state, aggregate);
   } catch (error) {
     operationError = error;
     throw error;

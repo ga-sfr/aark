@@ -164,6 +164,62 @@ function summary(result: Record<string, unknown>, fields: readonly string[]): Re
   return selected;
 }
 
+function cleanupApprovalSummary(
+  result: Record<string, unknown>,
+  kind: "cleanup-plan" | "segmented-cleanup-plan",
+): Record<string, string | number | boolean | null> {
+  const deletion = result.deletion;
+  if (result.status !== "ready" || result.destructive !== true || result.approvalRequired !== true
+    || result.pathsRedacted !== true || result.valuesPrinted !== false
+    || typeof result.approvalToken !== "string" || !/^[a-f0-9]{64}$/u.test(result.approvalToken)
+    || !Number.isSafeInteger(result.miningScansVerified) || Number(result.miningScansVerified) < 1
+    || typeof deletion !== "object" || deletion === null || Array.isArray(deletion)) {
+    throw new Error("cleanup planning did not produce a complete redacted approval contract");
+  }
+  const values = deletion as Record<string, unknown>;
+  const byteFields = [
+    "filesystemEntries", "regularFiles", "logicalBytes", "allocatedBytes",
+    "expectedFreeSpaceGainMinimumBytes", "expectedFreeSpaceGainMaximumBytes", "allocationUnitBytes",
+  ];
+  if (!byteFields.every((field) => typeof values[field] === "string"
+    && Buffer.byteLength(values[field] as string) <= 128
+    && /^\d+$/u.test(values[field] as string))
+    || BigInt(values.allocationUnitBytes as string) < 1n
+    || BigInt(values.expectedFreeSpaceGainMinimumBytes as string) > BigInt(values.expectedFreeSpaceGainMaximumBytes as string)
+    || BigInt(values.expectedFreeSpaceGainMaximumBytes as string) > BigInt(values.allocatedBytes as string)
+    || kind === "cleanup-plan" && (!Number.isSafeInteger(values.directories) || Number(values.directories) < 1)
+    || kind === "segmented-cleanup-plan" && (!Number.isSafeInteger(result.selectedClosedSegments) || Number(result.selectedClosedSegments) < 1)
+    || kind === "segmented-cleanup-plan" && !["retain", "delete"].includes(String(result.scanErrorSourceDisposition))) {
+    throw new Error("cleanup planning produced inconsistent aggregate deletion accounting");
+  }
+  const selected = summary(result, [
+    "status", "destructive", "approvalRequired", "approvalToken", "miningScansVerified", "scannedFilesVerified",
+    "findingsRetained", "sourceFilesRetained", "selectedClosedSegments", "activeSegmentsPreserved",
+    "findingSourceFilesRetained", "scanErrorSourceFiles", "scanErrorSourceDisposition",
+  ]);
+  const fields: Array<[string, string]> = [
+    ["directories", "deletionDirectories"],
+    ["filesystemEntries", "deletionFilesystemEntries"],
+    ["regularFiles", "deletionRegularFiles"],
+    ["logicalBytes", "deletionLogicalBytes"],
+    ["allocatedBytes", "deletionPlannedMaximumReclaimableAllocatedBytes"],
+    ["expectedFreeSpaceGainMinimumBytes", "expectedFreeSpaceGainMinimumBytes"],
+    ["expectedFreeSpaceGainMaximumBytes", "expectedFreeSpaceGainMaximumBytes"],
+    ["allocationUnitBytes", "allocationUnitBytes"],
+    ["recoveredCopyIncluded", "recoveredCopyIncluded"],
+    ["evidenceCopyIncluded", "evidenceCopyIncluded"],
+    ["evidenceCopyPresent", "evidenceCopyPresent"],
+    ["intermediateLogsAndRunsIncluded", "intermediateLogsAndRunsIncluded"],
+  ];
+  for (const [source, destination] of fields) {
+    const value = values[source];
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean" || value === null) {
+      selected[destination] = value;
+    }
+  }
+  return selected;
+}
+
 function genericBlocker(error: unknown): string {
   let current: unknown = error;
   for (let depth = 0; depth < 8 && current !== undefined; depth += 1) {
@@ -294,7 +350,7 @@ async function stageResult(
   }
   if (stage.kind === "mining-batch") {
     const result = await dependencies.runMiningBatch(stage, options.signal, onProgress);
-    const selected = summary(result, ["status", "complete", "batchesCompleted", "rootsCompleted", "rootsTotal", "filesScanned", "bytesScanned", "globallyDeduplicatedFindings", "occurrences"]);
+    const selected = summary(result, ["status", "complete", "batchesCompleted", "rootsPartitioned", "rootsCompleted", "rootsTotal", "filesScanned", "bytesScanned", "globallyDeduplicatedFindings", "occurrences"]);
     if (result.status === "paused") return { outcome: "blocked-safety", summary: selected, blocker: "mining paused at a clean checkpoint; restore its capacity reserve or clear the signal and resume this workflow" };
     if (result.status === "blocked-safety") return { outcome: "blocked-safety", summary: selected, blocker: "mining batch verification or integrity checks require local remediation" };
     if (result.status !== "complete") throw new Error("mining batch did not reach exact completion");
@@ -318,7 +374,7 @@ async function stageResult(
     : await dependencies.planSegmentedCleanup(stage, options.signal);
   return {
     outcome: "blocked-user",
-    summary: summary(result, ["status", "approvalToken", "miningScansVerified", "scannedFilesVerified", "findingsRetained", "sourceFilesRetained", "selectedClosedSegments", "activeSegmentsPreserved", "findingSourceFilesRetained", "scanErrorSourceFiles"]),
+    summary: cleanupApprovalSummary(result, stage.kind),
     blocker: "cleanup plan is ready; deletion requires the end user to review its aggregate and explicitly approve the separate cleanup run command",
   };
 }
@@ -402,18 +458,35 @@ export async function runWorkflowUntilBlocked(
     await writer.write(state);
     await workflowStatus(config.directory, true);
     let heartbeatError: unknown;
+    const heartbeatAbort = new AbortController();
+    const stageSignal = options.signal === undefined
+      ? heartbeatAbort.signal
+      : AbortSignal.any([options.signal, heartbeatAbort.signal]);
+    const stageOptions: WorkflowRunOptions = { ...options, signal: stageSignal };
     const timer = setInterval(() => {
       state.heartbeatAt = new Date().toISOString();
-      void writer.write(state).catch((error: unknown) => { heartbeatError ??= error; });
+      void writer.write(state).catch((error: unknown) => {
+        heartbeatError ??= error;
+        heartbeatAbort.abort();
+      });
     }, 5_000);
     timer.unref();
     try {
       while (state.currentStage < config.stages.length) {
-        if (heartbeatError !== undefined) throw new Error("workflow heartbeat persistence failed", { cause: heartbeatError });
-        if (options.signal?.aborted === true) throw new Error("workflow was interrupted before its next stage");
         const stage = config.stages[state.currentStage];
         const checkpoint = state.stages[state.currentStage];
         if (stage === undefined || checkpoint === undefined) throw new Error("workflow stage checkpoint is missing");
+        if (heartbeatError !== undefined || options.signal?.aborted === true) {
+          finishActiveInterval(checkpoint);
+          checkpoint.status = "blocked";
+          checkpoint.summary = null;
+          state.status = "blocked-safety";
+          state.blocker = heartbeatError !== undefined
+            ? "workflow heartbeat persistence failed; restore reliable control-state storage before resuming"
+            : "workflow was interrupted at a clean stage boundary; clear the signal before resuming";
+          state.continuation = safetyBlockedContinuation(state.blocker, "workflow-resume");
+          break;
+        }
         beginCheckpoint(checkpoint);
         state.progress = null;
         state.capacity = null;
@@ -426,7 +499,8 @@ export async function runWorkflowUntilBlocked(
           state.safety = preflight.safety;
           if (preflight.capacity?.reserveSatisfied === false) throw new Error("free-space reserve is not currently satisfied");
           await writer.write(state);
-          const outcome = await stageResult(stage, options, dependencies, (progress) => { state.progress = progress; });
+          const outcome = await stageResult(stage, stageOptions, dependencies, (progress) => { state.progress = progress; });
+          if (heartbeatError !== undefined) throw new Error("workflow heartbeat persistence failed", { cause: heartbeatError });
           checkpoint.summary = outcome.summary;
           if (outcome.outcome === "complete") {
             completeCheckpoint(checkpoint, outcome.summary);
@@ -461,7 +535,9 @@ export async function runWorkflowUntilBlocked(
           finishActiveInterval(checkpoint);
           checkpoint.status = "blocked";
           state.status = "blocked-safety";
-          state.blocker = genericBlocker(error);
+          state.blocker = heartbeatError !== undefined
+            ? "workflow heartbeat persistence failed; restore reliable control-state storage before resuming"
+            : genericBlocker(error);
           state.continuation = safetyBlockedContinuation(state.blocker, "workflow-resume");
           break;
         }
@@ -473,7 +549,14 @@ export async function runWorkflowUntilBlocked(
       }
     } finally {
       clearInterval(timer);
-      await writer.settled();
+      try {
+        await writer.settled();
+      } catch (error) {
+        // Preserve the heartbeat failure as a safety blocker, then let the
+        // final write below make one fresh attempt through the writer's
+        // failure-isolated queue. A persistent storage failure still rejects.
+        heartbeatError ??= error;
+      }
     }
     state.process = null;
     state.heartbeatAt = new Date().toISOString();

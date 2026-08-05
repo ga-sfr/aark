@@ -9,11 +9,15 @@ import type { WorkflowState } from "./types.js";
 const MAX_WORKFLOW_STATE_BYTES = 64 * 1024 * 1024;
 const STALE_HEARTBEAT_MS = 20_000;
 const SUMMARY_FIELDS = new Set([
-  "status", "complete", "finishedAt", "batchesCompleted", "rootsCompleted", "rootsTotal", "filesScanned", "bytesScanned",
+  "status", "complete", "finishedAt", "batchesCompleted", "rootsPartitioned", "rootsCompleted", "rootsTotal", "filesScanned", "bytesScanned",
   "globallyDeduplicatedFindings", "occurrences", "miningScansVerified", "sourceFilesRetained", "contentObjects", "copiedLogicalBytes",
   "allSourcesReadOnly", "approvalToken", "scannedFilesVerified", "findingsRetained", "sourceFilesRetained", "selectedClosedSegments",
   "activeSegmentsPreserved", "findingSourceFilesRetained", "scanErrorSourceFiles", "filesCompleted", "filesTotal", "bytesCopied",
   "objectsCreated", "objectsReused",
+  "destructive", "approvalRequired", "scanErrorSourceDisposition", "deletionDirectories", "deletionFilesystemEntries",
+  "deletionRegularFiles", "deletionLogicalBytes", "deletionPlannedMaximumReclaimableAllocatedBytes",
+  "expectedFreeSpaceGainMinimumBytes", "expectedFreeSpaceGainMaximumBytes", "allocationUnitBytes", "recoveredCopyIncluded",
+  "evidenceCopyIncluded", "evidenceCopyPresent", "intermediateLogsAndRunsIncluded",
 ]);
 
 function record(value: unknown): Record<string, unknown> {
@@ -52,7 +56,8 @@ function safeCapacity(value: unknown): WorkflowState["capacity"] {
   if (value === null) return null;
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("workflow capacity state is invalid");
   const item = value as Record<string, unknown>;
-  if (![item.availableBytes, item.totalBytes, item.reservedBytes].every((entry) => typeof entry === "string" && /^\d+$/u.test(entry))
+  if (![item.availableBytes, item.totalBytes, item.reservedBytes].every((entry) => typeof entry === "string"
+    && Buffer.byteLength(entry) <= 128 && /^\d+$/u.test(entry))
     || typeof item.reserveSatisfied !== "boolean") throw new Error("workflow capacity state is invalid");
   return {
     availableBytes: String(item.availableBytes),
@@ -86,6 +91,8 @@ function safeProgress(value: unknown): WorkflowState["progress"] {
   if (!["partitioning", "scanning", "finalizing"].includes(String(item.phase))) throw new Error("workflow progress phase is invalid");
   const names = ["batch", "batchesCompleted", "rootsCompleted", "rootsTotal", "filesTotal", "filesScanned", "bytesScanned", "uniqueFindings", "occurrences", "scanErrors"] as const;
   if (!names.every((name) => Number.isSafeInteger(item[name]) && Number(item[name]) >= 0)) throw new Error("workflow progress counters are invalid");
+  if (Number(item.rootsCompleted) > Number(item.rootsTotal) || Number(item.filesScanned) > Number(item.filesTotal)
+    || Number(item.batchesCompleted) > Number(item.batch)) throw new Error("workflow progress counters are inconsistent");
   return {
     phase: item.phase as "partitioning" | "scanning" | "finalizing",
     batch: Number(item.batch),
@@ -158,13 +165,21 @@ export async function workflowStatus(directory: string, persist = false): Promis
   if (state.status === "terminal" && (state.currentStage !== state.stages.length || state.stages.some((stage) => stage.status !== "complete"))) {
     throw new Error("terminal workflow state has incomplete stages");
   }
+  if ((state.status === "blocked-user" || state.status === "blocked-safety")
+    && state.stages[state.currentStage]?.status !== "blocked") {
+    throw new Error("blocked workflow state lacks a blocked current stage");
+  }
+  if (state.status !== "running" && state.process !== null) {
+    throw new Error("only a running workflow may retain a controller identity");
+  }
   const capacity = safeCapacity(state.capacity);
   const safety = safeSafety(state.safety);
   const progress = safeProgress(state.progress);
   let processProbe: ProcessProbe | null = null;
   if (state.process !== null) processProbe = await probeProcess(state.process);
-  const heartbeatAgeMs = Math.max(0, Date.now() - Date.parse(state.heartbeatAt));
-  const heartbeatFresh = Number.isFinite(heartbeatAgeMs) && heartbeatAgeMs <= STALE_HEARTBEAT_MS;
+  const rawHeartbeatAgeMs = Date.now() - Date.parse(state.heartbeatAt);
+  const heartbeatAgeMs = Math.max(0, rawHeartbeatAgeMs);
+  const heartbeatFresh = Number.isFinite(rawHeartbeatAgeMs) && rawHeartbeatAgeMs >= -5_000 && rawHeartbeatAgeMs <= STALE_HEARTBEAT_MS;
   const activeVerified = state.status === "running"
     && heartbeatFresh
     && processProbe !== null

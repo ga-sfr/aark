@@ -212,6 +212,7 @@ interface InternalCleanupPlan {
   targets: TargetSnapshot[];
   introducedLocks: Set<string>;
   batchRoots: string[];
+  retentionMetadataReserveBytes: bigint;
 }
 
 function interrupted(signal: AbortSignal | undefined): void {
@@ -1096,12 +1097,16 @@ function approvalToken(
   mining: VerifiedMiningOutput[],
   targets: TargetSnapshot[],
   includeEvidence: boolean,
+  allocationUnitBytes: bigint,
+  retentionMetadataReserveBytes: bigint,
 ): string {
   const material = {
     version: 1,
     case: { ...caseRoot, recovery },
     retainedSourceBase: retainedSourceBase ?? null,
     includeEvidence,
+    allocationUnitBytes: allocationUnitBytes.toString(),
+    retentionMetadataReserveBytes: retentionMetadataReserveBytes.toString(),
     mining: mining.map((item) => ({
       root: item.root,
       runId: item.state.runId,
@@ -1194,11 +1199,11 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
   } else {
     for (const lock of heldLocks) await lock.assertHeld();
   }
-  const introducedLocks = new Set<string>([
-    ...RECOVERY_LOCK_FILENAMES.map((filename) => safeJoin(caseRoot.path, filename)),
-    ...miningRoots.flatMap((root) => MINING_LOCK_FILENAMES.map((filename) => safeJoin(root.path, filename))),
-  ]);
-  if (heldLocks === undefined) introducedLocks.clear();
+  // Exclude only lock inodes this cleanup invocation actually owns. Batch
+  // cleanup intentionally holds the parent controller lock rather than tens
+  // of thousands of child locks; an unexpected child mining lock must remain
+  // visible to exact live-manifest verification.
+  const introducedLocks = new Set<string>(heldLocks?.map((lock) => lock.path) ?? []);
 
   const recoveryCase = await verifyRecoveryCase(caseRoot.path, normalized.signal);
   const mining: VerifiedMiningOutput[] = [];
@@ -1296,6 +1301,7 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
     }
   }
   const allocationUnitBytes = (await statfs(caseRoot.path, { bigint: true })).bsize;
+  if (allocationUnitBytes < 1n) throw new Error("cleanup filesystem reported an invalid allocation unit");
   const retainedDirectories = new Set<string>();
   for (const target of targets) {
     if (target.retainedSourceFiles.length > 0) retainedDirectories.add(target.name);
@@ -1309,7 +1315,17 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
       }
     }
   }
-  const retentionMetadataReserve = BigInt(retainedSources.length + retainedDirectories.size + 16) * allocationUnitBytes;
+  const roundedAllocation = (bytes: number): bigint => (BigInt(bytes) + allocationUnitBytes - 1n) / allocationUnitBytes * allocationUnitBytes;
+  const sensitiveReportEstimate = Buffer.byteLength(JSON.stringify({
+    caseDirectory: caseRoot.path,
+    miningOutputs: miningRoots.map((root) => root.path),
+    selectedDirectories: targets.map((target) => target.path),
+    retainedDirectory: retainedSourceRunRoot(caseRoot.path, "0".repeat(64)),
+  })) + 64 * 1024;
+  const reportAllocationReserve = roundedAllocation(sensitiveReportEstimate)
+    + 2n * roundedAllocation(64 * 1024);
+  const retentionMetadataReserve = BigInt(retainedSources.length + retainedDirectories.size + 4) * allocationUnitBytes
+    + reportAllocationReserve;
   const minimumReclaimableAllocatedBytes = minimumBeforeMetadata > retentionMetadataReserve
     ? minimumBeforeMetadata - retentionMetadataReserve
     : 0n;
@@ -1328,7 +1344,16 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
       || (retainedSourceBase !== undefined && await directoryTreesOverlap(root, retainedSourceBase))
     ) throw new Error("a retained mining output aliases the reserved retained source-file directory");
   }
-  const token = approvalToken(caseRoot, retainedSourceBase, recoveryCase, mining, targets, normalized.includeEvidence);
+  const token = approvalToken(
+    caseRoot,
+    retainedSourceBase,
+    recoveryCase,
+    mining,
+    targets,
+    normalized.includeEvidence,
+    allocationUnitBytes,
+    retentionMetadataReserve,
+  );
   if (retainedSourceFiles > 0n) {
     await assertRetainedSourceDestinationAvailable(caseRoot, retainedSourceBase, token);
   }
@@ -1396,6 +1421,7 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
     targets,
     introducedLocks,
     batchRoots,
+    retentionMetadataReserveBytes: retentionMetadataReserve,
   };
 }
 
@@ -1797,9 +1823,18 @@ export async function runCleanup(options: CleanupRunOptions): Promise<Record<str
   const locks = await acquireCleanupLocks(normalized.caseDirectory, normalized.miningOutputs, resolved.batchRoots);
   let operationError: unknown;
   try {
-    const plan = await buildInternalPlan(normalized, locks, resolved.batchRoots);
+    const lockedResolution = await resolveCleanupOptions(options);
+    if (!isDeepStrictEqual(lockedResolution.normalized, normalized)
+      || !isDeepStrictEqual(lockedResolution.batchRoots, resolved.batchRoots)) {
+      throw new Error("cleanup mining batch expansion changed while operation locks were acquired");
+    }
+    const plan = await buildInternalPlan(lockedResolution.normalized, locks, lockedResolution.batchRoots);
     if (plan.public.approvalToken !== options.approvalToken) {
       throw new Error("cleanup inputs changed after planning; run cleanup plan again and obtain fresh approval");
+    }
+    const cleanupFilesystem = await statfs(plan.caseRoot.path, { bigint: true });
+    if (cleanupFilesystem.bavail * cleanupFilesystem.bsize < plan.retentionMetadataReserveBytes) {
+      throw new Error("cleanup lacks free space for retained-source metadata and final reports before deletion");
     }
     const completedTargets: string[] = [];
     try {
@@ -1830,7 +1865,7 @@ export async function runCleanup(options: CleanupRunOptions): Promise<Record<str
       deletedFilesystemEntries: plan.public.deletion.filesystemEntries,
       deletedRegularFiles: plan.public.deletion.regularFiles,
       deletedLogicalBytes: plan.public.deletion.logicalBytes,
-      deletedAllocatedBytes: plan.public.deletion.allocatedBytes,
+      plannedMaximumReclaimableAllocatedBytes: plan.public.deletion.allocatedBytes,
       expectedFreeSpaceGainMinimumBytes: plan.public.deletion.expectedFreeSpaceGainMinimumBytes,
       expectedFreeSpaceGainMaximumBytes: plan.public.deletion.expectedFreeSpaceGainMaximumBytes,
       miningScansVerified: plan.public.miningScansVerified,
