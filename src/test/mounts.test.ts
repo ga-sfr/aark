@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { blockTransportIsNetwork, filesystemEnforcesUnixModes, filesystemIsNetwork, mountForPath, mountForPathFrom, mountIsNetworkBacked, mountIsReadOnly, windowsLogicalDisksToMounts, type MountRecord } from "../core/mounts.js";
+import { blockTransportIsNetwork, filesystemEnforcesUnixModes, filesystemIsNetwork, mountForPath, mountForPathFrom, mountIsNetworkBacked, mountIsReadOnly, mounts, windowsLogicalDisksToMounts, type MountRecord } from "../core/mounts.js";
 
 function mount(filesystem: string, source = "/dev/test", options = ["rw"]): MountRecord {
   return { source, target: "/mnt/test", filesystem, options };
@@ -66,4 +66,10 @@ test("Windows live volume inventory obtains an exact local volume identity witho
   assert.equal(record?.source.endsWith(":unknown"), false);
   assert.equal(record?.options.includes("windows-inaccessible"), false);
   assert.equal(await mountIsNetworkBacked(record), false);
+});
+
+test("concurrent Windows volume inventories serialize without starving their bounded children", { skip: process.platform !== "win32" }, async () => {
+  const inventories = await Promise.all(Array.from({ length: 4 }, async () => await mounts()));
+  assert.equal(inventories.length, 4);
+  for (const records of inventories) assert.ok(records.some((record) => record.options.includes("windows-local")));
 });

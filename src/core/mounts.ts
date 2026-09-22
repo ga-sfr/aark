@@ -17,6 +17,11 @@ interface WindowsLogicalDisk {
 }
 
 const WINDOWS_LOGICAL_DISK_QUERY = [
+  "$mutex = [System.Threading.Mutex]::new($false, 'Local\\AARK-Windows-Volume-Inventory-v1');",
+  "$acquired = $false;",
+  "try {",
+  "try { $acquired = $mutex.WaitOne(20000) } catch [System.Threading.AbandonedMutexException] { $acquired = $true };",
+  "if (-not $acquired) { throw 'timed out waiting for bounded Windows volume inventory serialization' };",
   "@(",
   "[System.IO.DriveInfo]::GetDrives() | ForEach-Object {",
   "$filesystem = 'unknown';",
@@ -24,6 +29,7 @@ const WINDOWS_LOGICAL_DISK_QUERY = [
   "[pscustomobject]@{ DeviceID = $_.Name.Substring(0, 2); DriveType = [int]$_.DriveType; FileSystem = $filesystem }",
   "}",
   ") | ConvertTo-Json -Compress",
+  "} finally { if ($acquired) { $mutex.ReleaseMutex() }; $mutex.Dispose() }",
 ].join(" ");
 
 function unescapeMount(value: string): string {

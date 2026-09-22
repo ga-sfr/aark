@@ -24,7 +24,7 @@
     "build:test": "npm run clean && tsc -p tsconfig.json && node -e \"require('node:fs').chmodSync('dist/cli.js',0o755)\"",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build:test && node --test dist/test/*.test.js && node --test scripts/scan-large-file-sharded.test.mjs",
+    "test": "npm run build:test && node --test --test-concurrency=1 dist/test/*.test.js && node --test scripts/scan-large-file-sharded.test.mjs",
     "benchmark:small-files": "npm run build:test && node scripts/benchmark-small-files.mjs",
     "check:python": "node scripts/check-python.mjs",
     "audit:repo": "node scripts/audit-repository.mjs",

@@ -67,6 +67,9 @@ Do not invoke `aark mine reveal` unless the case authorization explicitly requir
 - Windows volume inventory uses bounded `System.IO.DriveInfo` enumeration and
   Node's exact `st_dev` volume identity. Do not replace it with WMI/CIM: those
   providers can hang when independent scanner processes query concurrently.
+- Run Node test files serially. Hosted Windows runners can starve concurrent
+  PowerShell volume-inventory children even though each bounded query is fast
+  in isolation; detector-worker concurrency is still exercised inside tests.
 - Do not assume rename preserves file identity on Windows/exFAT. Close the
   temporary handle, rename, then reopen and verify size, SHA-256, path identity,
   and stable timestamps.
