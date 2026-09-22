@@ -1,15 +1,27 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { access, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp } from "./helpers.js";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { captureCommand, commandExists } from "../core/command.js";
+import { captureCommand, commandExists, sanitizedEnvironment, WINDOWS_POWERSHELL } from "../core/command.js";
 
 test("command discovery uses the fixed system path without an external which dependency", async () => {
   assert.equal(await commandExists("node"), process.platform !== "win32");
   assert.equal(await commandExists(process.execPath), true);
   assert.equal(await commandExists("../node"), false);
   assert.equal(await commandExists("agetnic-executable-that-does-not-exist"), false);
+});
+
+test("Windows volume queries run with the minimal system environment", { skip: process.platform !== "win32" }, async () => {
+  const result = await captureCommand(WINDOWS_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+    "@(Get-CimInstance Win32_LogicalDisk -ErrorAction Stop | Select-Object DeviceID,DriveType) | ConvertTo-Json -Compress",
+  ], { timeoutMs: 30_000, maxCaptureBytes: 64 * 1024 });
+  assert.equal(result.terminationReason, null);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdoutTruncated, false);
+  const rows: unknown = JSON.parse(result.stdout.toString("utf8").replace(/^\uFEFF/, ""));
+  assert.ok(rows !== null && typeof rows === "object");
 });
 
 test("command runner streams large stdout and stderr to exclusive private files", async () => {
@@ -83,8 +95,12 @@ test("command runner strips unrelated credential environment variables", async (
   assert.equal(environment.LC_TEST, undefined);
   assert.equal(environment.SHELL, undefined);
   assert.equal(environment.TZ, undefined);
-  assert.equal(environment.PATH, "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-  assert.equal(environment.HOME, "/nonexistent");
+  assert.equal(environment.PATH, sanitizedEnvironment().PATH);
+  assert.equal(environment.HOME, sanitizedEnvironment().HOME);
+  if (process.platform === "win32") {
+    assert.equal(environment.SystemRoot, process.env.SystemRoot);
+    assert.equal(environment.WINDIR, process.env.SystemRoot);
+  }
   assert.equal(environment.TMPDIR, temporaryDirectory);
   assert.equal(environment.TMP, temporaryDirectory);
   assert.equal(environment.TEMP, temporaryDirectory);

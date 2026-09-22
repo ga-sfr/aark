@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { captureCommand } from "./command.js";
+import { captureCommand, WINDOWS_POWERSHELL } from "./command.js";
 
 export interface MountRecord {
   source: string;
@@ -16,7 +16,6 @@ interface WindowsLogicalDisk {
   VolumeSerialNumber?: unknown;
 }
 
-const WINDOWS_POWERSHELL = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 const WINDOWS_LOGICAL_DISK_QUERY = [
   "@(",
   "Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction Stop |",

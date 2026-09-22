@@ -60,6 +60,10 @@ Do not invoke `aark mine reveal` unless the case authorization explicitly requir
 - Preserve exact 64-bit Windows file identities in mining manifests and cleanup
   snapshots/tokens. Values outside JavaScript's safe-integer range are decimal
   strings for compatibility with existing numeric Linux manifests.
+- Child commands use a minimal platform-specific environment, not inherited
+  credentials or user PATH entries. Windows needs the system root and system
+  executable directories. Test fixtures must canonicalize temporary paths,
+  because hosted Windows runners may expose TEMP through an 8.3 alias.
 - Do not assume rename preserves file identity on Windows/exFAT. Close the
   temporary handle, rename, then reopen and verify size, SHA-256, path identity,
   and stable timestamps.

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdtemp, open, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, open, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { main, planRanges } from "./scan-large-file-sharded.mjs";
@@ -21,7 +21,7 @@ test("range plans cover both sides of every split, including short final shards"
 });
 
 test("controller finds a split key, verifies restart and refuses changed artifacts or paths", { timeout: 300_000 }, async () => {
-  const root = await mkdtemp(path.join(tmpdir(), "aark-shards-test-"));
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "aark-shards-test-")));
   const source = path.join(root, "source.raw");
   const output = path.join(root, "output");
   const staging = path.join(root, "staging");

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, readdir, unlink, writeFile } from "node:fs/promises";
+import { access, readFile, readdir, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp } from "./helpers.js";
 import os from "node:os";
 import test from "node:test";
 import path from "node:path";
