@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { generateKeyPairSync } from "node:crypto";
+import { createECDH, generateKeyPairSync } from "node:crypto";
 import test from "node:test";
 import { StorageBudget, StorageQuotaError, storageCapacity, storagePolicyFromGiB } from "../core/storage.js";
-import { isBoundedJsonValue, isSafeDetectorIdentifier, MAX_CANDIDATE_BYTES_PER_DETECTOR_JOB, MAX_CANDIDATES_PER_DETECTOR_JOB } from "../mining/limits.js";
+import { isBoundedJsonValue, isSafeDetectorIdentifier, MAX_CANDIDATE_BYTES_PER_DETECTOR_JOB, MAX_CANDIDATES_PER_DETECTOR_JOB, MAX_EXPENSIVE_CRYPTO_VALIDATIONS_PER_DETECTOR_JOB, MAX_STRUCTURAL_VALIDATIONS_PER_DETECTOR_JOB } from "../mining/limits.js";
 import { appendCandidate } from "../mining/detectors/types.js";
 import { DetectorWorkerPool } from "../mining/worker-pool.js";
 import { expandAesKey } from "../mining/validators/aes.js";
+import { dpapiMagic } from "../mining/validators/dpapi.js";
 
 test("detector workers preserve candidate bytes and offsets across pool sizes", async () => {
   const { privateKey } = generateKeyPairSync("ed25519");
@@ -90,6 +91,79 @@ test("detector workers bound repetitive malformed structural markers", async () 
     const [batch] = await pool.run("cryptographic-keys", data, { sourcePath: "/malformed.raw", baseOffset: 0, wholeFile: false });
     assert.equal(batch?.candidates.length, 0);
     assert.match(batch?.error ?? "", /structural-validation limit reached/);
+  } finally {
+    await pool.close();
+  }
+});
+
+test("exact DPAPI signatures do not exhaust the shared structural-validation budget", async () => {
+  const data = Buffer.concat(Array.from(
+    { length: MAX_STRUCTURAL_VALIDATIONS_PER_DETECTOR_JOB + 1 },
+    () => dpapiMagic(),
+  ));
+  const pool = new DetectorWorkerPool(1);
+  try {
+    const [batch] = await pool.run("cryptographic-keys", data, { sourcePath: "/dpapi-signatures.raw", baseOffset: 0, wholeFile: false });
+    assert.equal(batch?.candidates.length, 0);
+    assert.equal(batch?.error, undefined);
+  } finally {
+    await pool.close();
+  }
+});
+
+test("raw CNG magic strings do not consume the expensive crypto budget", async () => {
+  const data = Buffer.concat(Array.from({ length: MAX_STRUCTURAL_VALIDATIONS_PER_DETECTOR_JOB + 1 }, () => (
+    Buffer.concat([Buffer.from("RSA2", "ascii"), Buffer.alloc(24)])
+  )));
+  const pool = new DetectorWorkerPool(1);
+  try {
+    const [batch] = await pool.run("cryptographic-keys", data, { sourcePath: "/cng-signatures.raw", baseOffset: 0, wholeFile: false });
+    assert.equal(batch?.candidates.length, 0);
+    assert.equal(batch?.error, undefined);
+  } finally {
+    await pool.close();
+  }
+});
+
+test("plausible CNG keys still enforce the original expensive crypto limit", async () => {
+  const ecdh = createECDH("prime256v1");
+  ecdh.generateKeys();
+  const header = Buffer.alloc(8);
+  header.write("ECS2", "ascii");
+  header.writeUInt32LE(32, 4);
+  const blob = Buffer.concat([header, ecdh.getPublicKey().subarray(1), ecdh.getPrivateKey()]);
+  const data = Buffer.concat(Array.from({ length: MAX_EXPENSIVE_CRYPTO_VALIDATIONS_PER_DETECTOR_JOB + 1 }, () => blob));
+  const pool = new DetectorWorkerPool(1);
+  try {
+    const [batch] = await pool.run("cryptographic-keys", data, { sourcePath: "/cng-budget.raw", baseOffset: 0, wholeFile: false });
+    assert.equal(batch?.candidates.length, MAX_EXPENSIVE_CRYPTO_VALIDATIONS_PER_DETECTOR_JOB);
+    assert.match(batch?.error ?? "", /structural-validation limit reached/);
+  } finally { await pool.close(); }
+});
+
+test("JWT prefilter preserves objects with long leading JSON whitespace", async () => {
+  const header = Buffer.from(" ".repeat(300) + JSON.stringify({ alg: "HS256" })).toString("base64url");
+  const payload = Buffer.from("\t\r\n ".repeat(100) + JSON.stringify({ sub: "synthetic" })).toString("base64url");
+  const data = Buffer.from(`${header}.${payload}.${Buffer.alloc(32, 0x73).toString("base64url")}`);
+  const pool = new DetectorWorkerPool(1);
+  try {
+    const [batch] = await pool.run("provider-credentials", data, { sourcePath: "/jwt.raw", baseOffset: 0, wholeFile: false });
+    assert.equal(batch?.error, undefined);
+    assert.equal(batch?.candidates.filter((candidate) => candidate.category === "json-web-token").length, 1);
+  } finally { await pool.close(); }
+});
+
+test("irrelevant assignment and JWT shapes do not exhaust provider validation", async () => {
+  const repeated = MAX_STRUCTURAL_VALIDATIONS_PER_DETECTOR_JOB + 1;
+  const data = Buffer.from([
+    "ordinary_name=ordinary-value-12345\n".repeat(repeated),
+    "AAAAAAAA.AAAAAAAA.AAAAAAAA\n".repeat(repeated),
+  ].join(""), "ascii");
+  const pool = new DetectorWorkerPool(1);
+  try {
+    const [batch] = await pool.run("provider-credentials", data, { sourcePath: "/provider-shapes.raw", baseOffset: 0, wholeFile: false });
+    assert.equal(batch?.candidates.length, 0);
+    assert.equal(batch?.error, undefined);
   } finally {
     await pool.close();
   }

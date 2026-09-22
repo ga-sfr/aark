@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { blockTransportIsNetwork, filesystemEnforcesUnixModes, filesystemIsNetwork, mountForPathFrom, mountIsReadOnly, type MountRecord } from "../core/mounts.js";
+import { blockTransportIsNetwork, filesystemEnforcesUnixModes, filesystemIsNetwork, mountForPathFrom, mountIsNetworkBacked, mountIsReadOnly, windowsLogicalDisksToMounts, type MountRecord } from "../core/mounts.js";
 
 function mount(filesystem: string, source = "/dev/test", options = ["rw"]): MountRecord {
   return { source, target: "/mnt/test", filesystem, options };
@@ -40,4 +40,22 @@ test("mount classification is conservative for permissions, read-only state, and
     { source: "/dev/local", target: "/mnt/test", filesystem: "ext4", options: ["rw"] },
     { source: "server:/replacement", target: "/mnt/test", filesystem: "nfs4", options: ["ro"] },
   ], "/mnt/test/file")?.filesystem, "nfs4");
+});
+
+test("Windows logical disks retain volume identity and reject mapped drives", async () => {
+  const records = windowsLogicalDisksToMounts([
+    { DeviceID: "F:", DriveType: 3, FileSystem: "exFAT", VolumeSerialNumber: "012ACA6C" },
+    { DeviceID: "Z:", DriveType: 4, FileSystem: "NTFS", VolumeSerialNumber: "DEADBEEF" },
+  ]);
+  assert.equal(records.length, 2);
+  assert.equal(records[0]?.source, "windows-volume:F::012ACA6C");
+  assert.equal(records[0]?.target, "F:\\");
+  assert.equal(records[0]?.filesystem, "exFAT");
+  assert.equal(filesystemIsNetwork(records[0]), false);
+  assert.equal(await mountIsNetworkBacked(records[0]), false);
+  assert.equal(filesystemIsNetwork(records[1]), true);
+  assert.equal(await mountIsNetworkBacked(records[1]), true);
+  if (process.platform === "win32") {
+    assert.equal(mountForPathFrom(records, "F:\\recovery\\case")?.source, "windows-volume:F::012ACA6C");
+  }
 });

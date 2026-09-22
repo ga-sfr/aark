@@ -1,11 +1,21 @@
 import { randomUUID } from "node:crypto";
-import { lstat, realpath, rename, rm } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import type { Candidate, JsonValue, Provenance } from "../core/types.js";
 import { sha256Hex } from "../core/crypto.js";
 import type { StorageBudget } from "../core/storage.js";
-import { assertNoSymlinkComponents, atomicWriteFile, ensurePrivateDirectory, safeJoin, syncDirectory } from "../core/fs-safe.js";
+import {
+  assertNoSymlinkComponents,
+  atomicWriteFile,
+  ensurePrivateDirectory,
+  safeJoin,
+  stableHandleStat,
+  stableLstat,
+  syncDirectory,
+} from "../core/fs-safe.js";
+import type { FilesystemIdentity } from "../core/fs-safe.js";
 import {
   MAX_RECORDED_ERROR_FIELD_BYTES,
   MAX_DERIVED_ARTIFACT_BYTES_PER_CANDIDATE,
@@ -157,21 +167,35 @@ export class ArtifactStore {
         await assertNoSymlinkComponents(this.output, directory);
         await assertNoSymlinkComponents(this.output, staging);
         let published = false;
-        let stagingIdentity: { device: number; inode: number } | undefined;
+        let stagingHandle: Awaited<ReturnType<typeof open>> | undefined;
+        let stagingIdentity: { device: FilesystemIdentity; inode: FilesystemIdentity } | undefined;
         try {
           const artifactBytes = BigInt(candidate.value.length + derivedArtifactBytes);
           await this.storageBudget?.beforeWrite(artifactBytes);
           await ensurePrivateDirectory(staging);
-          const stagingMetadata = await lstat(staging);
-          if (stagingMetadata.isSymbolicLink() || !stagingMetadata.isDirectory() || await realpath(staging) !== staging) {
-            throw new Error("artifact staging path must be a canonical real directory");
-          }
-          stagingIdentity = { device: stagingMetadata.dev, inode: stagingMetadata.ino };
+          stagingHandle = await open(staging, constants.O_RDONLY);
+          const refreshStagingIdentity = async (): Promise<void> => {
+            const stagingMetadata = await stableLstat(staging);
+            const openedMetadata = await stableHandleStat(stagingHandle!);
+            if (
+              stagingMetadata.raw.isSymbolicLink()
+              || !stagingMetadata.raw.isDirectory()
+              || !openedMetadata.raw.isDirectory()
+              || stagingMetadata.device !== openedMetadata.device
+              || stagingMetadata.inode !== openedMetadata.inode
+              || await realpath(staging) !== staging
+            ) {
+              throw new Error("artifact staging path must be a canonical real directory");
+            }
+            stagingIdentity = { device: stagingMetadata.device, inode: stagingMetadata.inode };
+          };
+          await refreshStagingIdentity();
           const primaryName = `value${safeExtension(candidate.extension)}`;
           const names = new Set([primaryName.toLowerCase()]);
           const primary = safeJoin(staging, primaryName);
           await this.assertOutputSafe?.();
           await atomicWriteFile(primary, candidate.value);
+          await refreshStagingIdentity();
           const primaryRelative = path.join("artifacts", directoryName, primaryName);
           artifactFiles.push(primaryRelative);
           artifactIntegrity.push({ path: primaryRelative, bytes: candidate.value.length, sha256: digest });
@@ -187,6 +211,7 @@ export class ArtifactStore {
             const destination = safeJoin(staging, filename);
             await this.assertOutputSafe?.();
             await atomicWriteFile(destination, derived.data, mode);
+            await refreshStagingIdentity();
             const relative = path.join("artifacts", directoryName, filename);
             artifactFiles.push(relative);
             artifactIntegrity.push({ path: relative, bytes: derived.data.length, sha256: sha256Hex(derived.data) });
@@ -195,12 +220,14 @@ export class ArtifactStore {
           await rename(staging, directory);
           published = true;
           const assertPublishedDirectory = async (): Promise<void> => {
-            const current = await lstat(directory);
+            const current = await stableLstat(directory);
+            const opened = await stableHandleStat(stagingHandle!);
             if (
-              current.isSymbolicLink()
-              || !current.isDirectory()
-              || current.dev !== stagingIdentity?.device
-              || current.ino !== stagingIdentity.inode
+              current.raw.isSymbolicLink()
+              || !current.raw.isDirectory()
+              || !opened.raw.isDirectory()
+              || current.device !== opened.device
+              || current.inode !== opened.inode
               || await realpath(directory) !== directory
             ) throw new Error("artifact directory changed during publication");
           };
@@ -220,14 +247,18 @@ export class ArtifactStore {
           if (!published && stagingIdentity !== undefined) {
             try {
               await this.assertOutputSafe?.();
-              const current = await lstat(staging);
+              const current = await stableLstat(staging);
+              const opened = await stableHandleStat(stagingHandle!);
               if (
-                current.isSymbolicLink()
-                || !current.isDirectory()
-                || current.dev !== stagingIdentity.device
-                || current.ino !== stagingIdentity.inode
+                current.raw.isSymbolicLink()
+                || !current.raw.isDirectory()
+                || !opened.raw.isDirectory()
+                || current.device !== opened.device
+                || current.inode !== opened.inode
                 || await realpath(staging) !== staging
               ) throw new Error("artifact staging directory changed before cleanup");
+              await stagingHandle?.close();
+              stagingHandle = undefined;
               await rm(staging, { recursive: true, force: false });
               await syncDirectory(path.dirname(staging));
             } catch (candidateCleanupError) {
@@ -239,6 +270,8 @@ export class ArtifactStore {
           }
           if (cleanupError !== undefined) throw new AggregateError([error, cleanupError], "artifact publication failed and its verified staging directory could not be removed");
           throw error;
+        } finally {
+          await stagingHandle?.close().catch(() => undefined);
         }
       }
       finding = {

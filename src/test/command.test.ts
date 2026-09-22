@@ -6,7 +6,7 @@ import test from "node:test";
 import { captureCommand, commandExists } from "../core/command.js";
 
 test("command discovery uses the fixed system path without an external which dependency", async () => {
-  assert.equal(await commandExists("node"), true);
+  assert.equal(await commandExists("node"), process.platform !== "win32");
   assert.equal(await commandExists(process.execPath), true);
   assert.equal(await commandExists("../node"), false);
   assert.equal(await commandExists("agetnic-executable-that-does-not-exist"), false);
@@ -120,7 +120,7 @@ test("command runner escalates cancellation when a child ignores SIGTERM", async
   controller.abort();
   const result = await command;
   assert.equal(childReady, true);
-  assert.equal(result.signal, "SIGKILL");
+  assert.equal(result.signal, process.platform === "win32" ? "SIGTERM" : "SIGKILL");
   assert.equal(result.terminationReason, "abort");
   assert.ok(result.durationMs < 2_000);
 });

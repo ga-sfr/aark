@@ -18,6 +18,11 @@ Every distinct regular source file referenced by any finding occurrence—includ
 
 Whole-file retention is literal: if a large archive, mail store, raw stream, or evidence image contains a finding, the complete container is retained. The plan reports retained source-file bytes separately so the end user can see that cost before approving cleanup.
 
+Protected moves verify the destination against the still-open original handle.
+This is essential on Windows/exFAT, where rename may change the file or directory
+identity. Content snapshots, fresh approval, and whole-source retention remain
+mandatory; a renamed path or matching size alone is not sufficient proof.
+
 The case `evidence/` directory—normally a ddrescue image and mapfile—is retained by default. Include it in planning only when the end user intends to discard that evidence copy and clean mining scans cover every regular file under it. Evidence deletion requires its own confirmation at execution time.
 
 Cleanup does not delete arbitrary files elsewhere in the case, the original source device/image, any supplied mining output, snapshots or backups, or data outside the canonical case directory. It is ordinary filesystem deletion, not guaranteed secure erasure.
@@ -49,6 +54,8 @@ Planning requires all of the following:
 6. Every regular file selected for deletion lies under at least one of those unchanged, completely scanned input roots.
 7. The case, mining outputs, and deletion targets are canonical local directories without symbolic-link roots, nested mounts, active operation locks, or lexical/identity overlaps between retained mining outputs and either deletion targets or the reserved retained-source namespace.
 
+An older case that was unintentionally interrupted before recovery finalization may be planned only when its owner explicitly accepts that state and `--accept-interrupted-case` is passed to both `cleanup plan` and `cleanup run`. This narrow compatibility path accepts only an inactive `running` case with no recorded failure, a valid ordered prefix of completed stages, an exact next unaccounted stage, and root controls matching their immutable per-run copies. It reports `recoveryStatus: "legacy-interrupted"`, does not create missing recovery reports, and never rewrites the recovery state as successful. All mining, live-manifest, artifact, coverage, token, confirmation, and retention checks remain identical. A paused, failed, error-bearing, malformed, or actively locked case is still rejected.
+
 The result contains no local paths or recovered values. It reports aggregate scan, finding, marker-only, artifact, retained whole-source file/byte, deletion entry/file/byte counts; whether the recovery and evidence copies are selected; what remains; and a SHA-256 approval token binding the verified state, retained recovery/mining control and report hashes, whole-source retention set, existing retained-source directory identity (or its absence), and exact deletion choice. A marker-only finding has no exact exported artifact, but its complete containing source file is retained. Review marker-only files before cleanup if surrounding directory context is still needed.
 
 An agent must present this result to the end user and ask whether to proceed. A prior request to recover and scan data is not deletion approval. If approved, execute with the same set of mining outputs and options:
@@ -66,6 +73,8 @@ Evidence cleanup additionally requires both `--include-evidence` and `--confirm-
 ## Execution and failures
 
 Before repeating verification, execution holds current and legacy recovery/mining locks so compatible AARK processes cannot start against the same case or result directories. Known lock files introduced by cleanup itself are excluded from live manifest comparison; no other manifest difference is tolerated. Each fixed target is atomically moved to a private, unpredictable `.aark-cleanup-pending-*` name in the same case, then AARK rechecks the case mount, absence of nested mounts, every lock inode, the moved directory inode, and a fresh bounded deterministic digest of every nested directory, regular file, symbolic link, and special entry, including identities, modes, sizes, timestamps, and link targets where applicable. Only when that quarantined tree is still the exact approved target does AARK move each approved source file into the private retained tree and recursively remove what remains.
+
+On Windows, cleanup records volume/file identities exactly; values outside JavaScript's safe-integer range are decimal strings, matching mining manifests. This prevents two distinct 64-bit file IDs from being treated as equal through numeric rounding. Same-volume quarantine and retained-source renames must preserve those exact identities on the selected filesystem.
 
 Cleanup writes `cleanup-final-report-sensitive.md`, `cleanup-final-report-redacted.md`, and `cleanup-manifest-redacted.json` at the case root with status `authorized-in-progress` before moving or removing data. On success they say `complete` and record the aggregate retained whole-source count and bytes; the sensitive report identifies the token-specific retained root. If interruption or an error happens after retention or deletion begins, AARK attempts to publish `interrupted-partial` or `failed-partial`. Recursive deletion itself may not stop immediately on a signal, and a crash or filesystem failure can leave a partly populated retained tree or a `.aark-cleanup-pending-*` tree partly or wholly present. AARK refuses another cleanup while such a quarantine exists. Inspect both trees and the mounted filesystems locally before retrying or removing any stale lock.
 

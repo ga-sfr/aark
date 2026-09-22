@@ -4,8 +4,8 @@ import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import type { Candidate } from "../core/types.js";
-import { acquireExclusiveLock, nearestExistingParent, readDirectoryNamesBounded, walkRegularFiles } from "../core/fs-safe.js";
-import type { ExclusiveLock, WalkedFile } from "../core/fs-safe.js";
+import { acquireExclusiveLock, nearestExistingParent, readDirectoryNamesBounded, stableHandleStat, stableLstat, walkRegularFiles } from "../core/fs-safe.js";
+import type { ExclusiveLock, FilesystemIdentity, StableStat, WalkedFile } from "../core/fs-safe.js";
 import { filesystemIsNetwork, mountForPathFrom, mountIsNetworkBacked, mounts } from "../core/mounts.js";
 import type { MountRecord } from "../core/mounts.js";
 import {
@@ -66,16 +66,16 @@ const PROVENANCE_VALUES = new Set([
 
 interface PathSafetySnapshot {
   path: string;
-  device: number;
-  inode: number;
+  device: FilesystemIdentity;
+  inode: FilesystemIdentity;
   kind: "file" | "directory";
   mount: string;
 }
 
 interface OutputSafetySnapshot extends PathSafetySnapshot {
   kind: "directory";
-  lockDevice: number;
-  lockInode: number;
+  lockDevice: FilesystemIdentity;
+  lockInode: FilesystemIdentity;
 }
 
 interface NormalizedMiningOptions extends MiningOptions {
@@ -234,19 +234,26 @@ function mountIdentity(record: MountRecord): string {
   });
 }
 
+function sameCanonicalPath(left: string, right: string): boolean {
+  return process.platform === "win32"
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
+}
+
 async function pathSafetySnapshot(input: string, records: MountRecord[]): Promise<PathSafetySnapshot> {
-  const metadata = await lstat(input);
+  const stable = await stableLstat(input);
+  const metadata = stable.raw;
   if (metadata.isSymbolicLink() || (!metadata.isDirectory() && !metadata.isFile())) {
     throw new Error("protected mining path must remain a regular file or real directory");
   }
-  if (await realpath(input) !== input) throw new Error("protected mining path changed from its canonical location");
+  if (!sameCanonicalPath(await realpath(input), input)) throw new Error("protected mining path changed from its canonical location");
   const mounted = mountForPathFrom(records, input);
   if (mounted === undefined) throw new Error("could not determine the mount backing a protected mining path");
   if (filesystemIsNetwork(mounted)) throw new Error("protected mining path moved to a network filesystem");
   return {
     path: input,
-    device: metadata.dev,
-    inode: metadata.ino,
+    device: stable.device,
+    inode: stable.inode,
     kind: metadata.isDirectory() ? "directory" : "file",
     mount: mountIdentity(mounted),
   };
@@ -297,9 +304,9 @@ async function outputSafetySnapshot(output: string, lockPath: string): Promise<O
     const target = path.resolve(record.target);
     return target !== output && inside(output, target);
   })) throw new Error("nested mounts inside the mining output are not allowed");
-  const lock = await lstat(lockPath);
-  if (lock.isSymbolicLink() || !lock.isFile()) throw new Error("mining output lock changed after acquisition");
-  return { ...current, kind: "directory", lockDevice: lock.dev, lockInode: lock.ino };
+  const lock = await stableLstat(lockPath);
+  if (lock.raw.isSymbolicLink() || !lock.raw.isFile()) throw new Error("mining output lock changed after acquisition");
+  return { ...current, kind: "directory", lockDevice: lock.device, lockInode: lock.inode };
 }
 
 async function assertOutputSafetyCurrent(expected: OutputSafetySnapshot, lockPath: string): Promise<void> {
@@ -311,6 +318,25 @@ async function assertOutputSafetyCurrent(expected: OutputSafetySnapshot, lockPat
     || current.lockDevice !== expected.lockDevice
     || current.lockInode !== expected.lockInode
   ) throw new Error("mining output, mount, or exclusive lock changed after preflight");
+}
+
+async function assertOutputIdentityCurrent(expected: OutputSafetySnapshot, lockPath: string): Promise<void> {
+  const [current, canonical, lock] = await Promise.all([
+    stableLstat(expected.path),
+    realpath(expected.path),
+    stableLstat(lockPath),
+  ]);
+  if (
+    current.raw.isSymbolicLink()
+    || !current.raw.isDirectory()
+    || !sameCanonicalPath(canonical, expected.path)
+    || current.device !== expected.device
+    || current.inode !== expected.inode
+    || lock.raw.isSymbolicLink()
+    || !lock.raw.isFile()
+    || lock.device !== expected.lockDevice
+    || lock.inode !== expected.lockInode
+  ) throw new Error("mining output or exclusive lock changed after preflight");
 }
 
 async function assertRuntimeOutputCurrent(runtime: Pick<ScanRuntime, "outputSafety" | "lockPath" | "locks">): Promise<void> {
@@ -369,12 +395,13 @@ async function assertFreshSafeOutput(inputs: string[], output: string): Promise<
 
   const canonicalInputs: Array<{ path: string; directory: boolean }> = [];
   for (const input of inputs) {
-    const metadata = await lstat(input);
+    const stable = await stableLstat(input);
+    const metadata = stable.raw;
     if (metadata.isSymbolicLink()) throw new Error("symbolic-link input roots are not allowed");
     if (!metadata.isDirectory() && !metadata.isFile()) throw new Error("mining input roots must be regular files or directories");
     const canonicalInput = await realpath(input);
-    const canonicalMetadata = await lstat(canonicalInput);
-    if (canonicalMetadata.dev !== metadata.dev || canonicalMetadata.ino !== metadata.ino || canonicalMetadata.isDirectory() !== metadata.isDirectory() || canonicalMetadata.isFile() !== metadata.isFile()) {
+    const canonicalMetadata = await stableLstat(canonicalInput);
+    if (canonicalMetadata.device !== stable.device || canonicalMetadata.inode !== stable.inode || canonicalMetadata.raw.isDirectory() !== metadata.isDirectory() || canonicalMetadata.raw.isFile() !== metadata.isFile()) {
       throw new Error("mining input changed while its canonical path was being established");
     }
     canonicalInputs.push({ path: canonicalInput, directory: metadata.isDirectory() });
@@ -392,7 +419,7 @@ async function assertFreshSafeOutput(inputs: string[], output: string): Promise<
 
 async function assertLockedFreshOutput(output: string): Promise<void> {
   const metadata = await lstat(output);
-  if (metadata.isSymbolicLink() || !metadata.isDirectory() || await realpath(output) !== output) {
+  if (metadata.isSymbolicLink() || !metadata.isDirectory() || !sameCanonicalPath(await realpath(output), output)) {
     throw new Error("locked mining output must remain a real canonical directory");
   }
   const entries = await readDirectoryNamesBounded(output, MINING_LOCK_FILENAMES.length + 1);
@@ -406,7 +433,7 @@ async function assertLockedFreshOutput(output: string): Promise<void> {
 
 async function assertLockedResumeOutput(output: string): Promise<void> {
   const metadata = await lstat(output);
-  if (metadata.isSymbolicLink() || !metadata.isDirectory() || await realpath(output) !== output) {
+  if (metadata.isSymbolicLink() || !metadata.isDirectory() || !sameCanonicalPath(await realpath(output), output)) {
     throw new Error("resumed mining output must remain a real canonical directory");
   }
   const allowed = new Set([
@@ -701,38 +728,47 @@ function workForWindow(data: Buffer, context: DetectionContext, deep: boolean, d
 async function assertOpenedFilePathCurrent(
   filename: string,
   handle: Awaited<ReturnType<typeof open>>,
-  opened: Awaited<ReturnType<Awaited<ReturnType<typeof open>>["stat"]>>,
+  opened: StableStat,
 ): Promise<void> {
-  let descriptorPath: string;
-  let pathMetadata: Awaited<ReturnType<typeof lstat>>;
+  let descriptorPath: string | undefined;
+  let pathMetadata: StableStat;
   let canonicalPath: string;
   try {
-    [descriptorPath, pathMetadata, canonicalPath] = await Promise.all([
-      realpath(`/proc/self/fd/${handle.fd}`),
-      lstat(filename),
-      realpath(filename),
-    ]);
+    if (process.platform === "win32") {
+      // Windows does not expose Linux's /proc/self/fd handle-to-path link.
+      // Comparing the exact 64-bit volume/file identity of the opened handle
+      // with lstat of the authorized path detects final-file replacement and
+      // intermediate junction redirection without an additional path reopen.
+      pathMetadata = await stableLstat(filename);
+      canonicalPath = await realpath(filename);
+    } else {
+      [descriptorPath, pathMetadata, canonicalPath] = await Promise.all([
+        realpath(`/proc/self/fd/${handle.fd}`),
+        stableLstat(filename),
+        realpath(filename),
+      ]);
+    }
   } catch (error) {
     throw new Error("scan input path is no longer stably addressable", { cause: error });
   }
   if (
-    descriptorPath !== filename
-    || canonicalPath !== filename
-    || pathMetadata.isSymbolicLink()
-    || !pathMetadata.isFile()
-    || pathMetadata.dev !== opened.dev
-    || pathMetadata.ino !== opened.ino
+    (descriptorPath !== undefined && !sameCanonicalPath(descriptorPath, filename))
+    || !sameCanonicalPath(canonicalPath, filename)
+    || pathMetadata.raw.isSymbolicLink()
+    || !pathMetadata.raw.isFile()
+    || pathMetadata.device !== opened.device
+    || pathMetadata.inode !== opened.inode
   ) throw new Error("scan input path changed or crossed a symbolic-link component");
 }
 
-function assertFileSnapshot(file: FrozenScanFile, metadata: Awaited<ReturnType<Awaited<ReturnType<typeof open>>["stat"]>>): void {
+function assertFileSnapshot(file: FrozenScanFile, metadata: StableStat): void {
   if (
-    !metadata.isFile()
-    || metadata.dev !== file.device
-    || metadata.ino !== file.inode
-    || metadata.size !== file.bytes
-    || metadata.mtimeMs !== file.modifiedMs
-    || metadata.ctimeMs !== file.changedMs
+    !metadata.raw.isFile()
+    || metadata.device !== file.device
+    || metadata.inode !== file.inode
+    || metadata.bytes !== file.bytes
+    || metadata.modifiedMs !== file.modifiedMs
+    || metadata.changedMs !== file.changedMs
   ) throw new Error("scan input changed from its frozen file manifest snapshot");
 }
 
@@ -761,7 +797,7 @@ async function readExact(
 }
 
 type OpenFileHandle = Awaited<ReturnType<typeof open>>;
-type OpenFileStat = Awaited<ReturnType<OpenFileHandle["stat"]>>;
+type OpenFileStat = StableStat;
 
 interface PreparedSmallFile {
   file: FrozenScanFile;
@@ -778,7 +814,7 @@ type SmallFileOutcome =
 async function assertPreparedFileCurrent(runtime: ScanRuntime, prepared: Pick<PreparedSmallFile, "file" | "handle" | "opened">): Promise<void> {
   const started = performance.now();
   try {
-    const current = await prepared.handle.stat();
+    const current = await stableHandleStat(prepared.handle);
     assertFileSnapshot(prepared.file, current);
     await assertOpenedFilePathCurrent(prepared.file.path, prepared.handle, prepared.opened);
   } finally {
@@ -790,7 +826,7 @@ async function assertPreparedFileCurrent(runtime: ScanRuntime, prepared: Pick<Pr
 async function assertPreparedFileSnapshotCurrent(runtime: ScanRuntime, prepared: Pick<PreparedSmallFile, "file" | "handle">): Promise<void> {
   const started = performance.now();
   try {
-    assertFileSnapshot(prepared.file, await prepared.handle.stat());
+    assertFileSnapshot(prepared.file, await stableHandleStat(prepared.handle));
   } finally {
     runtime.metrics.fileValidationCalls += 1;
     runtime.metrics.fileValidationMs += performance.now() - started;
@@ -801,9 +837,12 @@ async function prepareSmallFile(runtime: ScanRuntime, file: FrozenScanFile): Pro
   let handle: OpenFileHandle | undefined;
   try {
     handle = await open(file.path, constants.O_RDONLY | constants.O_NOFOLLOW);
-    const opened = await handle.stat();
+    const opened = await stableHandleStat(handle);
     const preparedIdentity = { file, handle, opened };
-    await assertPreparedFileCurrent(runtime, preparedIdentity);
+    // O_NOFOLLOW plus the exact frozen handle identity proves that the open
+    // descriptor is the inventoried file. Re-resolve the path immediately
+    // before any detector result can publish an artifact.
+    await assertPreparedFileSnapshotCurrent(runtime, preparedIdentity);
     const data = await readExact(handle, 0, file.bytes, runtime.metrics);
     // Catch mutation during the read before spending worker time. The full
     // descriptor/canonical-path check is repeated immediately before commit.
@@ -867,6 +906,8 @@ async function processSmallFileBatch(
       let completelyScanned = false;
       if ("prepared" in outcome) {
         try {
+          const streamingBatches = outcome.prepared.batches.slice(0, STREAMING_DETECTOR_NAMES.length);
+          const streamingMayPublish = streamingBatches.some((batch) => batch.error !== undefined || batch.candidates.length > 0);
           await assertPreparedFileCurrent(runtime, outcome.prepared);
           const result: DetectorWorkResult = {
             kind: "small-file",
@@ -877,7 +918,7 @@ async function processSmallFileBatch(
               wholeFile: false,
               deepKeySchedules: false,
             },
-            batches: outcome.prepared.batches.slice(0, STREAMING_DETECTOR_NAMES.length),
+            batches: streamingBatches,
           };
           const commitStarted = performance.now();
           try {
@@ -891,18 +932,18 @@ async function processSmallFileBatch(
           } finally {
             runtime.metrics.deterministicCommitMs += performance.now() - commitStarted;
           }
-          await assertPreparedFileCurrent(runtime, outcome.prepared);
+          if (streamingMayPublish) await assertPreparedFileCurrent(runtime, outcome.prepared);
           runtime.state.cursor = { fileIndex: file.index, phase: "stream", nextOffset: file.bytes };
           runtime.progress.bytesScanned += file.bytes;
           await publishProgress(runtime);
           await maybeCheckpoint();
-          await assertPreparedFileCurrent(runtime, outcome.prepared);
           runtime.state.cursor = { fileIndex: file.index, phase: "whole-file", nextOffset: 0 };
           if (interrupted(runtime.options.signal)) throw new ScanPauseError("scan paused");
           const structuredBatch = outcome.prepared.batches[STREAMING_DETECTOR_NAMES.length];
           if (structuredBatch === undefined) {
             throw new ScanControlError("small-file worker omitted its structured detector result");
           }
+          await assertPreparedFileCurrent(runtime, outcome.prepared);
           const structuredStarted = performance.now();
           try {
             completelyScanned = await commitDetectorResults({
@@ -1136,17 +1177,17 @@ async function verifyCompletedManifestFiles(output: string, state: ScanState, in
       ) throw new Error("scan resume cursor is not aligned with its frozen input file");
     }
     if (file.index > state.cursor.fileIndex || (file.index === state.cursor.fileIndex && state.cursor.nextOffset === 0 && state.cursor.phase === "stream")) continue;
-    let metadata: Awaited<ReturnType<typeof lstat>>;
+    let metadata: StableStat;
     let canonicalPath: string;
     try {
-      [metadata, canonicalPath] = await Promise.all([lstat(file.path), realpath(file.path)]);
+      [metadata, canonicalPath] = await Promise.all([stableLstat(file.path), realpath(file.path)]);
     } catch (error) {
       throw new Error("a completed or partial resume input is no longer stably addressable", { cause: error });
     }
-    if (metadata.isSymbolicLink() || !metadata.isFile() || canonicalPath !== file.path) {
+    if (metadata.raw.isSymbolicLink() || !metadata.raw.isFile() || !sameCanonicalPath(canonicalPath, file.path)) {
       throw new Error("a completed resume input is no longer a canonical regular file");
     }
-    if (metadata.dev !== file.device || metadata.ino !== file.inode || metadata.size !== file.bytes || metadata.mtimeMs !== file.modifiedMs || metadata.ctimeMs !== file.changedMs) {
+    if (metadata.device !== file.device || metadata.inode !== file.inode || metadata.bytes !== file.bytes || metadata.modifiedMs !== file.modifiedMs || metadata.changedMs !== file.changedMs) {
       throw new Error("a completed or partial resume input changed after its checkpoint");
     }
   }
@@ -1161,7 +1202,7 @@ async function processFile(runtime: ScanRuntime, file: FrozenScanFile, cursor: S
     const assertSourceCurrent = async (): Promise<void> => {
       const started = performance.now();
       try {
-        const current = await handle.stat();
+        const current = await stableHandleStat(handle);
         assertFileSnapshot(file, current);
         await assertOpenedFilePathCurrent(file.path, handle, current);
       } finally {
@@ -1632,7 +1673,8 @@ export async function scanSensitiveMaterial(input: MiningOptions): Promise<Recor
     const outputSafety = await outputSafetySnapshot(options.output, lock.path);
     const assertSafeOutput = async (): Promise<void> => {
       for (const held of locks) await held.assertHeld();
-      await assertOutputSafetyCurrent(outputSafety, lock.path);
+      if (process.platform === "win32") await assertOutputIdentityCurrent(outputSafety, lock.path);
+      else await assertOutputSafetyCurrent(outputSafety, lock.path);
     };
     // A fresh output contains only the operation locks at this point. Do not
     // let an already-aborted signal prevent creation of the clean, resumable
@@ -1801,7 +1843,8 @@ export async function resumeSensitiveMaterial(input: MiningResumeOptions): Promi
     const outputSafety = await outputSafetySnapshot(output, lock.path);
     const assertSafeOutput = async (): Promise<void> => {
       for (const held of locks) await held.assertHeld();
-      await assertOutputSafetyCurrent(outputSafety, lock.path);
+      if (process.platform === "win32") await assertOutputIdentityCurrent(outputSafety, lock.path);
+      else await assertOutputSafetyCurrent(outputSafety, lock.path);
     };
     const budget = new StorageBudget(output, policy, await directoryLogicalBytes(output, options.signal));
     const inventory: SensitiveScanInventory = await loadResumeInventory(output, state.inventory, options.signal);

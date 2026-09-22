@@ -2,6 +2,16 @@
 
 The mining layer is an offline scanner for local recovery outputs. It accepts regular files and directory trees, refuses known network-mounted inputs and outputs, does not follow symbolic links, and does not open network connections. It is designed for carved files, deleted-metadata exports, raw filesystem-unallocated streams, shadow-copy exports, and residual-memory files. An authorized agent may run and resume it without human interaction; the safe automation contract is in [AGENTS.md](../AGENTS.md).
 
+Mining supports Ubuntu-compatible Linux and native Windows 10/11. Windows
+inputs and outputs must be on local drive-letter volumes; UNC paths, mapped
+network drives, and unknown drive types are rejected. AARK binds each protected
+path to the drive type, filesystem, and volume serial returned by the fixed
+system PowerShell executable. It stores exact 64-bit Windows file identities as
+decimal strings when they cannot be represented safely as JavaScript numbers.
+The Windows open-handle check compares that exact identity with the authorized
+path before publishing findings and after processing. Linux retains the
+stronger `/proc/self/fd` handle-to-canonical-path check.
+
 ## Output contract
 
 A scan writes these related local outputs:
@@ -36,6 +46,10 @@ aark mine scan /case/recovery/unallocated/free-space.raw \
 ```
 
 Whole-file validation is capped at 256 MiB and streaming chunks at 128 MiB to keep accidental memory use bounded. Raising the whole-file limit is useful for unusually large browser databases or password vaults; it does not affect streaming detection of embedded keys and tokens.
+
+Before each sensitive artifact write, AARK verifies the exact output-directory and exclusive-lock identities through their live filesystem identities. It also re-enumerates and validates input/output mount topology periodically and before checkpoints. This keeps path substitution checks on the write path without making every finding invoke an expensive operating-system mount inventory.
+
+Very large raw files can contain enough distinct validated material to reach the intentionally bounded per-run finding or occurrence limits. `scripts/scan-large-file-sharded.mjs` copies one bounded byte range at a time to a separate staging filesystem, scans that range with the normal mining command, records a sensitive source-identity/range/hash map, and removes only the temporary range after its scan completes without errors. Its redacted coverage report proves aggregate byte coverage without exposing the source path or hashes. Keep the sensitive controller state with every shard output; it is required to map shard-relative offsets back to the original file and to justify later cleanup of that original.
 
 Pure detector families run in a bounded `worker_threads` pool. `--workers` accepts `1` through `4`; the default is the number of available CPUs minus one, bounded to that range. The four streaming families are fused into one request per source buffer, so the buffer is copied to a worker once while each detector keeps its own candidate, byte, and structural-validation limits. A complete small file also runs structured validation in that request.
 
@@ -79,6 +93,38 @@ aark mine scan /case/recovery/residual-memory \
 ```
 
 ## Post-scan cleanup
+
+### Large raw files and shard boundaries
+
+After `npm run build`, a local-only staging controller can split large regular
+files into bounded scans without increasing the finding/occurrence limits:
+
+```bash
+node scripts/scan-large-file-sharded.mjs --source /case/source.img \
+  --output-root /work/image-scans --staging-root /work/image-staging \
+  --provenance allocated-reference --shard-mib 4096 --workers 4
+```
+
+Use canonical local paths; source, output, and staging must be separate and
+non-nested. The same command works with quoted drive-letter paths in PowerShell.
+The source is opened read-only. Temporary copies have SHA-256 checks, explicit
+free-space reserves, and exclusive controller/staging locks. Each clean range
+must have a matching finalized inventory, input manifest, and artifact hashes.
+Only verified temporary copies are removed; failed attempts and originals remain.
+
+Independent shards need their own boundary coverage: the controller additionally
+scans 17 MiB **on both sides** of every split. Version-2 coverage is complete only
+after these windows succeed. Repeating the original command upgrades version-1
+byte-only coverage without rereading all completed shards; findings from overlap
+windows may duplicate shard findings. The sensitive controller maps each staged
+offset back to the original as `range.start + occurrence.offset`.
+
+Keep the whole original, controller state, and all scan outputs together. This
+helper does not reconstruct filesystem files from an image, supply whole-image
+structured validation, or authorize deletion through `aark cleanup`. A hard-kill
+lock or incomplete staging copy needs local review, not automatic lock removal.
+
+### Approval and retention
 
 Only an error-free result whose exact status is `complete` can authorize AARK cleanup. `complete-with-errors`, paused, interrupted, failed, edited, or changed-input scans are never accepted. Multiple complete mining outputs may collectively cover recovery directories scanned under different provenance labels. Cleanup retains each full mining output—especially exact artifacts, the sensitive inventory, and frozen integrity metadata—and moves every complete source file referenced by a finding into a dedicated retained tree before removing bulk recovered data after a fresh end-user decision. See [Cleanup workflow](cleanup.md).
 

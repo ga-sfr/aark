@@ -59,7 +59,13 @@ export function detectCryptographicKeys(data: Buffer, context: DetectionContext)
   }
 
   for (const offset of allIndexes(data, dpapiMagic())) {
-    if (!takeStructuralValidation(context)) return output;
+    // The exact 20-byte signature bounds the number of possible offsets by
+    // the already bounded worker window, and parseDpapiBlob performs only a
+    // fixed sequence of length-bounded field checks. Do not consume the
+    // shared structural-validation budget here: raw Windows recovery streams
+    // can legitimately contain more than 100,000 repeated DPAPI signatures
+    // in one window, while the armored and expensive-crypto validators below
+    // still need the defensive shared limits.
     const value = parseDpapiBlob(data, offset);
     if (value === null) continue;
     if (!appendCandidate(output, {
@@ -75,13 +81,17 @@ export function detectCryptographicKeys(data: Buffer, context: DetectionContext)
 
   for (const magic of CNG_MAGICS) {
     for (const offset of allIndexes(data, magic)) {
-      if (!takeStructuralValidation(context)) return output;
-      if (expensiveValidations >= MAX_EXPENSIVE_CRYPTO_VALIDATIONS_PER_DETECTOR_JOB) {
-        markValidationLimit(context);
-        return output;
-      }
-      expensiveValidations += 1;
-      const parsed = parseCngPrivateBlob(data, offset);
+      // Reject cheap malformed headers without spending the crypto budget;
+      // retain the original 64-operation cap for actual prime/curve work.
+      const parsed = parseCngPrivateBlob(data, offset, () => {
+        if (expensiveValidations >= MAX_EXPENSIVE_CRYPTO_VALIDATIONS_PER_DETECTOR_JOB) {
+          markValidationLimit(context);
+          return false;
+        }
+        expensiveValidations += 1;
+        return takeStructuralValidation(context);
+      });
+      if (context.runtimeState?.validationLimitReached === true) return output;
       if (parsed === null) continue;
       const valueOffset = parsed.category === "cng-symmetric-key" ? offset + 12 : offset;
       if (!appendCandidate(output, {

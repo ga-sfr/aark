@@ -55,7 +55,7 @@ function modInverse(value: bigint, modulus: bigint): bigint {
   return (oldS % modulus + modulus) % modulus;
 }
 
-function rsa(data: Buffer, offset: number): CngValidation | null {
+function rsa(data: Buffer, offset: number, beforeCrypto: () => boolean): CngValidation | null {
   if (offset + 24 > data.length) return null;
   const magic = data.toString("ascii", offset, offset + 4);
   if (magic !== "RSA2" && magic !== "RSA3") return null;
@@ -74,6 +74,8 @@ function rsa(data: Buffer, offset: number): CngValidation | null {
     || modulusBytes !== Math.ceil(bitLength / 8)
     || pBytes < Math.floor(modulusBytes / 2) - 1
     || qBytes < Math.floor(modulusBytes / 2) - 1
+    || pBytes > modulusBytes
+    || qBytes > modulusBytes
     || total > data.length - offset
   ) return null;
   let cursor = offset + 24;
@@ -94,6 +96,7 @@ function rsa(data: Buffer, offset: number): CngValidation | null {
     || e % 2n === 0n
   ) return null;
   try {
+    if (!beforeCrypto()) return null;
     if (!checkPrimeSync(prime1Bytes, { checks: 32 }) || !checkPrimeSync(prime2Bytes, { checks: 32 })) return null;
     const lambda = lcm(p - 1n, q - 1n);
     const d = modInverse(e, lambda);
@@ -142,7 +145,7 @@ function rsa(data: Buffer, offset: number): CngValidation | null {
   }
 }
 
-function ecc(data: Buffer, offset: number): CngValidation | null {
+function ecc(data: Buffer, offset: number, beforeCrypto: () => boolean): CngValidation | null {
   if (offset + 8 > data.length) return null;
   const magic = data.toString("ascii", offset, offset + 4);
   const parameters = ECC.get(magic);
@@ -154,6 +157,7 @@ function ecc(data: Buffer, offset: number): CngValidation | null {
   const y = data.subarray(offset + 8 + keyBytes, offset + 8 + 2 * keyBytes);
   const d = data.subarray(offset + 8 + 2 * keyBytes, offset + total);
   try {
+    if (!beforeCrypto()) return null;
     const ecdh = createECDH(parameters.curve);
     ecdh.setPrivateKey(d);
     const publicPoint = ecdh.getPublicKey(undefined, "uncompressed");
@@ -194,8 +198,8 @@ function symmetric(data: Buffer, offset: number): CngValidation | null {
   };
 }
 
-export function parseCngPrivateBlob(data: Buffer, offset = 0): CngValidation | null {
-  return rsa(data, offset) ?? ecc(data, offset) ?? symmetric(data, offset);
+export function parseCngPrivateBlob(data: Buffer, offset = 0, beforeCrypto: () => boolean = () => true): CngValidation | null {
+  return rsa(data, offset, beforeCrypto) ?? ecc(data, offset, beforeCrypto) ?? symmetric(data, offset);
 }
 
 export const CNG_MAGICS = ["RSA2", "RSA3", ...ECC.keys(), "KDBM"].map((value) => Buffer.from(value, "ascii"));

@@ -21,10 +21,20 @@ No telemetry, LLM/API integration, cloud validation, or network lookup is perfor
 
 ## Requirements
 
-- Ubuntu or a compatible Linux distribution
 - Node.js 22.12 or newer
-- Root access for raw block-device work
+- Ubuntu or a compatible Linux distribution for recovery and raw block-device work
+- Windows 10/11 with Windows PowerShell 5.1 or newer for mining local drive-letter volumes
+- Root access for raw block-device work on Linux
 - A separate destination disk with enough free space
+
+The recovery layer remains Linux-only because it orchestrates Linux forensic
+engines and kernel block-device safeguards. The mining layer also supports
+native Windows local volumes. On Windows, AARK inventories drive type,
+filesystem, and volume serial through a fixed system PowerShell executable,
+rejects UNC and mapped network volumes, and records exact 64-bit file identities
+in its frozen manifests. Windows publication closes temporary files before a
+rename and then reopens, hashes, and identity-checks the published path because
+exFAT can assign a new file identity during rename.
 
 Install the optional forensic engines you need:
 
@@ -94,6 +104,8 @@ After every intended recovery folder has an error-free `complete` mining result,
 aark cleanup plan /mnt/recovery/case-001/sensitive-mining \
   --case /mnt/recovery/case-001
 ```
+
+For an inactive legacy case whose recovery process was unintentionally interrupted, an owner may explicitly add `--accept-interrupted-case` to both planning and execution. The result reports `legacy-interrupted`; AARK does not relabel the recovery as successful, and all complete/error-free mining, integrity, coverage, token, and confirmation gates still apply.
 
 The path-redacted JSON gives aggregate deletion counts and bytes, retained whole-source counts and bytes, the number of marker-only locations without exported artifacts, and an approval token. An agent must show that plan to the end user and ask whether to perform the irreversible cleanup; case-wide recovery authorization is not deletion approval. Only after the user agrees, run the unchanged plan with all three gates:
 

@@ -5,10 +5,11 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { Provenance } from "../core/types.js";
 import { sha256Hex } from "../core/crypto.js";
-import { assertNoSymlinkComponents, atomicWriteJson, readDirectoryNamesBounded, safeJoin, syncDirectory } from "../core/fs-safe.js";
+import { assertNoSymlinkComponents, atomicWriteJson, readDirectoryNamesBounded, safeJoin, stableHandleStat, stableLstat, syncDirectory } from "../core/fs-safe.js";
+import type { StableStat } from "../core/fs-safe.js";
 import { assertStorageCapacity, storagePolicyFromGiB } from "../core/storage.js";
 import type { StorageBudget } from "../core/storage.js";
-import type { WalkedFile } from "../core/fs-safe.js";
+import type { FilesystemIdentity, WalkedFile } from "../core/fs-safe.js";
 import {
   isBoundedJsonValue,
   isSafeDetectorIdentifier,
@@ -102,7 +103,7 @@ export interface ScanState {
   updatedAt: string;
   semantic: ScanSemanticOptions;
   operational: ScanOperationalOptions;
-  inputRoots: Array<{ path: string; device: number; inode: number; kind: "file" | "directory"; mount: string }>;
+  inputRoots: Array<{ path: string; device: FilesystemIdentity; inode: FilesystemIdentity; kind: "file" | "directory"; mount: string }>;
   manifest: { filename: typeof SCAN_FILES_FILENAME; entries: number; bytes: number; sha256: string };
   inventory: { filename: "inventory-sensitive.json"; bytes: number; sha256: string };
   cursor: ScanCursor;
@@ -114,6 +115,55 @@ function record(value: unknown, label: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function validFilesystemIdentity(value: unknown): value is FilesystemIdentity {
+  return Number.isSafeInteger(value) && Number(value) >= 0
+    || typeof value === "string" && /^[0-9]{1,32}$/.test(value);
+}
+
+async function verifyPublishedManifest(filename: string, expectedBytes: number, expectedSha256: string): Promise<void> {
+  const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const before = await stableHandleStat(handle);
+    const currentBefore = await stableLstat(filename);
+    if (
+      !before.raw.isFile()
+      || before.raw.nlink !== 1n
+      || before.device !== currentBefore.device
+      || before.inode !== currentBefore.inode
+      || before.bytes !== expectedBytes
+    ) throw new Error("published scan manifest is not the expected stable regular file");
+    const digest = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let consumed = 0;
+    while (consumed < expectedBytes) {
+      const result = await handle.read(buffer, 0, Math.min(buffer.length, expectedBytes - consumed), consumed);
+      if (result.bytesRead === 0) break;
+      digest.update(buffer.subarray(0, result.bytesRead));
+      consumed += result.bytesRead;
+    }
+    const extra = await handle.read(buffer, 0, 1, consumed);
+    const after = await stableHandleStat(handle);
+    const currentAfter = await stableLstat(filename);
+    if (
+      consumed !== expectedBytes
+      || extra.bytesRead !== 0
+      || digest.digest("hex") !== expectedSha256
+      || before.device !== after.device
+      || before.inode !== after.inode
+      || before.bytes !== after.bytes
+      || before.modifiedMs !== after.modifiedMs
+      || before.changedMs !== after.changedMs
+      || after.device !== currentAfter.device
+      || after.inode !== currentAfter.inode
+      || after.bytes !== currentAfter.bytes
+      || after.modifiedMs !== currentAfter.modifiedMs
+      || after.changedMs !== currentAfter.changedMs
+    ) throw new Error("published scan manifest changed during verification");
+  } finally {
+    await handle.close();
+  }
+}
+
 function frozenFile(value: unknown, expectedIndex: number): FrozenScanFile {
   const item = record(value, "scan manifest entry");
   if (
@@ -123,8 +173,8 @@ function frozenFile(value: unknown, expectedIndex: number): FrozenScanFile {
     || path.resolve(item.path) !== item.path
     || !Number.isSafeInteger(item.bytes)
     || Number(item.bytes) < 0
-    || !Number.isSafeInteger(item.device)
-    || !Number.isSafeInteger(item.inode)
+    || !validFilesystemIdentity(item.device)
+    || !validFilesystemIdentity(item.inode)
     || typeof item.modifiedMs !== "number"
     || !Number.isFinite(item.modifiedMs)
     || typeof item.changedMs !== "number"
@@ -144,18 +194,12 @@ export async function createScanManifest(
   await assertNoSymlinkComponents(output, destination);
   await assertNoSymlinkComponents(output, temporary);
   let replacingBytes = 0n;
-  let priorDestination: { device: number; inode: number; bytes: number; modifiedMs: number; changedMs: number } | undefined;
+  let priorDestination: StableStat | undefined;
   try {
-    const existing = await lstat(destination);
-    if (existing.isSymbolicLink() || !existing.isFile() || existing.nlink !== 1) throw new Error("scan manifest must remain a single-link regular file");
-    replacingBytes = BigInt(existing.size);
-    priorDestination = {
-      device: existing.dev,
-      inode: existing.ino,
-      bytes: existing.size,
-      modifiedMs: existing.mtimeMs,
-      changedMs: existing.ctimeMs,
-    };
+    const existing = await stableLstat(destination);
+    if (existing.raw.isSymbolicLink() || !existing.raw.isFile() || existing.raw.nlink !== 1n) throw new Error("scan manifest must remain a single-link regular file");
+    replacingBytes = BigInt(existing.bytes);
+    priorDestination = existing;
   } catch (error) {
     const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
     if (code !== "ENOENT") throw error;
@@ -168,7 +212,8 @@ export async function createScanManifest(
     await handle.close().catch(() => undefined);
     throw error;
   }
-  const openedIdentity = { device: opened.dev, inode: opened.ino };
+  const openedStable = await stableHandleStat(handle);
+  const openedIdentity = { device: openedStable.device, inode: openedStable.inode };
   const hash = createHash("sha256");
   let entries = 0;
   let bytes = 0;
@@ -211,42 +256,48 @@ export async function createScanManifest(
     await flush();
     await handle.sync();
     await assertOutputSafe();
-    const currentTemporary = await lstat(temporary);
+    const currentTemporary = await stableLstat(temporary);
     if (
-      currentTemporary.isSymbolicLink()
-      || !currentTemporary.isFile()
-      || currentTemporary.nlink !== 1
-      || currentTemporary.dev !== opened.dev
-      || currentTemporary.ino !== opened.ino
+      currentTemporary.raw.isSymbolicLink()
+      || !currentTemporary.raw.isFile()
+      || currentTemporary.raw.nlink !== 1n
+      || currentTemporary.device !== openedStable.device
+      || currentTemporary.inode !== openedStable.inode
     ) throw new Error("scan manifest temporary path changed before publication");
     try {
-      const current = await lstat(destination);
+      const current = await stableLstat(destination);
       if (
         priorDestination === undefined
-        || current.isSymbolicLink()
-        || !current.isFile()
-        || current.nlink !== 1
-        || current.dev !== priorDestination.device
-        || current.ino !== priorDestination.inode
-        || current.size !== priorDestination.bytes
-        || current.mtimeMs !== priorDestination.modifiedMs
-        || current.ctimeMs !== priorDestination.changedMs
+        || current.raw.isSymbolicLink()
+        || !current.raw.isFile()
+        || current.raw.nlink !== 1n
+        || current.device !== priorDestination.device
+        || current.inode !== priorDestination.inode
+        || current.bytes !== priorDestination.bytes
+        || current.modifiedMs !== priorDestination.modifiedMs
+        || current.changedMs !== priorDestination.changedMs
       ) throw new Error("scan manifest destination changed before publication");
     } catch (error) {
       const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
       if (!(code === "ENOENT" && priorDestination === undefined)) throw error;
     }
+    const expectedSha256 = hash.copy().digest("hex");
+    if (process.platform === "win32") await handle.close();
     await rename(temporary, destination);
     published = true;
-    const currentDestination = await lstat(destination);
-    if (
-      currentDestination.isSymbolicLink()
-      || !currentDestination.isFile()
-      || currentDestination.nlink !== 1
-      || currentDestination.dev !== opened.dev
-      || currentDestination.ino !== opened.ino
-    ) throw new Error("scan manifest path changed during publication");
-    await handle.close();
+    if (process.platform === "win32") {
+      await verifyPublishedManifest(destination, bytes, expectedSha256);
+    } else {
+      const currentDestination = await stableLstat(destination);
+      if (
+        currentDestination.raw.isSymbolicLink()
+        || !currentDestination.raw.isFile()
+        || currentDestination.raw.nlink !== 1n
+        || currentDestination.device !== openedStable.device
+        || currentDestination.inode !== openedStable.inode
+      ) throw new Error("scan manifest path changed during publication");
+      await handle.close();
+    }
     budget.committedWrite(BigInt(bytes), replacingBytes);
     await syncDirectory(output);
     await assertOutputSafe();
@@ -254,8 +305,8 @@ export async function createScanManifest(
     await handle.close().catch(() => undefined);
     if (!published) {
       try {
-        const current = await lstat(temporary);
-        if (current.dev === openedIdentity.device && current.ino === openedIdentity.inode) await unlink(temporary);
+        const current = await stableLstat(temporary);
+        if (current.device === openedIdentity.device && current.inode === openedIdentity.inode) await unlink(temporary);
       } catch {
         // Missing or substituted temporary paths are not safe cleanup targets.
       }
@@ -272,12 +323,12 @@ async function stableFileBytes(filename: string, maximumBytes?: number, signal?:
   assertNotAborted(signal, "resume control verification");
   const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
-    const before = await handle.stat();
-    if (!before.isFile() || before.nlink !== 1 || !Number.isSafeInteger(before.size) || before.size < 0) {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.nlink !== 1n || !Number.isSafeInteger(Number(before.size)) || before.size < 0n) {
       throw new Error("resume control input must be a single-link regular file");
     }
-    if (maximumBytes !== undefined && before.size > maximumBytes) throw new Error("resume control input exceeds its size limit");
-    const data = Buffer.allocUnsafe(before.size);
+    if (maximumBytes !== undefined && before.size > BigInt(maximumBytes)) throw new Error("resume control input exceeds its size limit");
+    const data = Buffer.allocUnsafe(Number(before.size));
     let offset = 0;
     while (offset < data.length) {
       assertNotAborted(signal, "resume control verification");
@@ -285,24 +336,24 @@ async function stableFileBytes(filename: string, maximumBytes?: number, signal?:
       if (result.bytesRead === 0) break;
       offset += result.bytesRead;
     }
-    const after = await handle.stat();
-    const current = await lstat(filename);
+    const after = await handle.stat({ bigint: true });
+    const current = await lstat(filename, { bigint: true });
     if (
-      offset !== before.size
+      BigInt(offset) !== before.size
       || before.dev !== after.dev
       || before.ino !== after.ino
-      || after.nlink !== 1
+      || after.nlink !== 1n
       || before.size !== after.size
-      || before.mtimeMs !== after.mtimeMs
-      || before.ctimeMs !== after.ctimeMs
+      || before.mtimeNs !== after.mtimeNs
+      || before.ctimeNs !== after.ctimeNs
       || current.isSymbolicLink()
       || !current.isFile()
-      || current.nlink !== 1
+      || current.nlink !== 1n
       || current.dev !== after.dev
       || current.ino !== after.ino
       || current.size !== after.size
-      || current.mtimeMs !== after.mtimeMs
-      || current.ctimeMs !== after.ctimeMs
+      || current.mtimeNs !== after.mtimeNs
+      || current.ctimeNs !== after.ctimeNs
       || await realpath(filename) !== path.resolve(filename)
     ) {
       throw new Error("resume control input changed while it was read");
@@ -321,41 +372,41 @@ async function stableFileIntegrity(
   assertNotAborted(signal, "resume artifact verification");
   const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
-    const before = await handle.stat();
-    if (!before.isFile() || before.nlink !== 1 || !Number.isSafeInteger(before.size) || before.size < 0 || before.size > maximumBytes) {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.nlink !== 1n || !Number.isSafeInteger(Number(before.size)) || before.size < 0n || before.size > BigInt(maximumBytes)) {
       throw new Error("resume artifact must be a bounded single-link regular file");
     }
     const hash = createHash("sha256");
-    const buffer = Buffer.allocUnsafe(Math.min(1024 * 1024, Math.max(1, before.size)));
+    const buffer = Buffer.allocUnsafe(Math.min(1024 * 1024, Math.max(1, Number(before.size))));
     let consumed = 0;
     while (consumed < before.size) {
       assertNotAborted(signal, "resume artifact verification");
-      const result = await handle.read(buffer, 0, Math.min(buffer.length, before.size - consumed), consumed);
+      const result = await handle.read(buffer, 0, Math.min(buffer.length, Number(before.size) - consumed), consumed);
       if (result.bytesRead === 0) break;
       hash.update(buffer.subarray(0, result.bytesRead));
       consumed += result.bytesRead;
     }
     const probe = Buffer.allocUnsafe(1);
     const extra = await handle.read(probe, 0, 1, consumed);
-    const after = await handle.stat();
-    const current = await lstat(filename);
+    const after = await handle.stat({ bigint: true });
+    const current = await lstat(filename, { bigint: true });
     if (
-      consumed !== before.size
+      BigInt(consumed) !== before.size
       || extra.bytesRead !== 0
       || before.dev !== after.dev
       || before.ino !== after.ino
-      || after.nlink !== 1
+      || after.nlink !== 1n
       || before.size !== after.size
-      || before.mtimeMs !== after.mtimeMs
-      || before.ctimeMs !== after.ctimeMs
+      || before.mtimeNs !== after.mtimeNs
+      || before.ctimeNs !== after.ctimeNs
       || current.isSymbolicLink()
       || !current.isFile()
-      || current.nlink !== 1
+      || current.nlink !== 1n
       || current.dev !== after.dev
       || current.ino !== after.ino
       || current.size !== after.size
-      || current.mtimeMs !== after.mtimeMs
-      || current.ctimeMs !== after.ctimeMs
+      || current.mtimeNs !== after.mtimeNs
+      || current.ctimeNs !== after.ctimeNs
       || await realpath(filename) !== path.resolve(filename)
     ) throw new Error("resume artifact changed while its integrity was verified");
     return { bytes: consumed, sha256: hash.digest("hex") };
@@ -375,8 +426,8 @@ export async function* readScanManifest(output: string, expected: ScanState["man
   let index = 0;
   let consumed = 0;
   try {
-    const before = await handle.stat();
-    if (!before.isFile() || before.nlink !== 1 || before.size !== expected.bytes) throw new Error("scan manifest identity or size does not match resume state");
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.nlink !== 1n || before.size !== BigInt(expected.bytes)) throw new Error("scan manifest identity or size does not match resume state");
     const buffer = Buffer.allocUnsafe(1024 * 1024);
     while (consumed < expected.bytes) {
       assertNotAborted(signal, "scan manifest verification");
@@ -407,24 +458,24 @@ export async function* readScanManifest(output: string, expected: ScanState["man
     const extra = await handle.read(probe, 0, 1, consumed);
     pending += decoder.end();
     if (pending !== "") throw new Error("scan manifest does not end at a record boundary");
-    const after = await handle.stat();
-    const current = await lstat(filename);
+    const after = await handle.stat({ bigint: true });
+    const current = await lstat(filename, { bigint: true });
     if (
       extra.bytesRead !== 0
       || before.dev !== after.dev
       || before.ino !== after.ino
-      || after.nlink !== 1
+      || after.nlink !== 1n
       || before.size !== after.size
-      || before.mtimeMs !== after.mtimeMs
-      || before.ctimeMs !== after.ctimeMs
+      || before.mtimeNs !== after.mtimeNs
+      || before.ctimeNs !== after.ctimeNs
       || current.isSymbolicLink()
       || !current.isFile()
-      || current.nlink !== 1
+      || current.nlink !== 1n
       || current.dev !== after.dev
       || current.ino !== after.ino
       || current.size !== after.size
-      || current.mtimeMs !== after.mtimeMs
-      || current.ctimeMs !== after.ctimeMs
+      || current.mtimeNs !== after.mtimeNs
+      || current.ctimeNs !== after.ctimeNs
       || await realpath(filename) !== path.resolve(filename)
     ) {
       throw new Error("scan manifest changed while it was read");
@@ -521,7 +572,7 @@ export async function loadScanState(output: string, signal?: AbortSignal): Promi
     || inputRoots.length !== semanticInputs.length
     || inputRoots.some((entry, index) => {
       const root = typeof entry === "object" && entry !== null && !Array.isArray(entry) ? entry as Record<string, unknown> : {};
-      return !boundedString(root.path, MAX_CONTROL_PATH_BYTES) || root.path !== semanticInputs[index] || !path.isAbsolute(root.path) || path.resolve(root.path) !== root.path || !nonNegativeSafe(root.device) || !nonNegativeSafe(root.inode)
+      return !boundedString(root.path, MAX_CONTROL_PATH_BYTES) || root.path !== semanticInputs[index] || !path.isAbsolute(root.path) || path.resolve(root.path) !== root.path || !validFilesystemIdentity(root.device) || !validFilesystemIdentity(root.inode)
         || !["file", "directory"].includes(String(root.kind)) || !boundedString(root.mount, MAX_CONTROL_PATH_BYTES);
     })
     || manifest.filename !== SCAN_FILES_FILENAME

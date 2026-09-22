@@ -57,8 +57,10 @@ test("reveal validation accepts only artifacts referenced by a finalized adjacen
   await assert.rejects(readValidatedRevealArtifact(unlisted), /not referenced/);
 
   const alias = path.join(findingDirectory, "alias.txt");
-  await symlink(artifact, alias);
-  await assert.rejects(readValidatedRevealArtifact(alias), /non-symbolic-link/);
+  if (process.platform !== "win32") {
+    await symlink(artifact, alias);
+    await assert.rejects(readValidatedRevealArtifact(alias), /non-symbolic-link/);
+  }
 
   await writeFile(artifact, "modified artifact bytes");
   await assert.rejects(readValidatedRevealArtifact(artifact), /do not match|integrity metadata|safety limit/);

@@ -268,7 +268,8 @@ cleanup.command("plan")
   .argument("<mining-outputs...>", "completed error-free mining output directories covering the selected recovered data")
   .requiredOption("-c, --case <directory>", "completed AARK recovery case directory")
   .option("--include-evidence", "also plan deletion of the case evidence copy", false)
-  .action(async (miningOutputs: string[], options: { case: string; includeEvidence: boolean }) => {
+  .option("--accept-interrupted-case", "accept an inactive legacy interrupted recovery state while still requiring exact completed scan coverage", false)
+  .action(async (miningOutputs: string[], options: { case: string; includeEvidence: boolean; acceptInterruptedCase: boolean }) => {
     const controller = new AbortController();
     const interrupt = (): void => controller.abort();
     process.on("SIGINT", interrupt);
@@ -278,6 +279,7 @@ cleanup.command("plan")
         caseDirectory: options.case,
         miningOutputs,
         includeEvidence: options.includeEvidence,
+        acceptInterruptedCase: options.acceptInterruptedCase,
         signal: controller.signal,
       }));
     } finally {
@@ -295,6 +297,7 @@ cleanup.command("run")
   .option("--confirm-delete-recovered-copy", "confirm irreversible deletion of selected recovered data", false)
   .option("--include-evidence", "also delete the case evidence copy", false)
   .option("--confirm-delete-evidence", "separately confirm irreversible evidence-copy deletion", false)
+  .option("--accept-interrupted-case", "accept the same inactive legacy interrupted recovery state used for planning", false)
   .action(async (miningOutputs: string[], options: {
     case: string;
     approvalToken: string;
@@ -302,6 +305,7 @@ cleanup.command("run")
     confirmDeleteRecoveredCopy: boolean;
     includeEvidence: boolean;
     confirmDeleteEvidence: boolean;
+    acceptInterruptedCase: boolean;
   }) => {
     const controller = new AbortController();
     const interrupt = (): void => controller.abort();
@@ -316,6 +320,7 @@ cleanup.command("run")
         confirmDeleteRecoveredCopy: options.confirmDeleteRecoveredCopy,
         includeEvidence: options.includeEvidence,
         confirmDeleteEvidence: options.confirmDeleteEvidence,
+        acceptInterruptedCase: options.acceptInterruptedCase,
         signal: controller.signal,
       }));
     } finally {

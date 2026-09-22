@@ -9,11 +9,79 @@ export interface MountRecord {
   options: string[];
 }
 
+interface WindowsLogicalDisk {
+  DeviceID?: unknown;
+  DriveType?: unknown;
+  FileSystem?: unknown;
+  VolumeSerialNumber?: unknown;
+}
+
+const WINDOWS_POWERSHELL = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+const WINDOWS_LOGICAL_DISK_QUERY = [
+  "@(",
+  "Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction Stop |",
+  "Select-Object DeviceID,DriveType,FileSystem,VolumeSerialNumber",
+  ") | ConvertTo-Json -Compress",
+].join(" ");
+
 function unescapeMount(value: string): string {
   return value.replace(/\\040/g, " ").replace(/\\011/g, "\t").replace(/\\012/g, "\n").replace(/\\134/g, "\\");
 }
 
+function validWindowsLogicalDisk(value: unknown): value is WindowsLogicalDisk {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+export function windowsLogicalDisksToMounts(value: unknown): MountRecord[] {
+  const entries = Array.isArray(value) ? value : [value];
+  const records: MountRecord[] = [];
+  for (const entry of entries) {
+    if (!validWindowsLogicalDisk(entry)) continue;
+    const device = typeof entry.DeviceID === "string" ? entry.DeviceID.toUpperCase() : "";
+    const driveType = typeof entry.DriveType === "number" ? entry.DriveType : Number.NaN;
+    const filesystem = typeof entry.FileSystem === "string" && entry.FileSystem !== "" ? entry.FileSystem : "unknown";
+    const serial = typeof entry.VolumeSerialNumber === "string" && /^[A-Fa-f0-9]+$/.test(entry.VolumeSerialNumber)
+      ? entry.VolumeSerialNumber.toUpperCase()
+      : "unknown";
+    if (!/^[A-Z]:$/.test(device) || !Number.isInteger(driveType)) continue;
+    const network = driveType === 4 || !new Set([2, 3, 5, 6]).has(driveType);
+    records.push({
+      source: `windows-volume:${device}:${serial}`,
+      target: `${device}\\`,
+      filesystem,
+      options: ["rw", network ? "windows-network" : "windows-local", `drive-type=${driveType}`],
+    });
+  }
+  return records;
+}
+
+async function windowsMounts(): Promise<MountRecord[]> {
+  const result = await captureCommand(WINDOWS_POWERSHELL, [
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    WINDOWS_LOGICAL_DISK_QUERY,
+  ], {
+    maxCaptureBytes: 256 * 1024,
+    timeoutMs: 30_000,
+  });
+  if (result.exitCode !== 0 || result.stdoutTruncated) {
+    throw new Error("could not inventory Windows logical volumes safely");
+  }
+  let document: unknown;
+  try {
+    document = JSON.parse(result.stdout.toString("utf8").replace(/^\uFEFF/, ""));
+  } catch (error) {
+    throw new Error("Windows logical-volume inventory returned invalid JSON", { cause: error });
+  }
+  const records = windowsLogicalDisksToMounts(document);
+  if (records.length === 0) throw new Error("Windows logical-volume inventory returned no usable local roots");
+  return records;
+}
+
 export async function mounts(): Promise<MountRecord[]> {
+  if (process.platform === "win32") return await windowsMounts();
   const records: MountRecord[] = [];
   for (const line of (await readFile("/proc/self/mounts", "utf8")).split("\n")) {
     const fields = line.split(" ");
@@ -32,10 +100,12 @@ export function mountForPathFrom(records: MountRecord[], input: string): MountRe
   const resolved = path.resolve(input);
   let selected: MountRecord | undefined;
   for (const record of records) {
-    if (resolved !== record.target && !resolved.startsWith(`${record.target.replace(/\/$/, "")}/`)) continue;
+    const target = path.resolve(record.target);
+    const relative = path.relative(target, resolved);
+    if (relative !== "" && (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))) continue;
     // /proc/self/mounts is ordered by mount creation. For stacked mounts with
     // the same target, the later record is the visible topmost mount.
-    if (selected === undefined || record.target.length >= selected.target.length) selected = record;
+    if (selected === undefined || target.length >= path.resolve(selected.target).length) selected = record;
   }
   return selected;
 }
@@ -50,6 +120,7 @@ export function mountIsReadOnly(record: MountRecord | undefined): boolean {
 
 export function filesystemIsNetwork(record: MountRecord | undefined): boolean {
   if (record === undefined) return false;
+  if (record.options.includes("windows-network")) return true;
   const filesystem = record.filesystem.toLowerCase();
   const known = new Set(["9p", "afs", "ceph", "cifs", "davfs", "glusterfs", "lustre", "nfs", "nfs4", "smb3", "virtiofs"]);
   const knownLocalFuse = new Set([
@@ -92,6 +163,7 @@ export function blockTransportIsNetwork(device: string, transport?: string | nul
 export async function mountIsNetworkBacked(record: MountRecord | undefined): Promise<boolean> {
   if (record === undefined) throw new Error("could not determine the mount backing a protected path");
   if (filesystemIsNetwork(record)) return true;
+  if (record.options.includes("windows-local") && record.source.startsWith("windows-volume:")) return false;
   if (!record.source.startsWith("/dev/")) return false;
   const source = record.source.replace(/\[[^\]]*\]$/, "");
   const result = await captureCommand("lsblk", ["--inverse", "--json", "--paths", "--output", "PATH,TYPE,TRAN,SUBSYSTEMS", source], {

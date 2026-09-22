@@ -77,6 +77,24 @@ function decodeBase64UrlJson(value: string): Record<string, unknown> | null {
   }
 }
 
+function plausibleBase64UrlJsonObject(value: string): boolean {
+  try {
+    // Reject random base64url-shaped disk bytes before spending the shared
+    // structural-validation budget on full decoding and JSON.parse. JWT
+    // headers and payloads accepted below must decode to JSON objects.
+    const prefix = Buffer.from(value.slice(0, 128), "base64url");
+    for (const byte of prefix) {
+      if (byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d) continue;
+      return byte === 0x7b;
+    }
+    // An all-whitespace prefix is inconclusive, not invalid JSON. Let the
+    // bounded full decoder decide when the object starts beyond this prefix.
+    return value.length > 128;
+  } catch {
+    return false;
+  }
+}
+
 export function detectProviderCredentials(data: Buffer, context: DetectionContext): Candidate[] {
   const text = decodedText(data, "latin1");
   const output: Candidate[] = [];
@@ -102,6 +120,7 @@ export function detectProviderCredentials(data: Buffer, context: DetectionContex
 
   for (const match of text.matchAll(new RegExp(JWT.source, JWT.flags))) {
     if (match.index === undefined || match[1] === undefined || match[2] === undefined || match[3] === undefined) continue;
+    if (!plausibleBase64UrlJsonObject(match[1]) || !plausibleBase64UrlJsonObject(match[2])) continue;
     if (!takeStructuralValidation(context)) return output;
     const header = decodeBase64UrlJson(match[1]);
     const payload = decodeBase64UrlJson(match[2]);
@@ -138,7 +157,6 @@ export function detectProviderCredentials(data: Buffer, context: DetectionContex
     const key = match[2];
     const rawValue = match[3] ?? match[4] ?? match[5];
     if (match.index === undefined || key === undefined || rawValue === undefined) continue;
-    if (!takeStructuralValidation(context)) return output;
     if (placeholder(rawValue)) continue;
     const normalizedKey = key.toLowerCase().replace(/-/g, "_");
     const awsCategory = normalizedKey === "aws_secret_access_key"
@@ -147,6 +165,7 @@ export function detectProviderCredentials(data: Buffer, context: DetectionContex
         ? "aws-session-token"
         : undefined;
     if (awsCategory === undefined && !SECRET_NAME.test(key)) continue;
+    if (!takeStructuralValidation(context)) return output;
     if (awsCategory === "aws-secret-access-key" && (rawValue.length !== 40 || !/^[A-Za-z0-9/+=]{40}$/.test(rawValue))) continue;
     if (awsCategory === "aws-session-token" && (rawValue.length < 16 || rawValue.length > 4096 || !/^[A-Za-z0-9/+=_-]+$/.test(rawValue))) continue;
     const entropy = shannonEntropy(Buffer.from(rawValue, "latin1"));

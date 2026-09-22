@@ -1,12 +1,130 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import type { BigIntStats } from "node:fs";
 import { constants, open, opendir, rename, stat, lstat, chmod, mkdir, unlink } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
+
+export type FilesystemIdentity = number | string;
+
+export interface StableStat {
+  raw: BigIntStats;
+  device: FilesystemIdentity;
+  inode: FilesystemIdentity;
+  bytes: number;
+  modifiedMs: number;
+  changedMs: number;
+}
+
+function identityValue(value: bigint): FilesystemIdentity {
+  if (value < 0n) throw new Error("filesystem identity is negative");
+  const numeric = Number(value);
+  return Number.isSafeInteger(numeric) ? numeric : value.toString(10);
+}
+
+function stableStat(raw: BigIntStats): StableStat {
+  const bytes = Number(raw.size);
+  const modifiedMs = Number(raw.mtimeNs) / 1_000_000;
+  const changedMs = Number(raw.ctimeNs) / 1_000_000;
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || !Number.isFinite(modifiedMs) || !Number.isFinite(changedMs)) {
+    throw new Error("filesystem metadata is outside supported numeric bounds");
+  }
+  return {
+    raw,
+    device: identityValue(raw.dev),
+    inode: identityValue(raw.ino),
+    bytes,
+    modifiedMs,
+    changedMs,
+  };
+}
+
+export async function stableLstat(filename: string): Promise<StableStat> {
+  return stableStat(await lstat(filename, { bigint: true }));
+}
+
+export async function stableHandleStat(handle: FileHandle): Promise<StableStat> {
+  return stableStat(await handle.stat({ bigint: true }));
+}
+
+// exFAT can change the directory-entry-based identity on rename. Keep the
+// original handle open and compare the destination against that live handle,
+// never merely against size or a newly reopened destination.
+export async function renameWithHeldIdentity(source: string, destination: string, expected: StableStat): Promise<StableStat> {
+  const handle = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = await stableHandleStat(handle);
+    const current = await stableLstat(source);
+    for (const entry of [opened, current]) {
+      if (entry.raw.isSymbolicLink() || entry.device !== expected.device || entry.inode !== expected.inode
+        || entry.bytes !== expected.bytes || entry.modifiedMs !== expected.modifiedMs || entry.changedMs !== expected.changedMs
+        || entry.raw.mode !== expected.raw.mode || entry.raw.nlink !== expected.raw.nlink) {
+        throw new Error("protected rename source changed before moving");
+      }
+    }
+    await rename(source, destination);
+    const live = await stableHandleStat(handle);
+    const moved = await stableLstat(destination);
+    if (moved.raw.isSymbolicLink() || moved.device !== live.device || moved.inode !== live.inode
+      || moved.bytes !== live.bytes || moved.modifiedMs !== live.modifiedMs || moved.changedMs !== live.changedMs
+      || moved.bytes !== expected.bytes || moved.modifiedMs !== expected.modifiedMs
+      || moved.raw.mode !== expected.raw.mode || moved.raw.nlink !== expected.raw.nlink
+      || moved.raw.isDirectory() !== expected.raw.isDirectory() || moved.raw.isFile() !== expected.raw.isFile()
+      || (process.platform !== "win32" && (moved.device !== expected.device || moved.inode !== expected.inode))) {
+      throw new Error("protected rename destination does not match the original live handle");
+    }
+    return moved;
+  } finally { await handle.close(); }
+}
+
+async function verifyPublishedFile(filename: string, expectedBytes: number, expectedSha256: string): Promise<void> {
+  const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const before = await stableHandleStat(handle);
+    const currentBefore = await stableLstat(filename);
+    if (
+      !before.raw.isFile()
+      || before.raw.nlink !== 1n
+      || before.device !== currentBefore.device
+      || before.inode !== currentBefore.inode
+      || before.bytes !== expectedBytes
+    ) throw new Error("published output is not the expected stable regular file");
+    const digest = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(Math.min(1024 * 1024, Math.max(1, expectedBytes)));
+    let consumed = 0;
+    while (consumed < expectedBytes) {
+      const result = await handle.read(buffer, 0, Math.min(buffer.length, expectedBytes - consumed), consumed);
+      if (result.bytesRead === 0) break;
+      digest.update(buffer.subarray(0, result.bytesRead));
+      consumed += result.bytesRead;
+    }
+    const extra = await handle.read(buffer, 0, 1, consumed);
+    const after = await stableHandleStat(handle);
+    const currentAfter = await stableLstat(filename);
+    if (
+      consumed !== expectedBytes
+      || extra.bytesRead !== 0
+      || digest.digest("hex") !== expectedSha256
+      || before.device !== after.device
+      || before.inode !== after.inode
+      || before.bytes !== after.bytes
+      || before.modifiedMs !== after.modifiedMs
+      || before.changedMs !== after.changedMs
+      || after.device !== currentAfter.device
+      || after.inode !== currentAfter.inode
+      || after.bytes !== currentAfter.bytes
+      || after.modifiedMs !== currentAfter.modifiedMs
+      || after.changedMs !== currentAfter.changedMs
+    ) throw new Error("published output changed during verification");
+  } finally {
+    await handle.close();
+  }
+}
 
 export interface WalkedFile {
   path: string;
   bytes: number;
-  device: number;
-  inode: number;
+  device: FilesystemIdentity;
+  inode: FilesystemIdentity;
   modifiedMs: number;
   changedMs: number;
 }
@@ -91,18 +209,18 @@ export async function acquireExclusiveLock(directory: string, filename: string):
     if (code === "EEXIST") throw new Error("an exclusive operation lock already exists; another process may be active or a prior process may have stopped abruptly", { cause: error });
     throw error;
   }
-  let openedLock: Awaited<ReturnType<typeof handle.stat>>;
+  let openedLock: StableStat;
   try {
-    openedLock = await handle.stat();
+    openedLock = await stableHandleStat(handle);
   } catch (error) {
     await handle.close().catch(() => undefined);
     throw error;
   }
-  if (!openedLock.isFile() || openedLock.nlink !== 1) {
+  if (!openedLock.raw.isFile() || openedLock.raw.nlink !== 1n) {
     await handle.close().catch(() => undefined);
     try {
-      const current = await lstat(lockPath);
-      if (current.dev === openedLock.dev && current.ino === openedLock.ino) {
+      const current = await stableLstat(lockPath);
+      if (current.device === openedLock.device && current.inode === openedLock.inode) {
         await unlink(lockPath);
         await syncDirectory(root).catch(() => undefined);
       }
@@ -117,8 +235,8 @@ export async function acquireExclusiveLock(directory: string, filename: string):
     await syncDirectory(root);
   } catch (error) {
     await handle.close().catch(() => undefined);
-    const removed = await lstat(lockPath).then(async (current) => {
-      if (current.dev !== openedLock.dev || current.ino !== openedLock.ino) return false;
+    const removed = await stableLstat(lockPath).then(async (current) => {
+      if (current.device !== openedLock.device || current.inode !== openedLock.inode) return false;
       await unlink(lockPath);
       return true;
     }, () => false).catch(() => false);
@@ -129,15 +247,22 @@ export async function acquireExclusiveLock(directory: string, filename: string):
   let released = false;
   const assertHeld = async (): Promise<void> => {
     if (released) throw new Error("exclusive lock was already released");
-    let opened: Awaited<ReturnType<typeof handle.stat>>;
-    let current: Awaited<ReturnType<typeof lstat>>;
+    let opened: StableStat;
+    let current: StableStat;
     try {
-      opened = await handle.stat();
-      current = await lstat(lockPath);
+      opened = await stableHandleStat(handle);
+      current = await stableLstat(lockPath);
     } catch (error) {
       throw new Error("exclusive lock path is no longer verifiable", { cause: error });
     }
-    if (opened.dev !== current.dev || opened.ino !== current.ino || opened.nlink !== 1 || current.nlink !== 1 || !current.isFile() || current.isSymbolicLink()) {
+    if (
+      opened.device !== current.device
+      || opened.inode !== current.inode
+      || opened.raw.nlink !== 1n
+      || current.raw.nlink !== 1n
+      || !current.raw.isFile()
+      || current.raw.isSymbolicLink()
+    ) {
       throw new Error("exclusive lock path changed while the operation was running");
     }
   };
@@ -174,36 +299,30 @@ export async function atomicWriteFile(destination: string, data: Uint8Array | st
   const parent = path.dirname(destination);
   await ensurePrivateDirectory(parent);
   await assertNoSymlinkComponents(parent, destination);
-  let priorDestination: { device: number; inode: number; bytes: number; modifiedMs: number; changedMs: number } | undefined;
+  let priorDestination: StableStat | undefined;
   try {
-    const existing = await lstat(destination);
-    if (existing.isSymbolicLink() || !existing.isFile() || existing.nlink !== 1) {
+    const existing = await stableLstat(destination);
+    if (existing.raw.isSymbolicLink() || !existing.raw.isFile() || existing.raw.nlink !== 1n) {
       throw new Error("atomic output destination must remain a single-link regular file");
     }
-    priorDestination = {
-      device: existing.dev,
-      inode: existing.ino,
-      bytes: existing.size,
-      modifiedMs: existing.mtimeMs,
-      changedMs: existing.ctimeMs,
-    };
+    priorDestination = existing;
   } catch (error) {
     const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
     if (code !== "ENOENT") throw error;
   }
   const assertDestinationUnchanged = async (): Promise<void> => {
     try {
-      const current = await lstat(destination);
+      const current = await stableLstat(destination);
       if (
         priorDestination === undefined
-        || current.isSymbolicLink()
-        || !current.isFile()
-        || current.nlink !== 1
-        || current.dev !== priorDestination.device
-        || current.ino !== priorDestination.inode
-        || current.size !== priorDestination.bytes
-        || current.mtimeMs !== priorDestination.modifiedMs
-        || current.ctimeMs !== priorDestination.changedMs
+        || current.raw.isSymbolicLink()
+        || !current.raw.isFile()
+        || current.raw.nlink !== 1n
+        || current.device !== priorDestination.device
+        || current.inode !== priorDestination.inode
+        || current.bytes !== priorDestination.bytes
+        || current.modifiedMs !== priorDestination.modifiedMs
+        || current.changedMs !== priorDestination.changedMs
       ) throw new Error("atomic output destination changed before publication");
     } catch (error) {
       const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
@@ -213,12 +332,13 @@ export async function atomicWriteFile(destination: string, data: Uint8Array | st
   };
   const temporary = `${destination}.tmp-${process.pid}-${randomUUID()}`;
   let handle: Awaited<ReturnType<typeof open>> | undefined;
-  let identity: { device: number; inode: number } | undefined;
+  let identity: { device: FilesystemIdentity; inode: FilesystemIdentity } | undefined;
   let renamed = false;
   try {
     handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, mode);
     const opened = await handle.stat();
-    identity = { device: opened.dev, inode: opened.ino };
+    const openedStable = await stableHandleStat(handle);
+    identity = { device: openedStable.device, inode: openedStable.inode };
     if (!opened.isFile() || opened.nlink !== 1) throw new Error("atomic temporary output must be a single-link regular file");
     await handle.writeFile(data);
     try {
@@ -228,34 +348,44 @@ export async function atomicWriteFile(destination: string, data: Uint8Array | st
       // Non-Unix destination filesystems may not implement chmod; the manifest warns about mode enforcement.
     }
     await handle.sync();
-    const currentTemporary = await lstat(temporary);
+    const currentTemporary = await stableLstat(temporary);
     if (
-      currentTemporary.isSymbolicLink()
-      || !currentTemporary.isFile()
-      || currentTemporary.nlink !== 1
-      || currentTemporary.dev !== identity.device
-      || currentTemporary.ino !== identity.inode
+      currentTemporary.raw.isSymbolicLink()
+      || !currentTemporary.raw.isFile()
+      || currentTemporary.raw.nlink !== 1n
+      || currentTemporary.device !== identity.device
+      || currentTemporary.inode !== identity.inode
     ) throw new Error("atomic temporary output path changed before publication");
     await assertDestinationUnchanged();
+    const expectedBytes = typeof data === "string" ? Buffer.byteLength(data) : data.byteLength;
+    const expectedSha256 = createHash("sha256").update(data).digest("hex");
+    if (process.platform === "win32") {
+      await handle?.close();
+      handle = undefined;
+    }
     await rename(temporary, destination);
     renamed = true;
-    const currentDestination = await lstat(destination);
-    if (
-      currentDestination.isSymbolicLink()
-      || !currentDestination.isFile()
-      || currentDestination.nlink !== 1
-      || currentDestination.dev !== identity.device
-      || currentDestination.ino !== identity.inode
-    ) throw new Error("atomic output path changed during publication");
-    await handle.close();
-    handle = undefined;
+    if (process.platform === "win32") {
+      await verifyPublishedFile(destination, expectedBytes, expectedSha256);
+    } else {
+      const currentDestination = await stableLstat(destination);
+      if (
+        currentDestination.raw.isSymbolicLink()
+        || !currentDestination.raw.isFile()
+        || currentDestination.raw.nlink !== 1n
+        || currentDestination.device !== identity.device
+        || currentDestination.inode !== identity.inode
+      ) throw new Error("atomic output path changed during publication");
+      await handle?.close();
+      handle = undefined;
+    }
     await syncDirectory(parent);
   } finally {
     await handle?.close().catch(() => undefined);
     if (!renamed && identity !== undefined) {
       try {
-        const current = await lstat(temporary);
-        if (current.dev === identity.device && current.ino === identity.inode) await unlink(temporary);
+        const current = await stableLstat(temporary);
+        if (current.device === identity.device && current.inode === identity.inode) await unlink(temporary);
       } catch {
         // Missing or substituted temporary paths are not safe cleanup targets.
       }
@@ -317,12 +447,12 @@ export async function readJson<T>(filename: string, maximumBytes = 16 * 1024 * 1
   if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1) throw new Error("JSON size limit must be a positive integer");
   const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
-    const before = await handle.stat();
-    if (!before.isFile() || before.nlink !== 1) throw new Error("JSON input must be a single-link regular, non-symbolic-link file");
-    if (!Number.isSafeInteger(before.size) || before.size < 0 || before.size > maximumBytes) {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.nlink !== 1n) throw new Error("JSON input must be a single-link regular, non-symbolic-link file");
+    if (!Number.isSafeInteger(Number(before.size)) || before.size < 0n || before.size > BigInt(maximumBytes)) {
       throw new Error("JSON input exceeds its bounded size limit");
     }
-    const data = Buffer.allocUnsafe(before.size);
+    const data = Buffer.allocUnsafe(Number(before.size));
     let consumed = 0;
     while (consumed < data.length) {
       const result = await handle.read(data, consumed, data.length - consumed, consumed);
@@ -331,25 +461,25 @@ export async function readJson<T>(filename: string, maximumBytes = 16 * 1024 * 1
     }
     const probe = Buffer.allocUnsafe(1);
     const extra = await handle.read(probe, 0, 1, consumed);
-    const after = await handle.stat();
-    const current = await lstat(filename);
+    const after = await handle.stat({ bigint: true });
+    const current = await lstat(filename, { bigint: true });
     if (
-      consumed !== before.size
+      BigInt(consumed) !== before.size
       || extra.bytesRead !== 0
       || before.dev !== after.dev
       || before.ino !== after.ino
-      || after.nlink !== 1
+      || after.nlink !== 1n
       || before.size !== after.size
-      || before.mtimeMs !== after.mtimeMs
-      || before.ctimeMs !== after.ctimeMs
+      || before.mtimeNs !== after.mtimeNs
+      || before.ctimeNs !== after.ctimeNs
       || current.isSymbolicLink()
       || !current.isFile()
-      || current.nlink !== 1
+      || current.nlink !== 1n
       || current.dev !== after.dev
       || current.ino !== after.ino
       || current.size !== after.size
-      || current.mtimeMs !== after.mtimeMs
-      || current.ctimeMs !== after.ctimeMs
+      || current.mtimeNs !== after.mtimeNs
+      || current.ctimeNs !== after.ctimeNs
     ) throw new Error("JSON input changed while it was being read");
     try {
       return JSON.parse(data.toString("utf8")) as T;
@@ -395,47 +525,29 @@ export async function* walkRegularFiles(roots: string[], options: WalkOptions = 
     if (aborted()) throw new Error("regular-file walk was paused");
     const current = pending.pop();
     if (current === undefined) break;
-    let metadata: Awaited<ReturnType<typeof lstat>>;
+    let stable: StableStat;
     try {
-      metadata = await lstat(current);
+      stable = await stableLstat(current);
     } catch (error) {
       if (aborted() || rootPaths.has(current)) throw error;
       options.onError?.(current, error);
       continue;
     }
+    const metadata = stable.raw;
     if (metadata.isSymbolicLink()) continue;
-    if (
-      !Number.isFinite(metadata.dev)
-      || metadata.dev < 0
-      || !Number.isFinite(metadata.ino)
-      || metadata.ino < 0
-      || !Number.isFinite(metadata.mtimeMs)
-      || !Number.isFinite(metadata.ctimeMs)
-    ) {
-      const error = new Error("filesystem entry identity or timestamps are outside valid numeric bounds");
-      if (rootPaths.has(current)) throw error;
-      options.onError?.(current, error);
-      continue;
-    }
     if (metadata.isFile()) {
-      if (!Number.isSafeInteger(metadata.size) || metadata.size < 0) {
-        const error = new Error("regular-file size exceeds safe numeric bounds");
-        if (rootPaths.has(current)) throw error;
-        options.onError?.(current, error);
-        continue;
-      }
       yield {
         path: current,
-        bytes: metadata.size,
-        device: metadata.dev,
-        inode: metadata.ino,
-        modifiedMs: metadata.mtimeMs,
-        changedMs: metadata.ctimeMs,
+        bytes: stable.bytes,
+        device: stable.device,
+        inode: stable.inode,
+        modifiedMs: stable.modifiedMs,
+        changedMs: stable.changedMs,
       };
       continue;
     }
     if (!metadata.isDirectory()) continue;
-    const directoryKey = `${metadata.dev}:${metadata.ino}`;
+    const directoryKey = JSON.stringify([stable.device, stable.inode]);
     if (visitedDirectories.has(directoryKey)) continue;
     if (visitedDirectories.size >= maximumDirectories) {
       const error = new Error(`input tree exceeds the ${maximumDirectories}-directory deterministic-walk limit; scan smaller subdirectories separately`);
