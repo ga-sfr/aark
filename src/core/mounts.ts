@@ -1,6 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { captureCommand, WINDOWS_POWERSHELL } from "./command.js";
+import { captureCommand, WINDOWS_MOUNTVOL } from "./command.js";
 
 export interface MountRecord {
   source: string;
@@ -9,93 +9,60 @@ export interface MountRecord {
   options: string[];
 }
 
-interface WindowsLogicalDisk {
-  DeviceID?: unknown;
-  DriveType?: unknown;
-  FileSystem?: unknown;
-  VolumeSerialNumber?: unknown;
-}
-
-const WINDOWS_LOGICAL_DISK_QUERY = [
-  "$mutex = [System.Threading.Mutex]::new($false, 'Local\\AARK-Windows-Volume-Inventory-v1');",
-  "$acquired = $false;",
-  "try {",
-  "try { $acquired = $mutex.WaitOne(20000) } catch [System.Threading.AbandonedMutexException] { $acquired = $true };",
-  "if (-not $acquired) { throw 'timed out waiting for bounded Windows volume inventory serialization' };",
-  "@(",
-  "[System.IO.DriveInfo]::GetDrives() | ForEach-Object {",
-  "[pscustomobject]@{ DeviceID = $_.Name.Substring(0, 2); DriveType = [int]$_.DriveType; FileSystem = 'unknown' }",
-  "}",
-  ") | ConvertTo-Json -Compress",
-  "} finally { if ($acquired) { $mutex.ReleaseMutex() }; $mutex.Dispose() }",
-].join(" ");
-
 function unescapeMount(value: string): string {
   return value.replace(/\\040/g, " ").replace(/\\011/g, "\t").replace(/\\012/g, "\n").replace(/\\134/g, "\\");
 }
 
-function validWindowsLogicalDisk(value: unknown): value is WindowsLogicalDisk {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-export function windowsLogicalDisksToMounts(value: unknown): MountRecord[] {
-  const entries = Array.isArray(value) ? value : [value];
+export function windowsMountvolToMounts(value: string): MountRecord[] {
   const records: MountRecord[] = [];
-  for (const entry of entries) {
-    if (!validWindowsLogicalDisk(entry)) continue;
-    const device = typeof entry.DeviceID === "string" ? entry.DeviceID.toUpperCase() : "";
-    const driveType = typeof entry.DriveType === "number" ? entry.DriveType : Number.NaN;
-    const filesystem = typeof entry.FileSystem === "string" && entry.FileSystem !== "" ? entry.FileSystem : "unknown";
-    const serial = typeof entry.VolumeSerialNumber === "string" && /^[A-Fa-f0-9]+$/.test(entry.VolumeSerialNumber)
-      ? entry.VolumeSerialNumber.toUpperCase()
-      : "unknown";
-    if (!/^[A-Z]:$/.test(device) || !Number.isInteger(driveType)) continue;
-    const network = driveType === 4 || !new Set([2, 3, 5, 6]).has(driveType);
+  let volume: string | undefined;
+  for (const rawLine of value.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const volumeMatch = /^\\\\\?\\Volume\{([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\}\\$/.exec(line);
+    if (volumeMatch?.[1] !== undefined) {
+      volume = volumeMatch[1].toUpperCase();
+      continue;
+    }
+    if (volume === undefined || line === "") continue;
+    if (!/^[A-Za-z]:\\(?:[^<>:"/\\|?*\x00-\x1F]+\\)*$/.test(line)) {
+      // This also handles the localized form of "NO MOUNT POINTS" without
+      // depending on display language or accepting a later unrelated line.
+      volume = undefined;
+      continue;
+    }
     records.push({
-      source: `windows-volume:${device}:${serial}`,
-      target: `${device}\\`,
-      filesystem,
-      options: ["rw", network ? "windows-network" : "windows-local", `drive-type=${driveType}`],
+      source: `windows-volume:${volume}`,
+      target: `${line[0]?.toUpperCase()}${line.slice(1)}`,
+      filesystem: "unknown",
+      options: ["rw", "windows-local"],
     });
   }
   return records;
 }
 
 async function windowsMounts(): Promise<MountRecord[]> {
-  const result = await captureCommand(WINDOWS_POWERSHELL, [
-    "-NoLogo",
-    "-NoProfile",
-    "-NonInteractive",
-    "-Command",
-    WINDOWS_LOGICAL_DISK_QUERY,
-  ], {
+  const result = await captureCommand(WINDOWS_MOUNTVOL, [], {
     maxCaptureBytes: 256 * 1024,
-    timeoutMs: 30_000,
+    timeoutMs: 10_000,
   });
-  if (result.exitCode !== 0 || result.stdoutTruncated) {
-    throw new Error("could not inventory Windows logical volumes safely");
+  if (result.exitCode !== 0 || result.terminationReason !== null || result.stdoutTruncated || result.stderrTruncated) {
+    throw new Error("could not inventory Windows local volume mount points safely");
   }
-  let document: unknown;
-  try {
-    document = JSON.parse(result.stdout.toString("utf8").replace(/^\uFEFF/, ""));
-  } catch (error) {
-    throw new Error("Windows logical-volume inventory returned invalid JSON", { cause: error });
-  }
-  const records = windowsLogicalDisksToMounts(document);
+  const records = windowsMountvolToMounts(result.stdout.toString("utf8"));
+  if (records.length === 0) throw new Error("Windows volume inventory returned no usable local mount points");
   for (const record of records) {
-    if (!record.options.includes("windows-local")) continue;
     try {
-      // libuv exposes the Windows volume serial number as st_dev. This avoids
-      // WMI/CIM, which can hang under concurrent scanners and hosted runners.
+      // mountvol lists volume-manager mount points and omits mapped network
+      // drives. libuv's exact st_dev identity binds each reachable path to the
+      // local volume that actually backs it without WMI or DriveInfo queries.
       const serial = (await stat(record.target, { bigint: true })).dev.toString(16).toUpperCase().padStart(8, "0");
-      record.source = `windows-volume:${record.target.slice(0, 2)}:${serial}`;
+      record.source = `${record.source}:${serial}`;
     } catch {
       // An inaccessible local drive cannot safely back a protected path. Leave
       // it marked so protected-path checks fail closed if it is selected.
       record.options.push("windows-inaccessible");
     }
   }
-  if (records.length === 0) throw new Error("Windows logical-volume inventory returned no usable local roots");
   return records;
 }
 

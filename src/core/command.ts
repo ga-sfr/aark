@@ -38,9 +38,10 @@ const WINDOWS_DIRECTORY = process.platform === "win32"
 if (process.platform === "win32" && !/^[A-Za-z]:\\/.test(WINDOWS_DIRECTORY)) {
   throw new Error("Windows system directory must use a local drive-letter path");
 }
-export const WINDOWS_POWERSHELL = join(WINDOWS_DIRECTORY, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+const WINDOWS_SYSTEM_DIRECTORY = join(WINDOWS_DIRECTORY, "System32");
+export const WINDOWS_MOUNTVOL = join(WINDOWS_SYSTEM_DIRECTORY, "mountvol.exe");
 const SAFE_EXECUTABLE_PATH = process.platform === "win32"
-  ? [join(WINDOWS_DIRECTORY, "System32"), WINDOWS_DIRECTORY, dirname(WINDOWS_POWERSHELL)].join(delimiter)
+  ? [WINDOWS_SYSTEM_DIRECTORY, WINDOWS_DIRECTORY].join(delimiter)
   : "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const SAFE_TEMPORARY_DIRECTORY = process.platform === "win32" ? join(WINDOWS_DIRECTORY, "Temp") : "/tmp";
 

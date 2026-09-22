@@ -54,9 +54,9 @@ Do not invoke `aark mine reveal` unless the case authorization explicitly requir
 ## Platform support
 
 - Recovery orchestration and raw block-device work remain Linux-only.
-- Mining supports native Windows local drive-letter volumes with Node.js 22.12+
-  and Windows PowerShell 5.1+. Reject UNC paths, mapped network drives, and
-  unknown drive types; do not bypass the volume inventory.
+- Mining supports native Windows local drive-letter volumes with Node.js 22.12+.
+  Reject UNC paths, mapped network drives, and paths absent from the local
+  volume-manager inventory; do not bypass the volume inventory.
 - Preserve exact 64-bit Windows file identities in mining manifests and cleanup
   snapshots/tokens. Values outside JavaScript's safe-integer range are decimal
   strings for compatibility with existing numeric Linux manifests.
@@ -64,13 +64,12 @@ Do not invoke `aark mine reveal` unless the case authorization explicitly requir
   credentials or user PATH entries. Windows needs the system root and system
   executable directories. Test fixtures must canonicalize temporary paths,
   because hosted Windows runners may expose TEMP through an 8.3 alias.
-- Windows volume inventory uses bounded `System.IO.DriveInfo` enumeration and
-  Node's exact `st_dev` volume identity. Do not query `IsReady` or
-  `DriveFormat`, or replace this with WMI/CIM: all three can hang on virtual,
-  removable, or concurrently queried hosted-runner volumes.
-- Run Node test files serially. Hosted Windows runners can starve concurrent
-  PowerShell volume-inventory children even though each bounded query is fast
-  in isolation; detector-worker concurrency is still exercised inside tests.
+- Windows volume inventory uses the fixed system `mountvol.exe` and Node's exact
+  `st_dev` volume identity. Do not replace it with WMI/CIM or
+  `System.IO.DriveInfo`: those queries can hang on virtual, removable, or
+  concurrently queried hosted-runner volumes.
+- Run Node test files serially; detector-worker concurrency is still exercised
+  inside tests.
 - Do not assume rename preserves file identity on Windows/exFAT. Close the
   temporary handle, rename, then reopen and verify size, SHA-256, path identity,
   and stable timestamps.

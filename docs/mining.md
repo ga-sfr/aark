@@ -4,10 +4,11 @@ The mining layer is an offline scanner for local recovery outputs. It accepts re
 
 Mining supports Ubuntu-compatible Linux and native Windows 10/11. Windows
 inputs and outputs must be on local drive-letter volumes; UNC paths, mapped
-network drives, and unknown drive types are rejected. AARK binds each protected
-path to the drive type, filesystem, and volume serial returned by the fixed
-system PowerShell executable. It stores exact 64-bit Windows file identities as
-decimal strings when they cannot be represented safely as JavaScript numbers.
+network drives, and paths absent from the local volume-manager inventory are
+rejected. AARK obtains mount points from the fixed system `mountvol.exe` and
+binds each reachable protected path to Node's exact volume identity. It stores
+exact 64-bit Windows file identities as decimal strings when they cannot be
+represented safely as JavaScript numbers.
 The Windows open-handle check compares that exact identity with the authorized
 path before publishing findings and after processing. Linux retains the
 stronger `/proc/self/fd` handle-to-canonical-path check.

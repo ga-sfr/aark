@@ -4,7 +4,7 @@ import { mkdtemp } from "./helpers.js";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { captureCommand, commandExists, sanitizedEnvironment, WINDOWS_POWERSHELL } from "../core/command.js";
+import { captureCommand, commandExists, sanitizedEnvironment, WINDOWS_MOUNTVOL } from "../core/command.js";
 
 test("command discovery uses the fixed system path without an external which dependency", async () => {
   assert.equal(await commandExists("node"), process.platform !== "win32");
@@ -14,14 +14,11 @@ test("command discovery uses the fixed system path without an external which dep
 });
 
 test("Windows volume queries run with the minimal system environment", { skip: process.platform !== "win32" }, async () => {
-  const result = await captureCommand(WINDOWS_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
-    "@([System.IO.DriveInfo]::GetDrives() | ForEach-Object { [pscustomobject]@{ DeviceID = $_.Name.Substring(0,2); DriveType = [int]$_.DriveType } }) | ConvertTo-Json -Compress",
-  ], { timeoutMs: 30_000, maxCaptureBytes: 64 * 1024 });
+  const result = await captureCommand(WINDOWS_MOUNTVOL, [], { timeoutMs: 10_000, maxCaptureBytes: 64 * 1024 });
   assert.equal(result.terminationReason, null);
   assert.equal(result.exitCode, 0);
   assert.equal(result.stdoutTruncated, false);
-  const rows: unknown = JSON.parse(result.stdout.toString("utf8").replace(/^\uFEFF/, ""));
-  assert.ok(rows !== null && typeof rows === "object");
+  assert.match(result.stdout.toString("utf8"), /\\\\\?\\Volume\{/i);
 });
 
 test("command runner streams large stdout and stderr to exclusive private files", async () => {

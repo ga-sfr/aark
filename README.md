@@ -23,18 +23,19 @@ No telemetry, LLM/API integration, cloud validation, or network lookup is perfor
 
 - Node.js 22.12 or newer
 - Ubuntu or a compatible Linux distribution for recovery and raw block-device work
-- Windows 10/11 with Windows PowerShell 5.1 or newer for mining local drive-letter volumes
+- Windows 10/11 for mining local drive-letter volumes
 - Root access for raw block-device work on Linux
 - A separate destination disk with enough free space
 
 The recovery layer remains Linux-only because it orchestrates Linux forensic
 engines and kernel block-device safeguards. The mining layer also supports
-native Windows local volumes. On Windows, AARK inventories drive type,
-filesystem, and volume serial through a fixed system PowerShell executable,
-rejects UNC and mapped network volumes, and records exact 64-bit file identities
-in its frozen manifests. Windows publication closes temporary files before a
-rename and then reopens, hashes, and identity-checks the published path because
-exFAT can assign a new file identity during rename.
+native Windows local volumes. On Windows, AARK inventories local volume-manager
+mount points through the fixed system `mountvol.exe`, rejects UNC and mapped
+network volumes, and binds paths to Node's exact volume identity. It records
+exact 64-bit file identities in its frozen manifests. Windows publication
+closes temporary files before a rename and then reopens, hashes, and
+identity-checks the published path because exFAT can assign a new file identity
+during rename.
 
 Install the optional forensic engines you need:
 
