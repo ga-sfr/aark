@@ -65,8 +65,9 @@ Do not invoke `aark mine reveal` unless the case authorization explicitly requir
   executable directories. Test fixtures must canonicalize temporary paths,
   because hosted Windows runners may expose TEMP through an 8.3 alias.
 - Windows volume inventory uses bounded `System.IO.DriveInfo` enumeration and
-  Node's exact `st_dev` volume identity. Do not replace it with WMI/CIM: those
-  providers can hang when independent scanner processes query concurrently.
+  Node's exact `st_dev` volume identity. Do not query `IsReady` or
+  `DriveFormat`, or replace this with WMI/CIM: all three can hang on virtual,
+  removable, or concurrently queried hosted-runner volumes.
 - Run Node test files serially. Hosted Windows runners can starve concurrent
   PowerShell volume-inventory children even though each bounded query is fast
   in isolation; detector-worker concurrency is still exercised inside tests.
