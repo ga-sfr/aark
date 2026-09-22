@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { blockTransportIsNetwork, filesystemEnforcesUnixModes, filesystemIsNetwork, mountForPathFrom, mountIsNetworkBacked, mountIsReadOnly, windowsLogicalDisksToMounts, type MountRecord } from "../core/mounts.js";
+import { blockTransportIsNetwork, filesystemEnforcesUnixModes, filesystemIsNetwork, mountForPath, mountForPathFrom, mountIsNetworkBacked, mountIsReadOnly, windowsLogicalDisksToMounts, type MountRecord } from "../core/mounts.js";
 
 function mount(filesystem: string, source = "/dev/test", options = ["rw"]): MountRecord {
   return { source, target: "/mnt/test", filesystem, options };
@@ -58,4 +58,12 @@ test("Windows logical disks retain volume identity and reject mapped drives", as
   if (process.platform === "win32") {
     assert.equal(mountForPathFrom(records, "F:\\recovery\\case")?.source, "windows-volume:F::012ACA6C");
   }
+});
+
+test("Windows live volume inventory obtains an exact local volume identity without WMI", { skip: process.platform !== "win32" }, async () => {
+  const record = await mountForPath(process.cwd());
+  assert.ok(record?.source.startsWith(`windows-volume:${process.cwd().slice(0, 2).toUpperCase()}:`));
+  assert.equal(record?.source.endsWith(":unknown"), false);
+  assert.equal(record?.options.includes("windows-inaccessible"), false);
+  assert.equal(await mountIsNetworkBacked(record), false);
 });

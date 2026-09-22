@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { captureCommand, WINDOWS_POWERSHELL } from "./command.js";
 
@@ -18,8 +18,11 @@ interface WindowsLogicalDisk {
 
 const WINDOWS_LOGICAL_DISK_QUERY = [
   "@(",
-  "Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction Stop |",
-  "Select-Object DeviceID,DriveType,FileSystem,VolumeSerialNumber",
+  "[System.IO.DriveInfo]::GetDrives() | ForEach-Object {",
+  "$filesystem = 'unknown';",
+  "if ([int]$_.DriveType -ne 4 -and $_.IsReady) { try { $filesystem = $_.DriveFormat } catch {} };",
+  "[pscustomobject]@{ DeviceID = $_.Name.Substring(0, 2); DriveType = [int]$_.DriveType; FileSystem = $filesystem }",
+  "}",
   ") | ConvertTo-Json -Compress",
 ].join(" ");
 
@@ -75,6 +78,19 @@ async function windowsMounts(): Promise<MountRecord[]> {
     throw new Error("Windows logical-volume inventory returned invalid JSON", { cause: error });
   }
   const records = windowsLogicalDisksToMounts(document);
+  for (const record of records) {
+    if (!record.options.includes("windows-local")) continue;
+    try {
+      // libuv exposes the Windows volume serial number as st_dev. This avoids
+      // WMI/CIM, which can hang under concurrent scanners and hosted runners.
+      const serial = (await stat(record.target, { bigint: true })).dev.toString(16).toUpperCase().padStart(8, "0");
+      record.source = `windows-volume:${record.target.slice(0, 2)}:${serial}`;
+    } catch {
+      // An inaccessible local drive cannot safely back a protected path. Leave
+      // it marked so protected-path checks fail closed if it is selected.
+      record.options.push("windows-inaccessible");
+    }
+  }
   if (records.length === 0) throw new Error("Windows logical-volume inventory returned no usable local roots");
   return records;
 }
@@ -161,6 +177,7 @@ export function blockTransportIsNetwork(device: string, transport?: string | nul
 
 export async function mountIsNetworkBacked(record: MountRecord | undefined): Promise<boolean> {
   if (record === undefined) throw new Error("could not determine the mount backing a protected path");
+  if (record.options.includes("windows-inaccessible")) throw new Error("protected Windows volume identity could not be read safely");
   if (filesystemIsNetwork(record)) return true;
   if (record.options.includes("windows-local") && record.source.startsWith("windows-volume:")) return false;
   if (!record.source.startsWith("/dev/")) return false;

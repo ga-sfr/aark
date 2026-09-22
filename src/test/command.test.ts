@@ -15,7 +15,7 @@ test("command discovery uses the fixed system path without an external which dep
 
 test("Windows volume queries run with the minimal system environment", { skip: process.platform !== "win32" }, async () => {
   const result = await captureCommand(WINDOWS_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
-    "@(Get-CimInstance Win32_LogicalDisk -ErrorAction Stop | Select-Object DeviceID,DriveType) | ConvertTo-Json -Compress",
+    "@([System.IO.DriveInfo]::GetDrives() | ForEach-Object { [pscustomobject]@{ DeviceID = $_.Name.Substring(0,2); DriveType = [int]$_.DriveType } }) | ConvertTo-Json -Compress",
   ], { timeoutMs: 30_000, maxCaptureBytes: 64 * 1024 });
   assert.equal(result.terminationReason, null);
   assert.equal(result.exitCode, 0);
