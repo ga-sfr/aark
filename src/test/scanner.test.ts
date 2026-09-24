@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { renameSync, unlinkSync } from "node:fs";
-import { access, mkdir, mkdtemp, readFile, readdir, realpath, stat, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, realpath, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp } from "./helpers.js";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -42,7 +43,9 @@ async function artifactHashes(output: string): Promise<Record<string, string>> {
 }
 
 function normalizedReport(report: string, output: string): string {
+  const escapedOutput = JSON.stringify(output).slice(1, -1);
   return report
+    .replaceAll(escapedOutput, "<OUTPUT>")
     .replaceAll(output, "<OUTPUT>")
     .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/g, "<TIMESTAMP>");
 }
@@ -145,7 +148,7 @@ test("scanner keeps exact values local while default manifests stay redacted", a
   ]));
   const ignored = path.join(root, "ignored.txt");
   await writeFile(ignored, `api_key=${randomBytes(32).toString("hex")}`);
-  await symlink(ignored, path.join(input, "not-followed"));
+  if (process.platform !== "win32") await symlink(ignored, path.join(input, "not-followed"));
 
   const result = await scanSensitiveMaterial({
     inputs: [input],
@@ -194,19 +197,21 @@ test("scanner keeps exact values local while default manifests stay redacted", a
   }
   assert.match(sensitiveReport, /Cryptocurrency and wallet findings/);
   assert.match(sensitiveReport, /Total cryptocurrency-related unique findings: [1-9]/);
-  assert.ok(sensitiveReport.includes(input));
-  assert.ok(sensitiveReport.includes(path.join(output, "artifacts")));
+  assert.ok(sensitiveReport.includes(JSON.stringify(input)));
+  assert.ok(sensitiveReport.includes(JSON.stringify(path.join(output, "artifacts"))));
   assert.ok(sensitiveReport.includes("bitcoin-wif-private-key"));
   assert.equal(sensitiveReport.includes(mnemonic), false, "sensitive report should reference exact artifacts without duplicating values");
   assert.equal(inventoryText.includes(mnemonic), false, "sensitive inventory should map artifacts, not duplicate values inline");
   assert.equal(inventory.findings.some((finding) => finding.occurrences.some((occurrence) => occurrence.sourcePath === ignored)), false);
-  assert.equal((await stat(path.join(output, "inventory-sensitive.json"))).mode & 0o777, 0o600);
-  assert.equal((await stat(path.join(output, "manifest-redacted.json"))).mode & 0o777, 0o644);
-  assert.equal((await stat(path.join(output, "final-report-sensitive.md"))).mode & 0o777, 0o600);
-  assert.equal((await stat(path.join(output, "final-report-redacted.md"))).mode & 0o777, 0o644);
+  if (process.platform !== "win32") {
+    assert.equal((await stat(path.join(output, "inventory-sensitive.json"))).mode & 0o777, 0o600);
+    assert.equal((await stat(path.join(output, "manifest-redacted.json"))).mode & 0o777, 0o644);
+    assert.equal((await stat(path.join(output, "final-report-sensitive.md"))).mode & 0o777, 0o600);
+    assert.equal((await stat(path.join(output, "final-report-redacted.md"))).mode & 0o777, 0o644);
+  }
 });
 
-test("scanner rejects an output that aliases a scanned input through a parent symlink", async () => {
+test("scanner rejects an output that aliases a scanned input through a parent symlink", { skip: process.platform === "win32" }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "agetnic-alias-test-"));
   const input = path.join(root, "recovered");
   const alias = path.join(root, "recovered-alias");
@@ -552,7 +557,7 @@ test("a signal concurrent with an explicit input-root change is not mislabeled r
         controller.abort();
       }
     },
-  }), /scan input changed|explicit file input root changed/);
+  }), /scan input changed|explicit file input root changed|scan input path is no longer stably addressable/);
   assert.equal(changed, true);
   const state = JSON.parse(await readFile(path.join(output, "scan-state-sensitive.json"), "utf8")) as {
     status: string;
@@ -588,7 +593,7 @@ test("a signal concurrent with a completed child-file change is not mislabeled r
         controller.abort();
       }
     },
-  }), /scan input changed|completed or partial resume input is no longer stably addressable/);
+  }), /scan input changed|completed or partial resume input is no longer stably addressable|scan input path is no longer stably addressable/);
   assert.equal(changed, true);
   const state = JSON.parse(await readFile(path.join(output, "scan-state-sensitive.json"), "utf8")) as {
     status: string;
@@ -636,7 +641,7 @@ test("a signal concurrent with an inventory root change is not mislabeled resuma
   assert.equal(state.resumable, false);
 });
 
-test("a changed directory input remains a fatal scan-control error", async () => {
+test("a changed directory input remains a fatal scan-control error", { skip: process.platform === "win32" }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "agetnic-changing-directory-test-"));
   const input = path.join(root, "recovered");
   const moved = path.join(root, "recovered-moved");

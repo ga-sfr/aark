@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { access, lstat, open, stat, unlink } from "node:fs/promises";
+import { access, open, stat, unlink } from "node:fs/promises";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
-import { ensurePrivateDirectory, syncDirectory } from "./fs-safe.js";
+import { ensurePrivateDirectory, stableHandleStat, stableLstat, syncDirectory, type FilesystemIdentity } from "./fs-safe.js";
 
 export interface CommandResult {
   executable: string;
@@ -32,12 +32,22 @@ export interface CommandOptions {
   safetyCheckIntervalMs?: number;
 }
 
-const SAFE_EXECUTABLE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-const SAFE_TEMPORARY_DIRECTORY = "/tmp";
+const WINDOWS_DIRECTORY = process.platform === "win32"
+  ? resolve(process.env.SystemRoot ?? "C:\\Windows")
+  : "C:\\Windows";
+if (process.platform === "win32" && !/^[A-Za-z]:\\/.test(WINDOWS_DIRECTORY)) {
+  throw new Error("Windows system directory must use a local drive-letter path");
+}
+const WINDOWS_SYSTEM_DIRECTORY = join(WINDOWS_DIRECTORY, "System32");
+export const WINDOWS_MOUNTVOL = join(WINDOWS_SYSTEM_DIRECTORY, "mountvol.exe");
+const SAFE_EXECUTABLE_PATH = process.platform === "win32"
+  ? [WINDOWS_SYSTEM_DIRECTORY, WINDOWS_DIRECTORY].join(delimiter)
+  : "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const SAFE_TEMPORARY_DIRECTORY = process.platform === "win32" ? join(WINDOWS_DIRECTORY, "Temp") : "/tmp";
 
 interface CommandOutputIdentity {
-  device: number;
-  inode: number;
+  device: FilesystemIdentity;
+  inode: FilesystemIdentity;
 }
 
 function missingProcess(error: unknown): boolean {
@@ -65,8 +75,8 @@ async function killDetachedProcessGroupAndWait(processGroup: number, timeoutMs: 
 }
 
 async function assertCommandOutputLink(filename: string, identity: CommandOutputIdentity): Promise<void> {
-  const current = await lstat(filename);
-  if (current.isSymbolicLink() || !current.isFile() || current.nlink !== 1 || current.dev !== identity.device || current.ino !== identity.inode) {
+  const current = await stableLstat(filename);
+  if (current.raw.isSymbolicLink() || !current.raw.isFile() || current.raw.nlink !== 1n || current.device !== identity.device || current.inode !== identity.inode) {
     throw new Error("command output path changed after protected creation");
   }
 }
@@ -84,8 +94,9 @@ async function unlinkCommandOutputIfOwned(filename: string, identity: CommandOut
 
 export function sanitizedEnvironment(_source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   return {
+    ...(process.platform === "win32" ? { SystemRoot: WINDOWS_DIRECTORY, WINDIR: WINDOWS_DIRECTORY } : {}),
     PATH: SAFE_EXECUTABLE_PATH,
-    HOME: "/nonexistent",
+    HOME: process.platform === "win32" ? join(WINDOWS_DIRECTORY, "nonexistent-aark-home") : "/nonexistent",
     LANG: "C.UTF-8",
     LC_ALL: "C.UTF-8",
     TERM: "dumb",
@@ -163,16 +174,16 @@ export async function captureCommand(
       await ensurePrivateDirectory(dirname(options.stdoutFile));
       outputHandle = await open(options.stdoutFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
       outputCreated = true;
-      const metadata = await outputHandle.stat();
-      outputIdentity = { device: metadata.dev, inode: metadata.ino };
+      const metadata = await stableHandleStat(outputHandle);
+      outputIdentity = { device: metadata.device, inode: metadata.inode };
       await assertCommandOutputLink(options.stdoutFile, outputIdentity);
     }
     if (options.stderrFile !== undefined) {
       await ensurePrivateDirectory(dirname(options.stderrFile));
       errorHandle = await open(options.stderrFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
       errorCreated = true;
-      const metadata = await errorHandle.stat();
-      errorIdentity = { device: metadata.dev, inode: metadata.ino };
+      const metadata = await stableHandleStat(errorHandle);
+      errorIdentity = { device: metadata.device, inode: metadata.inode };
       await assertCommandOutputLink(options.stderrFile, errorIdentity);
     }
   } catch (error) {
@@ -199,6 +210,7 @@ export async function captureCommand(
         env: environment,
         detached,
         shell: false,
+        windowsHide: true,
         stdio: [
           options.stdin === undefined ? "ignore" : "pipe",
           outputHandle === undefined ? "pipe" : outputHandle.fd,

@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import type { Stats } from "node:fs";
-import { lstat, mkdir, open, opendir, readlink, realpath, rename, rm } from "node:fs/promises";
+import { mkdir, open, opendir, readlink, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -16,10 +15,13 @@ import {
   readDirectoryNamesBounded,
   readJson,
   safeJoin,
+  renameWithHeldIdentity,
+  stableHandleStat,
+  stableLstat,
   syncDirectory,
   walkRegularFiles,
 } from "./core/fs-safe.js";
-import type { ExclusiveLock, WalkedFile } from "./core/fs-safe.js";
+import type { ExclusiveLock, FilesystemIdentity, StableStat, WalkedFile } from "./core/fs-safe.js";
 import { filesystemIsNetwork, mountForPathFrom, mountIsNetworkBacked, mounts } from "./core/mounts.js";
 import type { MountRecord } from "./core/mounts.js";
 import {
@@ -48,6 +50,7 @@ export interface CleanupOptions {
   caseDirectory: string;
   miningOutputs: string[];
   includeEvidence?: boolean;
+  acceptInterruptedCase?: boolean;
   signal?: AbortSignal;
 }
 
@@ -66,7 +69,7 @@ export interface CleanupPlanResult {
   destructive: true;
   valuesPrinted: false;
   pathsRedacted: true;
-  recoveryStatus: "complete" | "complete-with-warnings";
+  recoveryStatus: "complete" | "complete-with-warnings" | "legacy-interrupted";
   miningScansVerified: number;
   scannedFilesVerified: string;
   findingsRetained: string;
@@ -88,7 +91,7 @@ export interface CleanupPlanResult {
     intermediateLogsAndRunsIncluded: boolean;
   };
   retained: {
-    recoveryFinalReports: true;
+    recoveryFinalReports: boolean;
     cleanupFinalReports: true;
     miningFinalReports: true;
     exactFindingArtifacts: true;
@@ -103,22 +106,22 @@ export interface CleanupPlanResult {
 
 interface RootSnapshot {
   path: string;
-  device: number;
-  inode: number;
+  device: FilesystemIdentity;
+  inode: FilesystemIdentity;
   mount: string;
 }
 
 interface DirectoryIdentity {
   path: string;
-  device: number;
-  inode: number;
+  device: FilesystemIdentity;
+  inode: FilesystemIdentity;
 }
 
 interface TargetSnapshot {
   name: "recovery" | "evidence" | "logs" | "runs";
   path: string;
-  device: number;
-  inode: number;
+  device: FilesystemIdentity;
+  inode: FilesystemIdentity;
   modifiedMs: number;
   changedMs: number;
   filesystemEntries: bigint;
@@ -132,8 +135,8 @@ interface TargetSnapshot {
 interface RetainedSourceFile {
   originalPath: string;
   relativePath: string;
-  device: number;
-  inode: number;
+  device: FilesystemIdentity;
+  inode: FilesystemIdentity;
   mode: number;
   links: number;
   bytes: number;
@@ -163,7 +166,7 @@ interface FindingSourceIndex {
 }
 
 interface VerifiedRecoveryCase {
-  status: "complete" | "complete-with-warnings";
+  status: "complete" | "complete-with-warnings" | "legacy-interrupted";
   runId: string;
   controlDigest: string;
 }
@@ -222,38 +225,43 @@ function bytewiseLexical(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function entryKind(metadata: Stats): "directory" | "file" | "symlink" | "block-device" | "character-device" | "fifo" | "socket" | "other" {
-  if (metadata.isDirectory()) return "directory";
-  if (metadata.isFile()) return "file";
-  if (metadata.isSymbolicLink()) return "symlink";
-  if (metadata.isBlockDevice()) return "block-device";
-  if (metadata.isCharacterDevice()) return "character-device";
-  if (metadata.isFIFO()) return "fifo";
-  if (metadata.isSocket()) return "socket";
+function entryKind(metadata: StableStat): "directory" | "file" | "symlink" | "block-device" | "character-device" | "fifo" | "socket" | "other" {
+  if (metadata.raw.isDirectory()) return "directory";
+  if (metadata.raw.isFile()) return "file";
+  if (metadata.raw.isSymbolicLink()) return "symlink";
+  if (metadata.raw.isBlockDevice()) return "block-device";
+  if (metadata.raw.isCharacterDevice()) return "character-device";
+  if (metadata.raw.isFIFO()) return "fifo";
+  if (metadata.raw.isSocket()) return "socket";
   return "other";
 }
 
-function assertBoundedEntryMetadata(metadata: Stats): void {
-  for (const value of [metadata.dev, metadata.ino, metadata.mode, metadata.nlink, metadata.uid, metadata.gid, metadata.rdev, metadata.mtimeMs, metadata.ctimeMs]) {
-    if (!Number.isFinite(value) || value < 0) throw new Error("cleanup target contains filesystem metadata outside valid numeric bounds");
+function boundedMetadataNumber(value: bigint): number {
+  const numeric = Number(value);
+  if (!Number.isSafeInteger(numeric) || numeric < 0) {
+    throw new Error("cleanup target contains filesystem metadata outside valid numeric bounds");
   }
-  if (!Number.isSafeInteger(metadata.size) || metadata.size < 0) {
-    throw new Error("cleanup target contains an entry whose size exceeds safe numeric bounds");
+  return numeric;
+}
+
+function assertBoundedEntryMetadata(metadata: StableStat): void {
+  for (const value of [metadata.raw.mode, metadata.raw.nlink, metadata.raw.uid, metadata.raw.gid, metadata.raw.rdev]) {
+    boundedMetadataNumber(value);
   }
 }
 
-function sameEntryMetadata(left: Stats, right: Stats): boolean {
+function sameEntryMetadata(left: StableStat, right: StableStat): boolean {
   return entryKind(left) === entryKind(right)
-    && left.dev === right.dev
-    && left.ino === right.ino
-    && left.mode === right.mode
-    && left.nlink === right.nlink
-    && left.uid === right.uid
-    && left.gid === right.gid
-    && left.rdev === right.rdev
-    && left.size === right.size
-    && left.mtimeMs === right.mtimeMs
-    && left.ctimeMs === right.ctimeMs;
+    && left.device === right.device
+    && left.inode === right.inode
+    && left.raw.mode === right.raw.mode
+    && left.raw.nlink === right.raw.nlink
+    && left.raw.uid === right.raw.uid
+    && left.raw.gid === right.raw.gid
+    && left.raw.rdev === right.raw.rdev
+    && left.bytes === right.bytes
+    && left.modifiedMs === right.modifiedMs
+    && left.changedMs === right.changedMs;
 }
 
 function boundedFailure(error: unknown): string | undefined {
@@ -267,15 +275,15 @@ function boundedFailure(error: unknown): string | undefined {
 
 async function existingRealDirectory(input: string, label: string): Promise<string> {
   const resolved = path.resolve(input);
-  const metadata = await lstat(resolved);
-  if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error(`${label} must be a real directory`);
+  const metadata = await stableLstat(resolved);
+  if (metadata.raw.isSymbolicLink() || !metadata.raw.isDirectory()) throw new Error(`${label} must be a real directory`);
   if (await realpath(resolved) !== resolved) throw new Error(`${label} must be supplied by its canonical path`);
   return resolved;
 }
 
 async function pathExists(filename: string): Promise<boolean> {
   try {
-    await lstat(filename);
+    await stableLstat(filename);
     return true;
   } catch (error) {
     if (errorCode(error) === "ENOENT") return false;
@@ -286,8 +294,8 @@ async function pathExists(filename: string): Promise<boolean> {
 async function assertRegularControlFile(root: string, filename: string): Promise<void> {
   const target = safeJoin(root, filename);
   await assertNoSymlinkComponents(root, target);
-  const metadata = await lstat(target);
-  if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.nlink !== 1 || await realpath(target) !== target) {
+  const metadata = await stableLstat(target);
+  if (metadata.raw.isSymbolicLink() || !metadata.raw.isFile() || metadata.raw.nlink !== 1n || await realpath(target) !== target) {
     throw new Error("required cleanup control input must remain a single-link canonical regular file");
   }
 }
@@ -308,48 +316,46 @@ async function stableControlFingerprint(
   const target = safeJoin(root, filename);
   const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
-    const before = await handle.stat();
+    const before = await stableHandleStat(handle);
     if (
-      !before.isFile()
-      || before.nlink !== 1
-      || !Number.isSafeInteger(before.size)
-      || before.size < 0
-      || before.size > MAX_RETAINED_CONTROL_BYTES
+      !before.raw.isFile()
+      || before.raw.nlink !== 1n
+      || before.bytes > MAX_RETAINED_CONTROL_BYTES
     ) throw new Error("retained cleanup control input is not a bounded single-link regular file");
     const digest = createHash("sha256");
     const buffer = Buffer.allocUnsafe(1024 * 1024);
     let offset = 0;
-    while (offset < before.size) {
+    while (offset < before.bytes) {
       interrupted(signal);
-      const read = await handle.read(buffer, 0, Math.min(buffer.length, before.size - offset), offset);
+      const read = await handle.read(buffer, 0, Math.min(buffer.length, before.bytes - offset), offset);
       if (read.bytesRead === 0) throw new Error("retained cleanup control input ended while it was being hashed");
       digest.update(buffer.subarray(0, read.bytesRead));
       offset += read.bytesRead;
     }
     const probe = Buffer.allocUnsafe(1);
     const extra = await handle.read(probe, 0, 1, offset);
-    const after = await handle.stat();
-    const current = await lstat(target);
+    const after = await stableHandleStat(handle);
+    const current = await stableLstat(target);
     if (
       extra.bytesRead !== 0
-      || !after.isFile()
-      || after.nlink !== 1
-      || before.dev !== after.dev
-      || before.ino !== after.ino
-      || before.size !== after.size
-      || before.mtimeMs !== after.mtimeMs
-      || before.ctimeMs !== after.ctimeMs
-      || current.isSymbolicLink()
-      || !current.isFile()
-      || current.nlink !== 1
-      || current.dev !== after.dev
-      || current.ino !== after.ino
-      || current.size !== after.size
-      || current.mtimeMs !== after.mtimeMs
-      || current.ctimeMs !== after.ctimeMs
+      || !after.raw.isFile()
+      || after.raw.nlink !== 1n
+      || before.device !== after.device
+      || before.inode !== after.inode
+      || before.bytes !== after.bytes
+      || before.modifiedMs !== after.modifiedMs
+      || before.changedMs !== after.changedMs
+      || current.raw.isSymbolicLink()
+      || !current.raw.isFile()
+      || current.raw.nlink !== 1n
+      || current.device !== after.device
+      || current.inode !== after.inode
+      || current.bytes !== after.bytes
+      || current.modifiedMs !== after.modifiedMs
+      || current.changedMs !== after.changedMs
       || await realpath(target) !== target
     ) throw new Error("retained cleanup control input changed while it was being hashed");
-    return { filename, bytes: after.size, sha256: digest.digest("hex") };
+    return { filename, bytes: after.bytes, sha256: digest.digest("hex") };
   } finally {
     await handle.close();
   }
@@ -366,7 +372,7 @@ async function rootSnapshot(
   label: string,
 ): Promise<RootSnapshot> {
   const canonical = await existingRealDirectory(root, label);
-  const metadata = await lstat(canonical);
+  const metadata = await stableLstat(canonical);
   const mounted = mountForPathFrom(records, canonical);
   if (mounted === undefined) throw new Error(`could not determine the mount backing ${label}`);
   const identity = mountIdentity(mounted);
@@ -381,7 +387,7 @@ async function rootSnapshot(
     const target = path.resolve(record.target);
     return target !== canonical && inside(canonical, target);
   })) throw new Error(`${label} must not contain nested mounts`);
-  return { path: canonical, device: metadata.dev, inode: metadata.ino, mount: identity };
+  return { path: canonical, device: metadata.device, inode: metadata.inode, mount: identity };
 }
 
 async function assertRootCurrent(expected: RootSnapshot): Promise<void> {
@@ -422,11 +428,11 @@ function sameRootSnapshot(left: RootSnapshot, right: RootSnapshot): boolean {
 async function directoryContainsIdentity(ancestor: DirectoryIdentity, candidate: DirectoryIdentity): Promise<boolean> {
   let cursor = path.resolve(candidate.path);
   while (true) {
-    const metadata = await lstat(cursor);
-    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    const metadata = await stableLstat(cursor);
+    if (metadata.raw.isSymbolicLink() || !metadata.raw.isDirectory()) {
       throw new Error("a protected cleanup directory ancestry changed during overlap verification");
     }
-    if (metadata.dev === ancestor.device && metadata.ino === ancestor.inode) return true;
+    if (metadata.device === ancestor.device && metadata.inode === ancestor.inode) return true;
     const parent = path.dirname(cursor);
     if (parent === cursor) return false;
     cursor = parent;
@@ -478,21 +484,17 @@ function recoveryPlanRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-async function verifyRecoveryCase(caseRoot: string, signal?: AbortSignal): Promise<VerifiedRecoveryCase> {
+async function verifyRecoveryCase(
+  caseRoot: string,
+  acceptInterruptedCase: boolean,
+  signal?: AbortSignal,
+): Promise<VerifiedRecoveryCase> {
   interrupted(signal);
-  const retainedControls = [
-    "case-sensitive.json",
-    "plan-redacted.json",
-    "manifest-redacted.json",
-    "final-report-sensitive.md",
-    "final-report-redacted.md",
-  ] as const;
-  for (const filename of retainedControls) await assertRegularControlFile(caseRoot, filename);
-
+  await assertRegularControlFile(caseRoot, "case-sensitive.json");
   const state = await readJson<RecoveryCaseState>(safeJoin(caseRoot, "case-sensitive.json"), MAX_CASE_STATE_BYTES);
   const plan = recoveryPlanRecord(state.plan);
   const status = String(state.status);
-  if (
+  const terminal = (
     state.version !== 1
     || !boundedString(state.runId, 256)
     || !RUN_ID.test(state.runId)
@@ -505,14 +507,83 @@ async function verifyRecoveryCase(caseRoot: string, signal?: AbortSignal): Promi
     || plan.version !== 1
     || plan.destination !== caseRoot
     || !Array.isArray(plan.steps)
-  ) throw new Error("cleanup requires a terminal successful AARK recovery case");
-  if (state.results.length !== plan.steps.length) {
+  ) === false;
+  if (!terminal) {
+    if (
+      !acceptInterruptedCase
+      || state.version !== 1
+      || !boundedString(state.runId, 256)
+      || !RUN_ID.test(state.runId)
+      || status !== "running"
+      || !boundedString(state.startedAt, 128)
+      || state.finishedAt !== null
+      || !boundedString(state.currentStep, 128)
+      || state.failure !== null
+      || !Array.isArray(state.results)
+      || state.results.length < 1
+      || plan.version !== 1
+      || plan.destination !== caseRoot
+      || !Array.isArray(plan.steps)
+      || state.results.length >= plan.steps.length
+    ) throw new Error("cleanup requires a terminal successful AARK recovery case, or an explicitly accepted inactive legacy interrupted case");
+    const stateResults = state.results as unknown[];
+    for (let index = 0; index < stateResults.length; index += 1) {
+      const step = recoveryPlanRecord(plan.steps[index]);
+      const result = recoveryPlanRecord(stateResults[index]);
+      if (
+        !boundedString(step.id, 128)
+        || !/^[a-z0-9][a-z0-9.-]{0,127}$/.test(step.id)
+        || typeof step.optional !== "boolean"
+        || result.id !== step.id
+        || !["completed", "completed-with-warnings", "skipped-missing-optional-tool"].includes(String(result.status))
+        || (result.status !== "completed" && step.optional !== true)
+      ) throw new Error("legacy interrupted recovery state contains an invalid completed-stage prefix");
+    }
+    const currentStep = recoveryPlanRecord(plan.steps[stateResults.length]);
+    if (currentStep.id !== state.currentStep) {
+      throw new Error("legacy interrupted recovery state does not identify the next unaccounted stage");
+    }
+    const retainedControls = ["case-sensitive.json", "plan-redacted.json"] as const;
+    for (const filename of retainedControls) await assertRegularControlFile(caseRoot, filename);
+    const fingerprints: ControlFingerprint[] = [];
+    for (const filename of retainedControls) {
+      interrupted(signal);
+      const current = await stableControlFingerprint(caseRoot, filename, signal);
+      const perRun = await stableControlFingerprint(
+        caseRoot,
+        path.join("runs", `${state.runId}-${filename === "case-sensitive.json" ? "sensitive.json" : filename}`),
+        signal,
+      );
+      if (current.bytes !== perRun.bytes || current.sha256 !== perRun.sha256) {
+        throw new Error("retained recovery controls do not match the interrupted run copies");
+      }
+      fingerprints.push(current);
+    }
+    return {
+      status: "legacy-interrupted",
+      runId: state.runId,
+      controlDigest: digestControlFingerprints(fingerprints),
+    };
+  }
+  const retainedControls = [
+    "case-sensitive.json",
+    "plan-redacted.json",
+    "manifest-redacted.json",
+    "final-report-sensitive.md",
+    "final-report-redacted.md",
+  ] as const;
+  for (const filename of retainedControls) await assertRegularControlFile(caseRoot, filename);
+  if (!Array.isArray(state.results) || !Array.isArray(plan.steps) || !boundedString(state.runId, 256)) {
+    throw new Error("cleanup requires a terminal successful AARK recovery case");
+  }
+  const terminalSteps = plan.steps as unknown[];
+  if (state.results.length !== terminalSteps.length) {
     throw new Error("completed recovery state does not account for every planned stage");
   }
   const stateResults = state.results as unknown[];
   let hasWarnings = false;
-  for (let index = 0; index < plan.steps.length; index += 1) {
-    const step = recoveryPlanRecord(plan.steps[index]);
+  for (let index = 0; index < terminalSteps.length; index += 1) {
+    const step = recoveryPlanRecord(terminalSteps[index]);
     const result = recoveryPlanRecord(stateResults[index]);
     const stepId = step.id;
     const resultStatus = result.status;
@@ -591,10 +662,10 @@ function buildCoverageIndex(roots: ScanState["inputRoots"]): CoverageIndex {
 }
 
 function entryIdentity(
-  parentDevice: number,
-  parentInode: number,
-  device: number,
-  inode: number,
+  parentDevice: FilesystemIdentity,
+  parentInode: FilesystemIdentity,
+  device: FilesystemIdentity,
+  inode: FilesystemIdentity,
 ): string {
   return JSON.stringify([parentDevice, parentInode, device, inode]);
 }
@@ -604,18 +675,18 @@ async function buildFindingSourceIndex(sourceFiles: string[], signal?: AbortSign
   const entryIdentities = new Set<string>();
   for (const source of paths) {
     interrupted(signal);
-    const metadata = await lstat(source);
-    const parent = await lstat(path.dirname(source));
+    const metadata = await stableLstat(source);
+    const parent = await stableLstat(path.dirname(source));
     assertBoundedEntryMetadata(metadata);
     assertBoundedEntryMetadata(parent);
     if (
-      metadata.isSymbolicLink()
-      || !metadata.isFile()
-      || parent.isSymbolicLink()
-      || !parent.isDirectory()
+      metadata.raw.isSymbolicLink()
+      || !metadata.raw.isFile()
+      || parent.raw.isSymbolicLink()
+      || !parent.raw.isDirectory()
       || await realpath(source) !== source
     ) throw new Error("a finding source is no longer a canonical regular file");
-    entryIdentities.add(entryIdentity(parent.dev, parent.ino, metadata.dev, metadata.ino));
+    entryIdentities.add(entryIdentity(parent.device, parent.inode, metadata.device, metadata.inode));
   }
   return { paths, entryIdentities };
 }
@@ -672,8 +743,8 @@ async function assertInputRootsCurrent(state: ScanState, signal?: AbortSignal): 
   for (const expected of state.inputRoots) {
     interrupted(signal);
     if (path.resolve(expected.path) !== expected.path) throw new Error("completed mining input root is not canonical");
-    const metadata = await lstat(expected.path);
-    if (metadata.isSymbolicLink() || (expected.kind === "file" ? !metadata.isFile() : !metadata.isDirectory())) {
+    const metadata = await stableLstat(expected.path);
+    if (metadata.raw.isSymbolicLink() || (expected.kind === "file" ? !metadata.raw.isFile() : !metadata.raw.isDirectory())) {
       throw new Error("completed mining input root changed kind");
     }
     if (await realpath(expected.path) !== expected.path) throw new Error("completed mining input root changed canonical path");
@@ -686,8 +757,8 @@ async function assertInputRootsCurrent(state: ScanState, signal?: AbortSignal): 
       networkCache.set(identity, network);
     }
     if (
-      metadata.dev !== expected.device
-      || metadata.ino !== expected.inode
+      metadata.device !== expected.device
+      || metadata.inode !== expected.inode
       || identity !== expected.mount
       || await network
     ) throw new Error("completed mining input root identity or mount changed after scanning");
@@ -809,23 +880,23 @@ async function targetSnapshot(
 ): Promise<TargetSnapshot | undefined> {
   interrupted(signal);
   const target = explicitTarget === undefined ? safeJoin(caseRoot.path, name) : safeJoin(caseRoot.path, path.relative(caseRoot.path, explicitTarget));
-  let before: Awaited<ReturnType<typeof lstat>>;
+  let before: StableStat;
   try {
-    before = await lstat(target);
+    before = await stableLstat(target);
   } catch (error) {
     if (errorCode(error) === "ENOENT") return undefined;
     throw error;
   }
-  if (before.isSymbolicLink() || !before.isDirectory() || await realpath(target) !== target) {
+  if (before.raw.isSymbolicLink() || !before.raw.isDirectory() || await realpath(target) !== target) {
     throw new Error("cleanup deletion targets must remain real canonical directories");
   }
   let filesystemEntries = 0n;
   let regularFiles = 0n;
   let logicalBytes = 0n;
   const retainedSourceFiles: RetainedSourceFile[] = [];
-  const directoryIdentities = new Map<string, { device: number; inode: number }>();
+  const directoryIdentities = new Map<string, { device: FilesystemIdentity; inode: FilesystemIdentity }>();
   const contentHash = createHash("sha256");
-  type Work = { phase: "enter"; filename: string } | { phase: "exit"; filename: string; relative: string; before: Stats };
+  type Work = { phase: "enter"; filename: string } | { phase: "exit"; filename: string; relative: string; before: StableStat };
   const pending: Work[] = [{ phase: "enter", filename: target }];
   let pendingEntries = 1;
   let directories = 0;
@@ -835,7 +906,7 @@ async function targetSnapshot(
     const work = pending.pop();
     if (work === undefined) break;
     if (work.phase === "exit") {
-      const afterDirectory = await lstat(work.filename);
+      const afterDirectory = await stableLstat(work.filename);
       assertBoundedEntryMetadata(afterDirectory);
       if (!sameEntryMetadata(work.before, afterDirectory)) {
         throw new Error("cleanup deletion target changed while it was being measured");
@@ -844,29 +915,29 @@ async function targetSnapshot(
         contentHash.update(`${JSON.stringify({
           path: work.relative,
           kind: "directory",
-          device: afterDirectory.dev,
-          inode: afterDirectory.ino,
-          mode: afterDirectory.mode,
-          links: afterDirectory.nlink,
-          owner: afterDirectory.uid,
-          group: afterDirectory.gid,
-          bytes: afterDirectory.size,
-          modifiedMs: afterDirectory.mtimeMs,
-          changedMs: afterDirectory.ctimeMs,
+          device: afterDirectory.device,
+          inode: afterDirectory.inode,
+          mode: boundedMetadataNumber(afterDirectory.raw.mode),
+          links: boundedMetadataNumber(afterDirectory.raw.nlink),
+          owner: boundedMetadataNumber(afterDirectory.raw.uid),
+          group: boundedMetadataNumber(afterDirectory.raw.gid),
+          bytes: afterDirectory.bytes,
+          modifiedMs: afterDirectory.modifiedMs,
+          changedMs: afterDirectory.changedMs,
         })}\n`);
       }
       continue;
     }
 
     pendingEntries -= 1;
-    const metadata = await lstat(work.filename);
+    const metadata = await stableLstat(work.filename);
     assertBoundedEntryMetadata(metadata);
     const relative = path.relative(target, work.filename);
     const kind = entryKind(metadata);
     if (work.filename !== target) filesystemEntries += 1n;
 
     if (kind === "directory") {
-      directoryIdentities.set(work.filename, { device: metadata.dev, inode: metadata.ino });
+      directoryIdentities.set(work.filename, { device: metadata.device, inode: metadata.inode });
       directories += 1;
       if (directories > MAX_WALK_DIRECTORIES) {
         throw new Error(`cleanup target exceeds the ${MAX_WALK_DIRECTORIES}-directory verification limit`);
@@ -902,14 +973,14 @@ async function targetSnapshot(
 
     let linkTarget: string | undefined;
     if (kind === "symlink") linkTarget = await readlink(work.filename);
-    const current = await lstat(work.filename);
+    const current = await stableLstat(work.filename);
     assertBoundedEntryMetadata(current);
     if (!sameEntryMetadata(metadata, current)) {
       throw new Error("cleanup deletion target changed while it was being measured");
     }
     if (kind === "file") {
       regularFiles += 1n;
-      logicalBytes += BigInt(metadata.size);
+      logicalBytes += BigInt(metadata.bytes);
       const coveragePath = coveragePathRoot === undefined
         ? work.filename
         : path.join(coveragePathRoot, relative);
@@ -925,56 +996,56 @@ async function targetSnapshot(
         || findingSources.entryIdentities.has(entryIdentity(
           parentIdentity.device,
           parentIdentity.inode,
-          metadata.dev,
-          metadata.ino,
+          metadata.device,
+          metadata.inode,
         ))
       ) {
         retainedSourceFiles.push({
           originalPath: coveragePath,
           relativePath: relative,
-          device: metadata.dev,
-          inode: metadata.ino,
-          mode: metadata.mode,
-          links: metadata.nlink,
-          bytes: metadata.size,
-          modifiedMs: metadata.mtimeMs,
-          changedMs: metadata.ctimeMs,
+          device: metadata.device,
+          inode: metadata.inode,
+          mode: boundedMetadataNumber(metadata.raw.mode),
+          links: boundedMetadataNumber(metadata.raw.nlink),
+          bytes: metadata.bytes,
+          modifiedMs: metadata.modifiedMs,
+          changedMs: metadata.changedMs,
         });
       }
     }
     contentHash.update(`${JSON.stringify({
       path: relative,
       kind,
-      device: metadata.dev,
-      inode: metadata.ino,
-      mode: metadata.mode,
-      links: metadata.nlink,
-      owner: metadata.uid,
-      group: metadata.gid,
-      deviceType: metadata.rdev,
-      bytes: metadata.size,
-      modifiedMs: metadata.mtimeMs,
-      changedMs: metadata.ctimeMs,
+      device: metadata.device,
+      inode: metadata.inode,
+      mode: boundedMetadataNumber(metadata.raw.mode),
+      links: boundedMetadataNumber(metadata.raw.nlink),
+      owner: boundedMetadataNumber(metadata.raw.uid),
+      group: boundedMetadataNumber(metadata.raw.gid),
+      deviceType: boundedMetadataNumber(metadata.raw.rdev),
+      bytes: metadata.bytes,
+      modifiedMs: metadata.modifiedMs,
+      changedMs: metadata.changedMs,
       ...(linkTarget === undefined ? {} : { linkTarget }),
     })}\n`);
   }
-  const after = await lstat(target);
+  const after = await stableLstat(target);
   if (
-    after.isSymbolicLink()
-    || !after.isDirectory()
-    || before.dev !== after.dev
-    || before.ino !== after.ino
-    || before.mtimeMs !== after.mtimeMs
-    || before.ctimeMs !== after.ctimeMs
+    after.raw.isSymbolicLink()
+    || !after.raw.isDirectory()
+    || before.device !== after.device
+    || before.inode !== after.inode
+    || before.modifiedMs !== after.modifiedMs
+    || before.changedMs !== after.changedMs
     || await realpath(target) !== target
   ) throw new Error("cleanup deletion target changed while it was being measured");
   return {
     name,
     path: target,
-    device: after.dev,
-    inode: after.ino,
-    modifiedMs: after.mtimeMs,
-    changedMs: after.ctimeMs,
+    device: after.device,
+    inode: after.inode,
+    modifiedMs: after.modifiedMs,
+    changedMs: after.changedMs,
     filesystemEntries,
     regularFiles,
     logicalBytes,
@@ -1027,7 +1098,7 @@ function approvalToken(
   return createHash("sha256").update(JSON.stringify(material)).digest("hex");
 }
 
-function normalizeOptions(options: CleanupOptions): { caseDirectory: string; miningOutputs: string[]; includeEvidence: boolean; signal?: AbortSignal } {
+function normalizeOptions(options: CleanupOptions): { caseDirectory: string; miningOutputs: string[]; includeEvidence: boolean; acceptInterruptedCase: boolean; signal?: AbortSignal } {
   if (options.miningOutputs.length < 1 || options.miningOutputs.length > 128) {
     throw new Error("cleanup requires from 1 through 128 completed mining output directories");
   }
@@ -1048,6 +1119,7 @@ function normalizeOptions(options: CleanupOptions): { caseDirectory: string; min
     caseDirectory,
     miningOutputs,
     includeEvidence: options.includeEvidence === true,
+    acceptInterruptedCase: options.acceptInterruptedCase === true,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   };
 }
@@ -1087,7 +1159,7 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
   ]);
   if (heldLocks === undefined) introducedLocks.clear();
 
-  const recoveryCase = await verifyRecoveryCase(caseRoot.path, normalized.signal);
+  const recoveryCase = await verifyRecoveryCase(caseRoot.path, normalized.acceptInterruptedCase, normalized.signal);
   const mining: VerifiedMiningOutput[] = [];
   for (const root of miningRoots) mining.push(await verifyMiningOutput(root, normalized.signal));
   const coverage = buildCoverageIndex(mining.flatMap((item) => item.state.inputRoots));
@@ -1202,7 +1274,7 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
       intermediateLogsAndRunsIncluded: targets.some((target) => target.name === "logs" || target.name === "runs"),
     },
     retained: {
-      recoveryFinalReports: true,
+      recoveryFinalReports: recoveryCase.status !== "legacy-interrupted",
       cleanupFinalReports: true,
       miningFinalReports: true,
       exactFindingArtifacts: true,
@@ -1216,6 +1288,7 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
       "Show this aggregate, path-redacted plan to the end user and obtain explicit approval before cleanup run.",
       "Pass the exact approval token plus --execute and --confirm-delete-recovered-copy.",
       "Keep every complete source file associated with a mining finding in the dedicated retained source-file tree.",
+      ...(recoveryCase.status === "legacy-interrupted" ? ["The original recovery run remains truthfully recorded as interrupted; cleanup was planned only after explicitly accepting that legacy state and independently proving exact scan coverage."] : []),
       ...(markerOnlyFindings > 0n ? ["Marker-only findings have no exact exported artifact; their complete containing files are retained, but review them before cleanup if neighboring directory context is needed."] : []),
       ...(normalized.includeEvidence ? ["Deleting the evidence copy additionally requires --confirm-delete-evidence."] : []),
     ],
@@ -1391,17 +1464,17 @@ async function moveRetainedSourceFile(
   }
   const quarantinedSource = safeJoin(quarantine, source.relativePath);
   await assertNoSymlinkComponents(quarantine, quarantinedSource);
-  const before = await lstat(quarantinedSource);
+  const before = await stableLstat(quarantinedSource);
   if (
-    before.isSymbolicLink()
-    || !before.isFile()
-    || before.dev !== source.device
-    || before.ino !== source.inode
-    || before.mode !== source.mode
-    || before.nlink !== source.links
-    || before.size !== source.bytes
-    || before.mtimeMs !== source.modifiedMs
-    || before.ctimeMs !== source.changedMs
+    before.raw.isSymbolicLink()
+    || !before.raw.isFile()
+    || before.device !== source.device
+    || before.inode !== source.inode
+    || boundedMetadataNumber(before.raw.mode) !== source.mode
+    || boundedMetadataNumber(before.raw.nlink) !== source.links
+    || before.bytes !== source.bytes
+    || before.modifiedMs !== source.modifiedMs
+    || before.changedMs !== source.changedMs
     || await realpath(quarantinedSource) !== quarantinedSource
   ) throw new Error("a finding-containing source file changed before it could be retained");
 
@@ -1413,19 +1486,19 @@ async function moveRetainedSourceFile(
   for (const lock of locks) await lock.assertHeld();
   await assertRootCurrent(plan.caseRoot);
   await assertRootCurrent(retainedRunRoot);
-  await rename(quarantinedSource, destination);
+  const movedSource = await renameWithHeldIdentity(quarantinedSource, destination, before);
   await syncDirectory(path.dirname(quarantinedSource));
   await syncDirectory(path.dirname(destination));
-  const retained = await lstat(destination);
+  const retained = await stableLstat(destination);
   if (
-    retained.isSymbolicLink()
-    || !retained.isFile()
-    || retained.dev !== source.device
-    || retained.ino !== source.inode
-    || retained.mode !== source.mode
-    || retained.nlink !== source.links
-    || retained.size !== source.bytes
-    || retained.mtimeMs !== source.modifiedMs
+    retained.raw.isSymbolicLink()
+    || !retained.raw.isFile()
+    || retained.device !== movedSource.device
+    || retained.inode !== movedSource.inode
+    || boundedMetadataNumber(retained.raw.mode) !== source.mode
+    || boundedMetadataNumber(retained.raw.nlink) !== source.links
+    || retained.bytes !== source.bytes
+    || retained.modifiedMs !== source.modifiedMs
     || await realpath(destination) !== destination
   ) throw new Error("a finding-containing source file was not retained intact after its protected move");
   if (await pathExists(quarantinedSource)) throw new Error("a retained source file remained in the cleanup quarantine after its protected move");
@@ -1441,14 +1514,14 @@ async function assertTargetCurrent(
   interrupted(signal);
   for (const lock of locks) await lock.assertHeld();
   await assertRootCurrent(plan.caseRoot);
-  const metadata = await lstat(target.path);
+  const metadata = await stableLstat(target.path);
   if (
-    metadata.isSymbolicLink()
-    || !metadata.isDirectory()
-    || metadata.dev !== target.device
-    || metadata.ino !== target.inode
-    || metadata.mtimeMs !== target.modifiedMs
-    || metadata.ctimeMs !== target.changedMs
+    metadata.raw.isSymbolicLink()
+    || !metadata.raw.isDirectory()
+    || metadata.device !== target.device
+    || metadata.inode !== target.inode
+    || metadata.modifiedMs !== target.modifiedMs
+    || metadata.changedMs !== target.changedMs
     || await realpath(target.path) !== target.path
   ) throw new Error("a cleanup deletion target changed after approval");
   for (const lock of locks) await lock.assertHeld();
@@ -1457,7 +1530,7 @@ async function assertTargetCurrent(
 
 async function assertTargetRemoved(target: TargetSnapshot): Promise<void> {
   try {
-    await lstat(target.path);
+    await stableLstat(target.path);
   } catch (error) {
     if (errorCode(error) === "ENOENT") return;
     throw error;
@@ -1477,14 +1550,19 @@ async function removeApprovedTarget(
   await assertNoSymlinkComponents(plan.caseRoot.path, quarantine);
   if (await pathExists(quarantine)) throw new Error("cleanup quarantine path unexpectedly already exists");
   for (const lock of locks) await lock.assertHeld();
-  await rename(target.path, quarantine);
+  const original = await stableLstat(target.path);
+  if (original.device !== target.device || original.inode !== target.inode
+    || original.modifiedMs !== target.modifiedMs || original.changedMs !== target.changedMs) {
+    throw new Error("cleanup target changed before protected quarantine");
+  }
+  const movedTarget = await renameWithHeldIdentity(target.path, quarantine, original);
   await syncDirectory(plan.caseRoot.path);
-  const moved = await lstat(quarantine);
+  const moved = await stableLstat(quarantine);
   if (
-    moved.isSymbolicLink()
-    || !moved.isDirectory()
-    || moved.dev !== target.device
-    || moved.ino !== target.inode
+    moved.raw.isSymbolicLink()
+    || !moved.raw.isDirectory()
+    || moved.device !== movedTarget.device
+    || moved.inode !== movedTarget.inode
     || await realpath(quarantine) !== quarantine
   ) {
     throw new Error("cleanup target changed during protected quarantine; the quarantined tree was not deleted");
@@ -1504,8 +1582,8 @@ async function removeApprovedTarget(
   );
   if (
     quarantined === undefined
-    || quarantined.device !== target.device
-    || quarantined.inode !== target.inode
+    || quarantined.device !== movedTarget.device
+    || quarantined.inode !== movedTarget.inode
     || quarantined.filesystemEntries !== target.filesystemEntries
     || quarantined.regularFiles !== target.regularFiles
     || quarantined.logicalBytes !== target.logicalBytes

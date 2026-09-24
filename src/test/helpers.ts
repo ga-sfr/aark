@@ -1,4 +1,11 @@
+import { mkdtemp as createTemporaryDirectory, realpath } from "node:fs/promises";
 import { doubleSha256 } from "../core/crypto.js";
+
+// Windows runner TEMP can use an 8.3 alias. Fixtures that exercise canonical
+// path contracts must use the real spelling, just like a completed CLI plan.
+export async function mkdtemp(prefix: string): Promise<string> {
+  return await realpath(await createTemporaryDirectory(prefix));
+}
 
 export const BITCOIN_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 export const RIPPLE_ALPHABET = "rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";

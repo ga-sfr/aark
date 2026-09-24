@@ -1,4 +1,5 @@
 import type { Confidence, JsonValue, Provenance, ValidationRecord } from "../core/types.js";
+import type { FilesystemIdentity } from "../core/fs-safe.js";
 
 export interface MiningOptions {
   inputs: string[];
@@ -105,7 +106,7 @@ export interface SensitiveScanInventory {
       wholeFileBytes: number;
       deepKeySchedules: boolean;
     };
-    inputRoots: Array<{ path: string; device: number; inode: number; kind: "file" | "directory"; mount: string }>;
+    inputRoots: Array<{ path: string; device: FilesystemIdentity; inode: FilesystemIdentity; kind: "file" | "directory"; mount: string }>;
     manifest: { filename: string; entries: number; bytes: number; sha256: string };
     cursor: { fileIndex: number; phase: "stream" | "whole-file"; nextOffset: number };
     progress: MiningProgress;

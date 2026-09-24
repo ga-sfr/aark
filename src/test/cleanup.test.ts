@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { access, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp } from "./helpers.js";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -16,8 +17,62 @@ async function missing(filename: string): Promise<boolean> {
   }
 }
 
+test("cleanup can truthfully plan an explicitly accepted inactive legacy interrupted case", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-cleanup-legacy-test-"));
+  const caseRoot = path.join(root, "case");
+  const recovery = path.join(caseRoot, "recovery");
+  const runs = path.join(caseRoot, "runs");
+  const mining = path.join(root, "mining");
+  await mkdir(recovery, { recursive: true });
+  await mkdir(runs);
+  await writeFile(path.join(recovery, "ordinary.txt"), "ordinary recovered data\n");
+  const runId = "synthetic-interrupted-run";
+  const state = {
+    version: 1,
+    runId,
+    status: "running",
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    currentStep: "signature-carving",
+    failure: null,
+    plan: {
+      version: 1,
+      destination: caseRoot,
+      steps: [
+        { id: "inventory", optional: false },
+        { id: "signature-carving", optional: false },
+      ],
+    },
+    results: [{ id: "inventory", status: "completed" }],
+  };
+  await writeFile(path.join(caseRoot, "case-sensitive.json"), `${JSON.stringify(state, null, 2)}\n`);
+  await writeFile(path.join(caseRoot, "plan-redacted.json"), "{}\n");
+  await writeFile(path.join(runs, `${runId}-sensitive.json`), await readFile(path.join(caseRoot, "case-sensitive.json")));
+  await writeFile(path.join(runs, `${runId}-plan-redacted.json`), await readFile(path.join(caseRoot, "plan-redacted.json")));
+  const scan = await scanSensitiveMaterial({
+    inputs: [recovery],
+    output: mining,
+    provenance: "unknown",
+    chunkBytes: 17 * 1024 * 1024,
+    overlapBytes: 17 * 1024 * 1024,
+    wholeFileBytes: 1024 * 1024,
+    workers: 1,
+    minimumFreeGiB: 0,
+    minimumFreePercent: 0,
+  });
+  assert.equal(scan.status, "complete");
+  const options = { caseDirectory: caseRoot, miningOutputs: [mining] };
+  await assert.rejects(planCleanup(options), /terminal successful AARK recovery case/);
+  const plan = await planCleanup({ ...options, acceptInterruptedCase: true });
+  assert.equal(plan.recoveryStatus, "legacy-interrupted");
+  assert.equal(plan.retained.recoveryFinalReports, false);
+  assert.equal(plan.deletion.recoveredCopyIncluded, true);
+  assert.equal(plan.sourceFilesRetained, "0");
+  assert.match(plan.approvalToken, /^[a-f0-9]{64}$/);
+});
+
 test("cleanup requires fresh approval and retains reports, findings, and whole finding-containing source files", {
-  skip: process.platform !== "linux",
+  skip: !["linux", "win32"].includes(process.platform),
 }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "aark-cleanup-test-"));
   const caseRoot = path.join(root, "case");
@@ -234,7 +289,7 @@ test("cleanup requires fresh approval and retains reports, findings, and whole f
   assert.equal(await readFile(retainedSource, "utf8"), sensitiveSourceContents);
   const retainedSourceIdentity = await stat(retainedSource);
   assert.equal(retainedSourceIdentity.dev, sensitiveSourceIdentity.dev);
-  assert.equal(retainedSourceIdentity.ino, sensitiveSourceIdentity.ino);
+  if (process.platform !== "win32") assert.equal(retainedSourceIdentity.ino, sensitiveSourceIdentity.ino);
   assert.equal(await missing(path.join(path.dirname(retainedSource), "ordinary.txt")), true);
   const retainedEvidence = path.join(
     caseRoot,
@@ -246,7 +301,7 @@ test("cleanup requires fresh approval and retains reports, findings, and whole f
   assert.equal(await readFile(retainedEvidence, "utf8"), sensitiveEvidenceContents);
   const retainedEvidenceIdentity = await stat(retainedEvidence);
   assert.equal(retainedEvidenceIdentity.dev, sensitiveEvidenceIdentity.dev);
-  assert.equal(retainedEvidenceIdentity.ino, sensitiveEvidenceIdentity.ino);
+  if (process.platform !== "win32") assert.equal(retainedEvidenceIdentity.ino, sensitiveEvidenceIdentity.ino);
   assert.equal(await missing(path.join(path.dirname(retainedEvidence), "ordinary.img")), true);
   assert.equal((await readdir(caseRoot)).some((entry) => entry.startsWith(".aark-cleanup-pending-")), false);
   const inventory = JSON.parse(await readFile(path.join(mining, "inventory-sensitive.json"), "utf8")) as { findings: unknown[] };

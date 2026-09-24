@@ -10,17 +10,17 @@ const MAX_REVEAL_BYTES = 256 * 1024 * 1024;
 const TERMINAL_STATUSES = new Set(["paused", "complete", "complete-with-errors", "failed", "interrupted"]);
 const SUPPORTED_INVENTORY_TOOLS = new Set(["aark", "agetnic-tools"]);
 
-async function readStableRegularFile(filename: string, maximumBytes: number, expected?: { dev: number; ino: number }): Promise<Buffer> {
+async function readStableRegularFile(filename: string, maximumBytes: number, expected?: { dev: bigint; ino: bigint }): Promise<Buffer> {
   const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
-    const before = await handle.stat();
-    if (!before.isFile() || before.nlink !== 1 || (expected !== undefined && (before.dev !== expected.dev || before.ino !== expected.ino))) {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.nlink !== 1n || (expected !== undefined && (before.dev !== expected.dev || before.ino !== expected.ino))) {
       throw new Error("reveal input changed or is not a regular file");
     }
-    if (!Number.isSafeInteger(before.size) || before.size < 0 || before.size > maximumBytes) {
+    if (!Number.isSafeInteger(Number(before.size)) || before.size < 0n || before.size > BigInt(maximumBytes)) {
       throw new Error(`reveal input exceeds its ${maximumBytes}-byte safety limit`);
     }
-    const data = Buffer.allocUnsafe(before.size);
+    const data = Buffer.allocUnsafe(Number(before.size));
     let consumed = 0;
     while (consumed < data.length) {
       const result = await handle.read(data, consumed, data.length - consumed, consumed);
@@ -29,25 +29,25 @@ async function readStableRegularFile(filename: string, maximumBytes: number, exp
     }
     const probe = Buffer.allocUnsafe(1);
     const extra = await handle.read(probe, 0, 1, consumed);
-    const after = await handle.stat();
-    const current = await lstat(filename);
+    const after = await handle.stat({ bigint: true });
+    const current = await lstat(filename, { bigint: true });
     if (
-      consumed !== before.size
+      BigInt(consumed) !== before.size
       || extra.bytesRead !== 0
       || before.dev !== after.dev
       || before.ino !== after.ino
-      || after.nlink !== 1
+      || after.nlink !== 1n
       || before.size !== after.size
-      || before.mtimeMs !== after.mtimeMs
-      || before.ctimeMs !== after.ctimeMs
+      || before.mtimeNs !== after.mtimeNs
+      || before.ctimeNs !== after.ctimeNs
       || current.isSymbolicLink()
       || !current.isFile()
-      || current.nlink !== 1
+      || current.nlink !== 1n
       || current.dev !== after.dev
       || current.ino !== after.ino
       || current.size !== after.size
-      || current.mtimeMs !== after.mtimeMs
-      || current.ctimeMs !== after.ctimeMs
+      || current.mtimeNs !== after.mtimeNs
+      || current.ctimeNs !== after.ctimeNs
     ) throw new Error("reveal input changed while it was being read");
     return data;
   } finally {
@@ -57,7 +57,7 @@ async function readStableRegularFile(filename: string, maximumBytes: number, exp
 
 export async function readValidatedRevealArtifact(input: string): Promise<Buffer> {
   const requested = path.resolve(input);
-  const requestedMetadata = await lstat(requested);
+  const requestedMetadata = await lstat(requested, { bigint: true });
   if (requestedMetadata.isSymbolicLink() || !requestedMetadata.isFile()) {
     throw new Error("reveal requires a regular, non-symbolic-link artifact file");
   }
@@ -71,7 +71,7 @@ export async function readValidatedRevealArtifact(input: string): Promise<Buffer
   await assertNoSymlinkComponents(output, artifact);
   const inventoryPath = safeJoin(output, "inventory-sensitive.json");
   await assertNoSymlinkComponents(output, inventoryPath);
-  const inventoryMetadata = await lstat(inventoryPath);
+  const inventoryMetadata = await lstat(inventoryPath, { bigint: true });
   if (inventoryMetadata.isSymbolicLink() || !inventoryMetadata.isFile()) throw new Error("the adjacent mining inventory is not a regular file");
   let inventory: SensitiveScanInventory;
   try {

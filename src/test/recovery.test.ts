@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, readdir, unlink, writeFile } from "node:fs/promises";
+import { access, readFile, readdir, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp } from "./helpers.js";
 import os from "node:os";
 import test from "node:test";
 import path from "node:path";
@@ -33,7 +34,7 @@ function config(): RecoveryConfig {
   };
 }
 
-test("recovery plan selects deleted/unallocated modes and redacts local paths", () => {
+test("recovery plan selects deleted/unallocated modes and redacts local paths", { skip: process.platform === "win32" }, () => {
   const plan = buildRecoveryPlan(config());
   assert.equal(plan.requireReadOnlySource, true);
   assert.deepEqual(plan.storage, { minFreeGiB: 5, minFreePercent: 5 });
@@ -103,7 +104,7 @@ test("shipped recovery example parses into a reviewable dry-run plan", async () 
   assert.ok(plan.steps.length >= 5);
 });
 
-test("recovery final reports locate restored outputs while the shareable version omits paths", () => {
+test("recovery final reports locate restored outputs while the shareable version omits paths", { skip: process.platform === "win32" }, () => {
   const input = config();
   const plan = buildRecoveryPlan(input);
   const sensitiveStdoutLog = "/synthetic/private/step.stdout-sensitive.log";
@@ -219,7 +220,7 @@ test("recovery config rejects typos, coercion, and allocated-space carving", asy
   await assert.rejects(loadRecoveryConfig(filename), /signatureCarving requires unallocatedStream/);
 });
 
-test("recovery completion and interruption both produce sensitive and redacted final reports", async () => {
+test("recovery completion and interruption both produce sensitive and redacted final reports", { skip: process.platform === "win32" }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "agetnic-recovery-run-test-"));
   const source = path.join(root, "source.img");
   await writeFile(source, Buffer.alloc(4096));

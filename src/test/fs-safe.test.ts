@@ -1,9 +1,41 @@
 import assert from "node:assert/strict";
-import { access, link, mkdir, mkdtemp, readFile, readdir, symlink, writeFile } from "node:fs/promises";
+import { access, link, lstat, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp } from "./helpers.js";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { acquireExclusiveLock, assertNoSymlinkComponents, atomicWriteFile, ensurePrivateDirectory, readDirectoryNamesBounded, readJson, walkRegularFiles } from "../core/fs-safe.js";
+import { acquireExclusiveLock, assertNoSymlinkComponents, atomicWriteFile, ensurePrivateDirectory, readDirectoryNamesBounded, readJson, renameWithHeldIdentity, stableLstat, walkRegularFiles } from "../core/fs-safe.js";
+
+test("filesystem snapshots preserve exact 64-bit identities", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-identities-test-"));
+  try {
+    const filename = path.join(root, "identity.txt");
+    await writeFile(filename, "synthetic");
+    const raw = await lstat(filename, { bigint: true });
+    const stable = await stableLstat(filename);
+    assert.equal(String(stable.device), raw.dev.toString());
+    assert.equal(String(stable.inode), raw.ino.toString());
+    assert.equal(typeof stable.inode, raw.ino > BigInt(Number.MAX_SAFE_INTEGER) ? "string" : "number");
+  } finally { await rm(root, { recursive: true }); }
+});
+
+test("protected rename verifies the original live handle for files and directories", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-rename-test-"));
+  try {
+    const before = path.join(root, "before");
+    const after = path.join(root, "after");
+    await mkdir(before);
+    await writeFile(path.join(before, "source.txt"), "synthetic rename data");
+    await renameWithHeldIdentity(before, after, await stableLstat(before));
+    const source = path.join(after, "source.txt");
+    const target = path.join(after, "retained.txt");
+    const snapshot = await stableLstat(source);
+    await renameWithHeldIdentity(source, target, snapshot);
+    assert.equal(await readFile(target, "utf8"), "synthetic rename data");
+    await writeFile(source, "replacement");
+    await assert.rejects(renameWithHeldIdentity(source, path.join(after, "unexpected.txt"), snapshot), /source changed/);
+  } finally { await rm(root, { recursive: true }); }
+});
 
 test("regular-file walks are deterministic and honor cancellation", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "aark-walk-test-"));
@@ -83,7 +115,7 @@ test("atomic rewrites reject hard-linked control destinations", async () => {
   assert.equal(await readFile(alias, "utf8"), "old");
 });
 
-test("output guards reject final and intermediate symbolic links", async () => {
+test("output guards reject final and intermediate symbolic links", { skip: process.platform === "win32" }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "agetnic-symlink-test-"));
   const outside = await mkdtemp(path.join(os.tmpdir(), "agetnic-symlink-outside-"));
   const link = path.join(root, "redirected");
@@ -104,7 +136,7 @@ test("exclusive output locks reject concurrent writers and are removed on releas
   await second.release();
 });
 
-test("JSON control files are bounded regular files and final symlinks are not followed", async () => {
+test("JSON control files are bounded regular files and final symlinks are not followed", { skip: process.platform === "win32" }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "agetnic-json-test-"));
   const filename = path.join(root, "control.json");
   const alias = path.join(root, "control-alias.json");

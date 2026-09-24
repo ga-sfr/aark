@@ -1,6 +1,6 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { captureCommand } from "./command.js";
+import { captureCommand, WINDOWS_MOUNTVOL } from "./command.js";
 
 export interface MountRecord {
   source: string;
@@ -13,7 +13,61 @@ function unescapeMount(value: string): string {
   return value.replace(/\\040/g, " ").replace(/\\011/g, "\t").replace(/\\012/g, "\n").replace(/\\134/g, "\\");
 }
 
+export function windowsMountvolToMounts(value: string): MountRecord[] {
+  const records: MountRecord[] = [];
+  let volume: string | undefined;
+  for (const rawLine of value.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const volumeMatch = /^\\\\\?\\Volume\{([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\}\\$/.exec(line);
+    if (volumeMatch?.[1] !== undefined) {
+      volume = volumeMatch[1].toUpperCase();
+      continue;
+    }
+    if (volume === undefined || line === "") continue;
+    if (!/^[A-Za-z]:\\(?:[^<>:"/\\|?*\x00-\x1F]+\\)*$/.test(line)) {
+      // This also handles the localized form of "NO MOUNT POINTS" without
+      // depending on display language or accepting a later unrelated line.
+      volume = undefined;
+      continue;
+    }
+    records.push({
+      source: `windows-volume:${volume}`,
+      target: `${line[0]?.toUpperCase()}${line.slice(1)}`,
+      filesystem: "unknown",
+      options: ["rw", "windows-local"],
+    });
+  }
+  return records;
+}
+
+async function windowsMounts(): Promise<MountRecord[]> {
+  const result = await captureCommand(WINDOWS_MOUNTVOL, [], {
+    maxCaptureBytes: 256 * 1024,
+    timeoutMs: 10_000,
+  });
+  if (result.exitCode !== 0 || result.terminationReason !== null || result.stdoutTruncated || result.stderrTruncated) {
+    throw new Error("could not inventory Windows local volume mount points safely");
+  }
+  const records = windowsMountvolToMounts(result.stdout.toString("utf8"));
+  if (records.length === 0) throw new Error("Windows volume inventory returned no usable local mount points");
+  for (const record of records) {
+    try {
+      // mountvol lists volume-manager mount points and omits mapped network
+      // drives. libuv's exact st_dev identity binds each reachable path to the
+      // local volume that actually backs it without WMI or DriveInfo queries.
+      const serial = (await stat(record.target, { bigint: true })).dev.toString(16).toUpperCase().padStart(8, "0");
+      record.source = `${record.source}:${serial}`;
+    } catch {
+      // An inaccessible local drive cannot safely back a protected path. Leave
+      // it marked so protected-path checks fail closed if it is selected.
+      record.options.push("windows-inaccessible");
+    }
+  }
+  return records;
+}
+
 export async function mounts(): Promise<MountRecord[]> {
+  if (process.platform === "win32") return await windowsMounts();
   const records: MountRecord[] = [];
   for (const line of (await readFile("/proc/self/mounts", "utf8")).split("\n")) {
     const fields = line.split(" ");
@@ -32,10 +86,12 @@ export function mountForPathFrom(records: MountRecord[], input: string): MountRe
   const resolved = path.resolve(input);
   let selected: MountRecord | undefined;
   for (const record of records) {
-    if (resolved !== record.target && !resolved.startsWith(`${record.target.replace(/\/$/, "")}/`)) continue;
+    const target = path.resolve(record.target);
+    const relative = path.relative(target, resolved);
+    if (relative !== "" && (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))) continue;
     // /proc/self/mounts is ordered by mount creation. For stacked mounts with
     // the same target, the later record is the visible topmost mount.
-    if (selected === undefined || record.target.length >= selected.target.length) selected = record;
+    if (selected === undefined || target.length >= path.resolve(selected.target).length) selected = record;
   }
   return selected;
 }
@@ -50,6 +106,7 @@ export function mountIsReadOnly(record: MountRecord | undefined): boolean {
 
 export function filesystemIsNetwork(record: MountRecord | undefined): boolean {
   if (record === undefined) return false;
+  if (record.options.includes("windows-network")) return true;
   const filesystem = record.filesystem.toLowerCase();
   const known = new Set(["9p", "afs", "ceph", "cifs", "davfs", "glusterfs", "lustre", "nfs", "nfs4", "smb3", "virtiofs"]);
   const knownLocalFuse = new Set([
@@ -91,7 +148,9 @@ export function blockTransportIsNetwork(device: string, transport?: string | nul
 
 export async function mountIsNetworkBacked(record: MountRecord | undefined): Promise<boolean> {
   if (record === undefined) throw new Error("could not determine the mount backing a protected path");
+  if (record.options.includes("windows-inaccessible")) throw new Error("protected Windows volume identity could not be read safely");
   if (filesystemIsNetwork(record)) return true;
+  if (record.options.includes("windows-local") && record.source.startsWith("windows-volume:")) return false;
   if (!record.source.startsWith("/dev/")) return false;
   const source = record.source.replace(/\[[^\]]*\]$/, "");
   const result = await captureCommand("lsblk", ["--inverse", "--json", "--paths", "--output", "PATH,TYPE,TRAN,SUBSYSTEMS", source], {
