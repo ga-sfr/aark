@@ -4,7 +4,15 @@ import { mkdtemp } from "./helpers.js";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { acquireExclusiveLock, assertNoSymlinkComponents, atomicWriteFile, ensurePrivateDirectory, readDirectoryNamesBounded, readJson, renameWithHeldIdentity, stableLstat, walkRegularFiles } from "../core/fs-safe.js";
+import { acquireExclusiveLock, assertNoSymlinkComponents, atomicWriteFile, ensurePrivateDirectory, filesystemIdentityValue, readDirectoryNamesBounded, readJson, renameWithHeldIdentity, stableLstat, walkRegularFiles } from "../core/fs-safe.js";
+
+test("Windows filesystem snapshots preserve signed representations of unsigned 64-bit identities", () => {
+  assert.equal(filesystemIdentityValue(-1n, "win32"), "18446744073709551615");
+  assert.equal(filesystemIdentityValue(-(1n << 63n), "win32"), "9223372036854775808");
+  assert.equal(filesystemIdentityValue(42n, "win32"), 42);
+  assert.throws(() => filesystemIdentityValue(-1n, "linux"), /filesystem identity is negative/);
+  assert.throws(() => filesystemIdentityValue(-(1n << 63n) - 1n, "win32"), /filesystem identity is negative/);
+});
 
 test("filesystem snapshots preserve exact 64-bit identities", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "aark-identities-test-"));
@@ -13,9 +21,11 @@ test("filesystem snapshots preserve exact 64-bit identities", async () => {
     await writeFile(filename, "synthetic");
     const raw = await lstat(filename, { bigint: true });
     const stable = await stableLstat(filename);
-    assert.equal(String(stable.device), raw.dev.toString());
-    assert.equal(String(stable.inode), raw.ino.toString());
-    assert.equal(typeof stable.inode, raw.ino > BigInt(Number.MAX_SAFE_INTEGER) ? "string" : "number");
+    const expectedDevice = raw.dev < 0n ? BigInt.asUintN(64, raw.dev) : raw.dev;
+    const expectedInode = raw.ino < 0n ? BigInt.asUintN(64, raw.ino) : raw.ino;
+    assert.equal(String(stable.device), expectedDevice.toString());
+    assert.equal(String(stable.inode), expectedInode.toString());
+    assert.equal(typeof stable.inode, expectedInode > BigInt(Number.MAX_SAFE_INTEGER) ? "string" : "number");
   } finally { await rm(root, { recursive: true }); }
 });
 

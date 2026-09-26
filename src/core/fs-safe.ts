@@ -15,10 +15,17 @@ export interface StableStat {
   changedMs: number;
 }
 
-function identityValue(value: bigint): FilesystemIdentity {
-  if (value < 0n) throw new Error("filesystem identity is negative");
-  const numeric = Number(value);
-  return Number.isSafeInteger(numeric) ? numeric : value.toString(10);
+export function filesystemIdentityValue(value: bigint, platform: NodeJS.Platform = process.platform): FilesystemIdentity {
+  let exact = value;
+  if (value < 0n) {
+    // Node exposes Windows' unsigned 64-bit file index through a signed
+    // bigint on some volumes. Preserve the same 64 bits rather than rejecting
+    // valid identities whose high bit is set.
+    if (platform !== "win32" || value < -(1n << 63n)) throw new Error("filesystem identity is negative");
+    exact = BigInt.asUintN(64, value);
+  }
+  const numeric = Number(exact);
+  return Number.isSafeInteger(numeric) ? numeric : exact.toString(10);
 }
 
 function stableStat(raw: BigIntStats): StableStat {
@@ -30,8 +37,8 @@ function stableStat(raw: BigIntStats): StableStat {
   }
   return {
     raw,
-    device: identityValue(raw.dev),
-    inode: identityValue(raw.ino),
+    device: filesystemIdentityValue(raw.dev),
+    inode: filesystemIdentityValue(raw.ino),
     bytes,
     modifiedMs,
     changedMs,
